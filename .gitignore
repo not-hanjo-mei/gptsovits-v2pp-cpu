@@ -1,0 +1,37 @@
+# Model weights and anything derived from them: never in this repo.
+# Users download or fine-tune their own v2ProPlus weights and convert locally.
+*.ckpt
+*.pth
+*.pt
+*.onnx
+*.npz
+*.gguf
+*.rpk
+*.safetensors
+weights/
+models/
+refs/
+refpacks/
+packed_graphs/
+
+# Reference audio and generated samples
+*.wav
+*.mp3
+*.flac
+samples/
+
+# Build output
+build/
+build-*/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dll
+*.exe
+
+# Local tooling state
+.cache/
+__pycache__/
+venv/
+.venv/
