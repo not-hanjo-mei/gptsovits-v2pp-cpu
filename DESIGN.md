@@ -75,6 +75,15 @@ of the workload, not of the instruction set:
   converting on the fly (F16C) halves bytes read per step at fp32
   compute. AVX2 has no VNNI, so int8 decode gains are limited; int8 is
   an experiment behind a gate, not the baseline plan.
+- **Quantization is the second acceleration tier.** The weight-only
+  W4 packs from the ARM line carry over unchanged (same format, same
+  conversion scripts, same gates: GPT agreement 299/361, VITS
+  correlation 0.9599). What does not carry over is the kernel tier:
+  the packed GEMV kernels are NEON/SDOT on ARM and fall back to a
+  scalar floor on x86 today. AVX2 packed kernels are part of M2, so
+  the quantized path is a real speed tier here, not a compatibility
+  leftover. The user of the engine picks the tier per deployment:
+  standard precision for exactness, W4 for speed and memory.
 - **VITS is many small ops.** The graph has hundreds of operators with
   small tensors; fixed per-op overhead is a large share of the total.
   What pays: op fusion, preallocated arenas, no per-op allocation, and
@@ -113,9 +122,14 @@ Same discipline as the ARM engine:
    Remaining in M1: the host gains a standard-precision load path
    (today it loads the quantized line's packed layout).
 3. **M2.** AVX2 kernels for decode GEMV and the heavy VITS blocks,
-   fp16 weight storage, thread pinning. RTF comparison against stock
-   on the project benchmark set.
+   AVX2 packed kernels for the W4 tier, fp16 weight storage, thread
+   pinning.
 4. **M3.** Hardening: streaming output, packaging, docs.
+5. **Final gate.** A published speed comparison, run once everything
+   above is done: stock GPT-SoVITS (PyTorch CPU) vs this engine at
+   standard precision vs this engine on the W4 tier, same machine,
+   same sentences, same seed, RTF and peak memory side by side. The
+   project is not done until that table exists.
 
 ## M1 gate results (2026-11-25, x86-64, this engine, standard precision)
 
