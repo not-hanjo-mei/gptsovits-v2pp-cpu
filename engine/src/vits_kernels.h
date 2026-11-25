@@ -85,6 +85,19 @@ void conv_transpose1d_fast(const float* X, int64_t N, int64_t Ci, int64_t L,
                            int64_t O, int64_t K, int64_t stride, int64_t pad_l, int64_t dil,
                            int64_t Tout, const float* bias, float* Y);
 
+#if defined(__x86_64__)
+// The AVX2+FMA conv tile (target-attributed in vits_kernels.cpp, so
+// generic translation units may call it; callers dispatch on
+// cpu::features().avx2). Precondition: stride 1 and (K-1)*dil <= 64.
+// wbuf rows are output channels of Ci*K floats, the same layout the
+// packed path dequantizes into -- which is also the plain fp32 Conv
+// weight layout, so the fp32 engine's k_conv reuses this tile.
+__attribute__((target("avx2,fma"))) void conv_tile_avx2(
+    const float* Xn, int64_t L, const float* wbuf, int64_t C, int64_t Ci, int64_t K,
+    int64_t pad_l, int64_t dil, const float* bias, float* Yn, int64_t Lout, int64_t lt0,
+    int64_t lt_len, int64_t o0, int64_t ob);
+#endif
+
 // Bench/diagnostics hook: force the conv tile choice (-1 = auto,
 // 0 = generic, 1 = NEON; the NEON choice still requires the runtime
 // NEON feature and the window precondition). Env POTATO_VITS_TILE=

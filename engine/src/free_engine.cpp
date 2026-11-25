@@ -1219,6 +1219,31 @@ void k_conv(const RT& X0, const RT& W0, const RT* B, RT& Y, const std::vector<in
         int64_t L = X.shape[2], K = W.shape[2], Lout = Y.shape[2];
         int64_t stride = strides_a[0], dilv = dil[0], pl = pads[0];
         const bool use_avx2 = cpu::features().avx2 && cpu::features().fma;
+        if (stride == 1 && (K - 1) * dilv <= 64 && use_avx2) {
+            // Register-blocked tile (4 output channels x 32 positions,
+            // shared with the packed path): the SAXPY form below
+            // re-reads and re-writes every output row once per
+            // (input channel, tap); the tile keeps outputs in
+            // registers over the whole contraction.
+            const int64_t OB4 = 4, LT = 1024;
+            const int64_t nblocks = (O + OB4 - 1) / OB4;
+            packed::kernel_pool().run([&](int idx, int nt) {
+                packed::chunk(idx, nt, N * nblocks, [&](int64_t t0, int64_t t1) {
+                    for (int64_t t = t0; t < t1; t++) {
+                        int64_t n = t / nblocks, blk = t % nblocks;
+                        int64_t o0 = blk * OB4, ob = std::min(OB4, O - o0);
+                        const float* Xn = x + (size_t)n * C * L;
+                        float* Yn = y + (size_t)n * O * Lout;
+                        for (int64_t lt0 = 0; lt0 < Lout; lt0 += LT) {
+                            int64_t lt_len = std::min(LT, Lout - lt0);
+                            packed::conv_tile_avx2(Xn, L, w, C * K, C, K, pl, dilv, bias, Yn, Lout,
+                                                   lt0, lt_len, o0, ob);
+                        }
+                    }
+                });
+            });
+            return;
+        }
         packed::kernel_pool().run([&](int idx, int nt) {
             packed::chunk(idx, nt, N * O, [&](int64_t t0, int64_t t1) {
                 for (int64_t t = t0; t < t1; t++) {
