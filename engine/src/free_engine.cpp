@@ -1227,20 +1227,25 @@ void k_conv(const RT& X0, const RT& W0, const RT* B, RT& Y, const std::vector<in
             // registers over the whole contraction.
             const int64_t OB4 = 4, LT = 1024;
             const int64_t nblocks = (O + OB4 - 1) / OB4;
-            packed::kernel_pool().run([&](int idx, int nt) {
-                packed::chunk(idx, nt, N * nblocks, [&](int64_t t0, int64_t t1) {
-                    for (int64_t t = t0; t < t1; t++) {
-                        int64_t n = t / nblocks, blk = t % nblocks;
-                        int64_t o0 = blk * OB4, ob = std::min(OB4, O - o0);
-                        const float* Xn = x + (size_t)n * C * L;
-                        float* Yn = y + (size_t)n * O * Lout;
-                        for (int64_t lt0 = 0; lt0 < Lout; lt0 += LT) {
-                            int64_t lt_len = std::min(LT, Lout - lt0);
-                            packed::conv_tile_avx2(Xn, L, w, C * K, C, K, pl, dilv, bias, Yn, Lout,
-                                                   lt0, lt_len, o0, ob);
-                        }
-                    }
-                });
+            const int64_t ntiles = (Lout + LT - 1) / LT;
+            // Dynamic task fetch, same reasoning as conv1d_fast: on
+            // shared vCPUs a static partition makes the node as slow
+            // as its most stolen worker (measured +83% on the EPYC
+            // box for this branch's first, static, version).
+            std::atomic<int64_t> next_task{0};
+            const int64_t total_tasks = N * ntiles * nblocks;
+            packed::kernel_pool().run([&](int, int) {
+                while (true) {
+                    int64_t task = next_task.fetch_add(1, std::memory_order_relaxed);
+                    if (task >= total_tasks) break;
+                    int64_t blk = task % nblocks;
+                    int64_t tile = (task / nblocks) % ntiles;
+                    int64_t n = task / (nblocks * ntiles);
+                    int64_t o0 = blk * OB4, ob = std::min(OB4, O - o0);
+                    int64_t lt0 = tile * LT, lt_len = std::min(LT, Lout - lt0);
+                    packed::conv_tile_avx2(x + (size_t)n * C * L, L, w, C * K, C, K, pl, dilv, bias,
+                                           y + (size_t)n * O * Lout, Lout, lt0, lt_len, o0, ob);
+                }
             });
             return;
         }
