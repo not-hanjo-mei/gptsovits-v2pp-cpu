@@ -106,9 +106,32 @@ Same discipline as the ARM engine:
 ## Milestones
 
 1. **M0.** This scaffold: scope, design, red lines in .gitignore.
-2. **M1.** Weight conversion plus a straightforward fp32 engine that
-   passes the correctness gates. No acceleration claims at M1.
+2. **M1.** The existing free engine carried over and re-gated at
+   standard precision: the loader learns external-data graphs, the
+   engine learns the ops the raw fp32 exports use, and both stages
+   pass the correctness gates below. No acceleration claims at M1.
+   Remaining in M1: the host gains a standard-precision load path
+   (today it loads the quantized line's packed layout).
 3. **M2.** AVX2 kernels for decode GEMV and the heavy VITS blocks,
    fp16 weight storage, thread pinning. RTF comparison against stock
    on the project benchmark set.
 4. **M3.** Hardening: streaming output, packaging, docs.
+
+## M1 gate results (2026-11-25, x86-64, this engine, standard precision)
+
+- GPT teacher-forced agreement against the fp32 reference trajectory:
+  **361/361 (1.0)**. The same build running the W4 baked graphs
+  reproduces the quantized line's recorded 299/361 exactly, so the
+  move changed nothing for the old path.
+- VITS full graph against ONNX Runtime on the identical graph and
+  feed, sampling noise pinned to zero in both: **correlation
+  1.000000, max error 4.0e-05** over 96,000 samples. The packed
+  hybrid path still reproduces its recorded 0.959880 against the
+  stage-1 reference waveform.
+- Two facts worth knowing about the inherited assets: the fp32 graph
+  copies under the old tree's `graphs/fp32` are dangling references
+  (their external `.bin` files were never kept; only fp16 bins
+  remain), and the complete self-contained fp32 set lives in
+  `work/fp32_full`. Its stage decoder must be the `*_logits` variant:
+  the plain stage graph has no logits output; the repetition-penalty
+  head exists only in the logits variant.
