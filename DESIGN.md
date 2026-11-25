@@ -115,12 +115,16 @@ Same discipline as the ARM engine:
 ## Milestones
 
 1. **M0.** This scaffold: scope, design, red lines in .gitignore.
-2. **M1.** The existing free engine carried over and re-gated at
-   standard precision: the loader learns external-data graphs, the
-   engine learns the ops the raw fp32 exports use, and both stages
-   pass the correctness gates below. No acceleration claims at M1.
-   Remaining in M1: the host gains a standard-precision load path
-   (today it loads the quantized line's packed layout).
+2. **M1. Done 2026-11-25.** The existing free engine carried over and
+   re-gated at standard precision: the loader learned external-data
+   graphs, the engine learned the ops the raw fp32 exports use, both
+   stages pass the correctness gates below, and the host gained a
+   standard-precision load path (`--engine free --fp32-graphs`,
+   graphs under `<root>/graphs-fp32/`, stage decoder file holding the
+   logits variant). End-to-end smoke on the dev VM: boot 14 s, one
+   3.13 s sentence synthesized through the full output chain, peak
+   RSS about 2.5 GB, RTF about 10 at the scalar kernel floor on a
+   1.5-CPU VM. That RTF is a pre-acceleration baseline, not a result.
 3. **M2.** AVX2 kernels for decode GEMV and the heavy VITS blocks,
    AVX2 packed kernels for the W4 tier, fp16 weight storage, thread
    pinning.

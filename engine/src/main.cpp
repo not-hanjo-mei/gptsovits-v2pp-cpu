@@ -333,6 +333,7 @@ int main(int argc, char** argv) {
     // --no-arena / --opt-level exist to attribute RSS in the stage-3 ledger;
     // defaults reproduce the stage-2 session configuration exactly.
     bool use_packed = false, no_arena = false, vits_baked = false;
+    bool fp32_graphs = false;  // --fp32-graphs: standard-precision load path (free engine)
     std::string opt_level = "all";
     // --engine free: the ORT-free engine (ORT-FREE.md phase 2). GPT runs
     // packed residency (W4) and vits packed residency by default, or the
@@ -353,6 +354,7 @@ int main(int argc, char** argv) {
         // behaviour) while GPT stays packed. Attribution/debugging only;
         // the default with --packed is vits packed residency (S10).
         else if (a == "--vits-baked") vits_baked = true;
+        else if (a == "--fp32-graphs") fp32_graphs = true;
         else if (a == "--no-arena") no_arena = true;
         else if (a == "--opt-level") opt_level = next();
         else if (a == "--emit-models") emit_dir = next();
@@ -400,15 +402,18 @@ int main(int argc, char** argv) {
 #ifdef POTATO_FREE_ONLY
     if (!engine_free) { std::cerr << "this is a free-only build: --engine ort is not compiled in\n"; return 2; }
 #endif
-    if (engine_free && gpt_bits != 4) { std::cerr << "--engine free supports --gpt-bits 4 only (packed graphs are W4)\n"; return 2; }
+    if (fp32_graphs && !engine_free) { std::cerr << "--fp32-graphs requires --engine free\n"; return 2; }
+    if (engine_free && !fp32_graphs && gpt_bits != 4) { std::cerr << "--engine free supports --gpt-bits 4 only (packed graphs are W4)\n"; return 2; }
     if (engine_free && !emit_dir.empty()) { std::cerr << "--emit-models is ORT-path only\n"; return 2; }
     std::string scheme = gpt_bits == 4 ? "w4" : "w8";
 
     try {
         auto t_boot = Clock::now();
-        Json man = JsonParser(read_text(root + "/wo-packs/manifest.json")).parse();
-
-        Json man_hybrid = JsonParser(read_text(root + "/wo-packs/manifest_vits_w4hybrid.json")).parse();
+        Json man, man_hybrid;
+        if (!fp32_graphs) {
+            man = JsonParser(read_text(root + "/wo-packs/manifest.json")).parse();
+            man_hybrid = JsonParser(read_text(root + "/wo-packs/manifest_vits_w4hybrid.json")).parse();
+        }
         // vits always loads the variant-E hybrid pack (enc_p + quantizer codebook
         // in W8, the rest W4; see VITS-W4.md). GPT packs follow --gpt-bits.
         struct GSpec { const char* tpl; const char* sec; const char* packfmt; const char* schemekey; const Json* manifest; };
@@ -441,56 +446,76 @@ int main(int argc, char** argv) {
         FreeHost fh;
         if (engine_free) {
             packed::set_kernel_threads(threads);
-            fh.store = std::make_shared<packed::BlobStore>();
-            fh.pool_f = std::make_unique<FreePool>(fh.store);
-            fh.pool_s = std::make_unique<FreePool>(fh.store);
-            fh.pool_v = std::make_unique<FreePool>(fh.store);
-            std::map<std::string, bool> filter;
-            for (auto f : {"t2s_first_stage_decoder_fp32.onnx", "t2s_stage_decoder_fp32.onnx"}) {
-                Json side = JsonParser(read_text(root + "/host/packed_graphs/" + f + ".json")).parse();
-                for (auto& pi : side.find("packed_inputs")->arr) filter[pi.find("tensor")->as_str()] = true;
-            }
-            fh.pool_f->filter = filter;
-            fh.pool_f->load(root, man, "w4", "gpt_first");
-            fh.pool_s->filter = filter;
-            fh.pool_s->load(root, man, "w4", "gpt_stage");
-            {
-                Json side = JsonParser(read_text(root + "/host/packed_graphs/vits_wnfold.onnx.json")).parse();
-                for (auto& pi : side.find("packed_inputs")->arr) fh.pool_v->filter[pi.find("tensor")->as_str()] = true;
-            }
-            fh.pool_v->load(root, man_hybrid, "w4hybrid", "sovits_vits");
-            std::cerr << "[pool] free: first entries " << fh.pool_f->entries << "; stage entries "
-                      << fh.pool_s->entries << "; vits entries " << fh.pool_v->entries
-                      << "; store unique " << fh.store->unique_bytes() << " B; rss " << rss_kb() / 1024
-                      << " MB\n";
-            auto compile = [&](const std::string& path, const std::string& label) {
-                auto t0 = Clock::now();
-                onnxm::Graph g = onnxm::load_model(path);
-                auto p = freeeng::Plan::compile(g, label);
-                std::cerr << "[load] free plan " << label << " compiled in " << (int)ms_since(t0)
-                          << " ms, " << p->step_count() << " steps; rss " << rss_kb() / 1024 << " MB\n";
-                return p;
-            };
-            fh.enc = compile(root + "/work/wo_graphs/w4/t2s_encoder_fp32.onnx", "gpt_encoder");
-            fh.first = compile(root + "/host/packed_graphs/t2s_first_stage_decoder_fp32.onnx", "gpt_first");
-            fh.first->set_packed_lookup(fh.pool_f->lookup());
-            fh.stage_a = compile(root + "/host/packed_graphs/t2s_stage_decoder_fp32.onnx", "gpt_stage_a");
-            fh.stage_a->set_packed_lookup(fh.pool_s->lookup());
-            fh.stage_b = compile(root + "/host/packed_graphs/t2s_stage_decoder_fp32.onnx", "gpt_stage_b");
-            fh.stage_b->set_packed_lookup(fh.pool_s->lookup());
-            fh.vits_baked = vits_baked;
-            if (vits_baked) {
-                auto t0 = Clock::now();
-                onnxm::Graph g = onnxm::load_model(root + "/work/folded/vits_wnfold.onnx");
-                const Json* secnode = man_hybrid.find("sovits_vits")->find("w4hybrid");
-                patch_graph_inplace(g, root, root + "/wo-packs/sovits_vits_w4hybrid.npz", *secnode);
-                fh.vits = freeeng::Plan::compile(g, "vits_baked");
-                std::cerr << "[load] free plan vits_baked compiled in " << (int)ms_since(t0) << " ms, "
-                          << fh.vits->step_count() << " steps; rss " << rss_kb() / 1024 << " MB\n";
+            if (fp32_graphs) {
+                // Standard-precision path: compile the raw fp32 graphs
+                // from <root>/graphs-fp32/ (the stage decoder file holds
+                // the logits variant; see DESIGN.md). No packs, no
+                // manifests, no packed lookups.
+                auto compile = [&](const std::string& path, const std::string& label) {
+                    auto t0 = Clock::now();
+                    onnxm::Graph g = onnxm::load_model(path);
+                    auto p = freeeng::Plan::compile(g, label);
+                    std::cerr << "[load] free plan " << label << " compiled in " << (int)ms_since(t0)
+                              << " ms, " << p->step_count() << " steps; rss " << rss_kb() / 1024 << " MB\n";
+                    return p;
+                };
+                fh.enc = compile(root + "/graphs-fp32/t2s_encoder_fp32.onnx", "gpt_encoder");
+                fh.first = compile(root + "/graphs-fp32/t2s_first_stage_decoder_fp32.onnx", "gpt_first");
+                fh.stage_a = compile(root + "/graphs-fp32/t2s_stage_decoder_fp32.onnx", "gpt_stage_a");
+                fh.stage_b = compile(root + "/graphs-fp32/t2s_stage_decoder_fp32.onnx", "gpt_stage_b");
+                fh.vits = compile(root + "/graphs-fp32/vits_fp32.onnx", "vits");
             } else {
-                fh.vits = compile(root + "/host/packed_graphs/vits_wnfold.onnx", "vits");
-                fh.vits->set_packed_lookup(fh.pool_v->lookup());
-            }
+                fh.store = std::make_shared<packed::BlobStore>();
+                fh.pool_f = std::make_unique<FreePool>(fh.store);
+                fh.pool_s = std::make_unique<FreePool>(fh.store);
+                fh.pool_v = std::make_unique<FreePool>(fh.store);
+                std::map<std::string, bool> filter;
+                for (auto f : {"t2s_first_stage_decoder_fp32.onnx", "t2s_stage_decoder_fp32.onnx"}) {
+                    Json side = JsonParser(read_text(root + "/host/packed_graphs/" + f + ".json")).parse();
+                    for (auto& pi : side.find("packed_inputs")->arr) filter[pi.find("tensor")->as_str()] = true;
+                }
+                fh.pool_f->filter = filter;
+                fh.pool_f->load(root, man, "w4", "gpt_first");
+                fh.pool_s->filter = filter;
+                fh.pool_s->load(root, man, "w4", "gpt_stage");
+                {
+                    Json side = JsonParser(read_text(root + "/host/packed_graphs/vits_wnfold.onnx.json")).parse();
+                    for (auto& pi : side.find("packed_inputs")->arr) fh.pool_v->filter[pi.find("tensor")->as_str()] = true;
+                }
+                fh.pool_v->load(root, man_hybrid, "w4hybrid", "sovits_vits");
+                std::cerr << "[pool] free: first entries " << fh.pool_f->entries << "; stage entries "
+                          << fh.pool_s->entries << "; vits entries " << fh.pool_v->entries
+                          << "; store unique " << fh.store->unique_bytes() << " B; rss " << rss_kb() / 1024
+                          << " MB\n";
+                auto compile = [&](const std::string& path, const std::string& label) {
+                    auto t0 = Clock::now();
+                    onnxm::Graph g = onnxm::load_model(path);
+                    auto p = freeeng::Plan::compile(g, label);
+                    std::cerr << "[load] free plan " << label << " compiled in " << (int)ms_since(t0)
+                              << " ms, " << p->step_count() << " steps; rss " << rss_kb() / 1024 << " MB\n";
+                    return p;
+                };
+                fh.enc = compile(root + "/work/wo_graphs/w4/t2s_encoder_fp32.onnx", "gpt_encoder");
+                fh.first = compile(root + "/host/packed_graphs/t2s_first_stage_decoder_fp32.onnx", "gpt_first");
+                fh.first->set_packed_lookup(fh.pool_f->lookup());
+                fh.stage_a = compile(root + "/host/packed_graphs/t2s_stage_decoder_fp32.onnx", "gpt_stage_a");
+                fh.stage_a->set_packed_lookup(fh.pool_s->lookup());
+                fh.stage_b = compile(root + "/host/packed_graphs/t2s_stage_decoder_fp32.onnx", "gpt_stage_b");
+                fh.stage_b->set_packed_lookup(fh.pool_s->lookup());
+                fh.vits_baked = vits_baked;
+                if (vits_baked) {
+                    auto t0 = Clock::now();
+                    onnxm::Graph g = onnxm::load_model(root + "/work/folded/vits_wnfold.onnx");
+                    const Json* secnode = man_hybrid.find("sovits_vits")->find("w4hybrid");
+                    patch_graph_inplace(g, root, root + "/wo-packs/sovits_vits_w4hybrid.npz", *secnode);
+                    fh.vits = freeeng::Plan::compile(g, "vits_baked");
+                    std::cerr << "[load] free plan vits_baked compiled in " << (int)ms_since(t0) << " ms, "
+                              << fh.vits->step_count() << " steps; rss " << rss_kb() / 1024 << " MB\n";
+                } else {
+                    fh.vits = compile(root + "/host/packed_graphs/vits_wnfold.onnx", "vits");
+                    fh.vits->set_packed_lookup(fh.pool_v->lookup());
+                }
+            }  // fp32_graphs / packed load paths
         }
 #ifndef POTATO_FREE_ONLY
         int spec_idx = 0;

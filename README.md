@@ -9,8 +9,12 @@ AVX/AVX2 with runtime dispatch, no GPU, no Python in the hot path.
 
 ## Status
 
-Scaffolding. The architecture and the settled design decisions are in
-[DESIGN.md](DESIGN.md). No engine code yet.
+M1 complete: the engine is in `engine/`, passes its standard-precision
+correctness gates (GPT teacher-forced 361/361, VITS correlation
+1.000000 against ONNX Runtime), and the host synthesizes end to end
+from raw fp32 graphs (`--engine free --fp32-graphs`). Next is M2, the
+AVX2 acceleration work. The architecture and the settled design
+decisions are in [DESIGN.md](DESIGN.md).
 
 ## What this is
 
