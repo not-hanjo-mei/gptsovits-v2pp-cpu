@@ -165,6 +165,15 @@ Same discipline as the ARM engine:
    1.88 (2 threads) and 1.21 (4 threads). The packed VITS conv
    time did not move; it lives in the packed conv kernels, which
    are still scalar on x86, and is the next target.
+   Fourth change: the plain fp32 Conv takes the same
+   register-blocked AVX2 tile for stride-1 shapes (the packed and
+   fp32 weight layouts are identical), under dynamic task fetch --
+   a static partition of the tile work cost +83 percent on the
+   shared-vCPU box, the same effect conv1d_fast's fetch loop
+   exists for. EPYC, 4 threads: fp32 CONV 2,445 -> 1,616..1,891
+   ms, the fp32 sentence at 4.72..5.11 s (RTF about 1.5), the
+   best standard-precision result so far. The vits fp32 gate
+   statistics are bit-identical to the SAXPY form's.
 4. **M3.** Hardening: streaming output, packaging, docs.
 5. **Final gate.** A published speed comparison, run once everything
    above is done: stock GPT-SoVITS (PyTorch CPU) vs this engine at
