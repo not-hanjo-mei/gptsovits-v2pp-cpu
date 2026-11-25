@@ -125,7 +125,7 @@ Same discipline as the ARM engine:
    3.13 s sentence synthesized through the full output chain, peak
    RSS about 2.5 GB, RTF about 10 at the scalar kernel floor on a
    1.5-CPU VM. That RTF is a pre-acceleration baseline, not a result.
-3. **M2.** AVX2 kernels for decode GEMV and the heavy VITS blocks,
+3. **M2 (done).** AVX2 kernels for decode GEMV and the heavy VITS blocks,
    AVX2 packed kernels for the W4 tier, fp16 weight storage, thread
    pinning. Profiling the standard-precision host (FE_PROFILE, dev
    VM) put the work in order: VITS is 89% Conv (20.8 s of 23.3 s),
@@ -174,6 +174,21 @@ Same discipline as the ARM engine:
    ms, the fp32 sentence at 4.72..5.11 s (RTF about 1.5), the
    best standard-precision result so far. The vits fp32 gate
    statistics are bit-identical to the SAXPY form's.
+   Fifth change: fp16 weight storage, opt-in per plan
+   (--fp16-weights on the host's standard-precision path, GPT
+   plans only). Initializer operands of MatMul/Gemm are converted
+   once at compile time and converted back on the fly with F16C
+   inside the matmul kernels; both weight layouts are covered
+   (row-contiguous SAXPY form and transposed dot form). The
+   teacher-forced gate holds at exactly 361/361. EPYC, 4
+   threads: GPT decode 2,011..2,131 -> 1,871 ms (about -10
+   percent); the sentence total is inside run-to-run noise. The
+   fp32 originals are retained alongside the fp16 copies for
+   now, so RSS grows by about 440 MB; dropping single-use
+   originals after conversion is a recorded follow-up, not
+   done. Thread pinning was not pursued: the verification box
+   is shared vCPUs, and the device precedent favoured unpinned.
+   This closes M2.
 4. **M3.** Hardening: streaming output, packaging, docs.
 5. **Final gate.** A published speed comparison, run once everything
    above is done: stock GPT-SoVITS (PyTorch CPU) vs this engine at
