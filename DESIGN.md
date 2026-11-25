@@ -33,22 +33,33 @@ Upstream v2ProPlus inference has five stages:
    through the flow and the upsampling decoder to a waveform.
 5. **Output chain.** Trim, gain and soft clipping on the way out.
 
-## The one open decision: where stage 2 runs
+## Decision: stage 2 runs both ways, the user chooses
 
-Two shapes are possible, and they lead to different engines:
+Settled 2026-11-25: the engine supports both reference modes, and the
+person running it picks per voice.
 
-- **A. Full standard.** Reference audio is accepted at run time. HuBERT
-  (and BERT for Chinese) run inside the engine. Drop-in compatible with
-  upstream usage, any reference clip works immediately, but the engine
-  carries two more models and their cost.
-- **B. Precomputed reference packs.** Reference features are computed
-  once by an offline tool and shipped to the engine as a pack. The
-  runtime is stages 1, 3, 4, 5 only: smaller, faster to start, and the
-  shape already proven in the PotatoAmika ARM engine. Changing the
-  reference voice costs one offline step.
+- **Runtime reference.** A wav plus its transcript is given at run time;
+  the engine runs HuBERT and the prompt_encoder on the spot. Drop-in
+  compatible with upstream usage, any clip works immediately.
+- **Precomputed pack.** Reference features computed earlier (by this
+  engine's own runtime path, saved out, or by the offline tool) are
+  loaded from a pack file. Startup is milliseconds and the HuBERT side
+  never loads.
 
-This decision gates the graph set, the runtime dependencies and the
-conversion scripts. It must be settled before code.
+There is exactly one canonical reference-feature format: the pack.
+Runtime mode computes the features and may write them back as a pack,
+so a voice extracted once can be reused in pack mode forever. Downstream
+of the features there is one code path; the two modes differ only in
+where the extraction bill is paid.
+
+Sequencing: the synthesis core lands first against packs (the shape
+already proven in the PotatoAmika ARM engine), then runtime extraction
+is added on the same feature format.
+
+One related point is independent of this choice: BERT features for
+Chinese *target* text belong to the frontend (stage 1). If Chinese is
+in scope, both modes carry that cost; it has nothing to do with how
+the reference is supplied.
 
 ## Acceleration plan
 

@@ -9,7 +9,7 @@ AVX/AVX2 with runtime dispatch, no GPU, no Python in the hot path.
 
 ## Status
 
-Scaffolding. The architecture and the one open design decision are in
+Scaffolding. The architecture and the settled design decisions are in
 [DESIGN.md](DESIGN.md). No engine code yet.
 
 ## What this is
