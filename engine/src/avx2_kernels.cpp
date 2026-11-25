@@ -1,5 +1,7 @@
 #include "avx2_kernels.h"
 
+#include <cstring>
+
 #if defined(__AVX2__) && defined(__FMA__)
 #include <immintrin.h>
 #endif
@@ -90,6 +92,112 @@ float w4b_dot64(const uint8_t* prow, float sc, float ze, const float* x) {
         a += ((float)(byte & 0xF) - ze) * sc * x[2 * b + 1];
     }
     return a;
+#endif
+}
+
+namespace {
+inline float f16_bits_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    int exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            // Subnormal half: normalize.
+            exp = 1;
+            while ((mant & 0x400) == 0) { mant <<= 1; exp--; }
+            mant &= 0x3FF;
+            bits = sign | ((uint32_t)(exp + 112) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000 | (mant << 13);
+    } else {
+        bits = sign | ((uint32_t)(exp + 112) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+}  // namespace
+
+void saxpy_f16(float a, const uint16_t* x, float* y, int64_t n) {
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    const __m256 va = _mm256_set1_ps(a);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 xv = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(x + i)));
+        _mm256_storeu_ps(y + i, _mm256_fmadd_ps(va, xv, _mm256_loadu_ps(y + i)));
+    }
+    if (i < n) {
+        uint16_t tmp[8] = {};
+        std::memcpy(tmp, x + i, (size_t)(n - i) * 2);
+        __m256 xv = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)tmp));
+        float ty[8];
+        _mm256_storeu_ps(ty, _mm256_fmadd_ps(va, xv, _mm256_loadu_ps(y + i)));
+        std::memcpy(y + i, ty, (size_t)(n - i) * 4);
+    }
+#else
+    for (int64_t i = 0; i < n; i++) y[i] += a * f16_bits_to_f32(x[i]);
+#endif
+}
+
+float dot_f16(const float* a, const uint16_t* b, int64_t n) {
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    __m256 acc = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 bv = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b + i)));
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), bv, acc);
+    }
+    if (i < n) {
+        uint16_t tmp[8] = {};
+        std::memcpy(tmp, b + i, (size_t)(n - i) * 2);
+        __m256 bv = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)tmp));
+        float ta[8] = {};
+        std::memcpy(ta, a + i, (size_t)(n - i) * 4);
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(ta), bv, acc);
+    }
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    return _mm_cvtss_f32(s);
+#else
+    float s = 0.0f;
+    for (int64_t i = 0; i < n; i++) s += a[i] * f16_bits_to_f32(b[i]);
+    return s;
+#endif
+}
+
+void f32_to_f16(const float* src, uint16_t* dst, int64_t n) {
+#if defined(__AVX2__) && defined(__F16C__)
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m128i h = _mm256_cvtps_ph(_mm256_loadu_ps(src + i), _MM_FROUND_TO_NEAREST_INT);
+        _mm_storeu_si128((__m128i*)(dst + i), h);
+    }
+    if (i < n) {
+        float ts[8] = {};
+        std::memcpy(ts, src + i, (size_t)(n - i) * 4);
+        __m128i h = _mm256_cvtps_ph(_mm256_loadu_ps(ts), _MM_FROUND_TO_NEAREST_INT);
+        uint16_t tmp[8];
+        _mm_storeu_si128((__m128i*)tmp, h);
+        std::memcpy(dst + i, tmp, (size_t)(n - i) * 2);
+    }
+#else
+    for (int64_t i = 0; i < n; i++) {
+        uint32_t bits;
+        std::memcpy(&bits, src + i, 4);
+        uint32_t sign = (bits >> 16) & 0x8000;
+        int exp = (int)((bits >> 23) & 0xFF) - 112;
+        uint32_t mant = bits & 0x7FFFFF;
+        uint16_t h;
+        if (exp <= 0) h = (uint16_t)sign;  // underflow to zero (denormal halves ignored)
+        else if (exp >= 31) h = (uint16_t)(sign | 0x7C00);
+        else h = (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+        dst[i] = h;
+    }
 #endif
 }
 

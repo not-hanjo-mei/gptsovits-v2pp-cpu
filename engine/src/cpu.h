@@ -45,6 +45,7 @@ struct Features {
     bool neon = false;    // aarch64: ASIMD baseline
     bool avx2 = false;    // x86-64: AVX2 usable (CPU + OS state)
     bool fma = false;     // x86-64: FMA3
+    bool f16c = false;    // x86-64: F16C (half<->float conversion)
     bool avx512 = false;  // x86-64: AVX-512F usable (log only, never required)
     const char* arch = "unknown";
 };
@@ -70,6 +71,7 @@ inline const Features& features() {
         bool osxsave = ((c >> 27) & 1) != 0;
         bool avx = ((c >> 28) & 1) != 0;
         r.fma = ((c >> 12) & 1) != 0;
+        r.f16c = ((c >> 29) & 1) != 0;
         unsigned long long xcr0 = 0;
         if (osxsave) {
             unsigned lo = 0, hi = 0;

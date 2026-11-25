@@ -228,7 +228,18 @@ struct Scratch {
 
 // ------------------------------------------------------------- kernels --
 
-void k_matmul(const RT& A0, const RT& B0, RT& C, Scratch& sc) {
+
+// One SAXPY step of k_matmul over a contiguous B row, in fp32 or
+// fp16 storage (bh != nullptr selects the f16 copy at the same
+// element offset; avx2k carries the scalar fallbacks).
+inline void mm_saxpy(bool use_avx2, const uint16_t* bh, float av, const float* browp, float* crow,
+                     int64_t n) {
+    if (bh) { avx2k::saxpy_f16(av, bh, crow, n); return; }
+    if (use_avx2) { avx2k::saxpy(av, browp, crow, n); return; }
+    for (int64_t j = 0; j < n; j++) crow[j] += av * browp[j];
+}
+
+void k_matmul(const RT& A0, const RT& B0, RT& C, Scratch& sc, const uint16_t* Bf16 = nullptr) {
     // FE_MM_DEBUG=1: dump shapes/strides of the first 400 calls.
     if (std::getenv("FE_MM_DEBUG")) {
         static int mm_dbg = 0;
@@ -251,7 +262,7 @@ void k_matmul(const RT& A0, const RT& B0, RT& C, Scratch& sc) {
     // sweep, re-reading the whole K cache once per k (stride-K gathers);
     // the dot form reads it exactly once, sequentially. Accumulation is
     // double, in k order, as in the original single-batch fast path.
-    if (A0.dtype == 1 && B0.dtype == 1 && C.contig()) {
+    if (Bf16 == nullptr && A0.dtype == 1 && B0.dtype == 1 && C.contig()) {
         int ra0 = (int)A0.shape.size(), rb0 = (int)B0.shape.size();
         if (ra0 >= 2 && rb0 >= 2) {
             int64_t M = A0.shape[ra0 - 2], K = A0.shape[ra0 - 1], N = B0.shape[rb0 - 1];
@@ -348,6 +359,26 @@ void k_matmul(const RT& A0, const RT& B0, RT& C, Scratch& sc) {
         aoff[b] = ao;
         boff[b] = bo;
     }
+    // fp16-stored B in transposed layout (brow == 1, bcol == K: the
+    // stored rows are the output columns), decode shape M == 1: one
+    // dot product per output, the f16 row read exactly once.
+    if (Bf16 && M == 1 && brow == 1 && bcol == K && acol == 1) {
+        auto dot_body = [&](int idx, int nt) {
+            packed::chunk(idx, nt, (int64_t)batch * N, [&](int64_t w0, int64_t w1) {
+                for (int64_t w = w0; w < w1; w++) {
+                    int b = (int)(w / N);
+                    int64_t j = w % N;
+                    // avx2k::dot_f16 carries its own scalar
+                    // fallback; Bf16 is only ever set on machines
+                    // whose features passed the compile-time check.
+                    cp0[w] = avx2k::dot_f16(ap0 + aoff[b], Bf16 + boff[b] + j * K, K);
+                }
+            });
+        };
+        if ((int64_t)batch * N * K >= (1 << 20)) packed::kernel_pool().run(dot_body);
+        else dot_body(0, 1);
+        return;
+    }
     int64_t rows = (int64_t)batch * M;
     if (rows >= 4) {
         // One pool run over all (batch, row) pairs: per-batch pool
@@ -375,8 +406,8 @@ void k_matmul(const RT& A0, const RT& B0, RT& C, Scratch& sc) {
                             const float* browp = bb + k * brow;
                             float* crow = cp0 + r * N;
                             if (bcol == 1) {
-                                if (use_avx2) avx2k::saxpy(av, browp, crow, N);
-                                else for (int64_t j = 0; j < N; j++) crow[j] += av * browp[j];
+                                mm_saxpy(use_avx2, Bf16 ? Bf16 + (browp - bp0) : nullptr, av, browp,
+                                         crow, N);
                             } else {
                                 for (int64_t j = 0; j < N; j++) crow[j] += av * browp[j * bcol];
                             }
@@ -404,8 +435,8 @@ void k_matmul(const RT& A0, const RT& B0, RT& C, Scratch& sc) {
                         float av = a[k * acol];
                         const float* browp = bb + k * brow + j0 * bcol;
                         if (bcol == 1) {
-                            if (use_avx2) avx2k::saxpy(av, browp, c + j0, j1 - j0);
-                            else for (int64_t j = j0; j < j1; j++) c[j] += av * browp[j - j0];
+                            mm_saxpy(use_avx2, Bf16 ? Bf16 + (browp - bp0) : nullptr, av, browp,
+                                     c + j0, j1 - j0);
                         } else {
                             for (int64_t j = j0; j < j1; j++) c[j] += av * browp[(j - j0) * bcol];
                         }
@@ -424,8 +455,8 @@ void k_matmul(const RT& A0, const RT& B0, RT& C, Scratch& sc) {
                             float av = a[m * arow + k * acol];
                             const float* browp = bb + k * brow;
                             if (bcol == 1) {
-                                if (use_avx2) avx2k::saxpy(av, browp, crow, N);
-                                else for (int64_t j = 0; j < N; j++) crow[j] += av * browp[j];
+                                mm_saxpy(use_avx2, Bf16 ? Bf16 + (browp - bp0) : nullptr, av, browp,
+                                         crow, N);
                             } else {
                                 for (int64_t j = 0; j < N; j++) crow[j] += av * browp[j * bcol];
                             }
@@ -1730,6 +1761,8 @@ struct Step {
     int pad_mode = 0;         // PAD: 0 constant, 1 reflect, 2 edge
     bool mean = false;        // REDUCESUM: ReduceMean (scale by 1/count)
     bool l2 = false;          // REDUCESUM: ReduceL2 (sqrt of sum of squares)
+    int b_f16 = -1;           // MATMUL/GEMM: index into Impl::f16_weights, or -1
+    const float* b_f16_src = nullptr;  // fp32 base pointer the runtime B must match
     onnxm::Tensor fill;
     int out_dtype = 0;
 };
@@ -1766,6 +1799,11 @@ struct Impl {
     std::vector<std::vector<uint8_t>> sym_bufs;
     uint64_t rng_ctr = 0;
     PackedLookup lookup;
+    // fp16 weight storage (M2): converted copies of initializer
+    // tensors used as MatMul/Gemm B operands, deduped by value id.
+    bool want_f16 = false;
+    std::vector<std::vector<uint16_t>> f16_weights;
+    std::map<int, int> f16_by_val;
 };
 
 // ------------------------------------------------------- shape helpers -
@@ -2321,6 +2359,42 @@ onnxm::Tensor permute_copy(const onnxm::Tensor& t, const std::vector<int64_t>& p
     return o;
 }
 
+// fp16 weight storage marking (M2): if a MatMul/Gemm step's B input
+// resolves through views to a graph initializer (fp32, at least 4096
+// elements), convert it once into Impl::f16_weights and record the
+// binding on the step. The executor re-checks the runtime pointer
+// against b_f16_src, so any view whose data does not start exactly
+// at the tensor base (a slice with an offset, say) falls back to
+// the fp32 operand.
+void mark_b_f16(Compiler& C, Step& st) {
+    Impl& im = C.im;
+    if (!im.want_f16 || st.in.size() < 2 || st.in[1] < 0) return;
+    int v = st.in[1];
+    while (true) {
+        const Value& val = im.vals[v];
+        if (val.kind == Value::CONSTV) break;
+        if (val.kind == Value::RT && val.base >= 0 && val.view_kind != 0) {
+            v = val.base;
+            continue;
+        }
+        return;
+    }
+    const onnxm::Tensor& ct = im.vals[v].ct;
+    if (ct.data_type != 1 || ct.numel() < 4096 || ct.data.empty()) return;
+    auto it = im.f16_by_val.find(v);
+    int idx;
+    if (it != im.f16_by_val.end()) {
+        idx = it->second;
+    } else {
+        idx = (int)im.f16_weights.size();
+        im.f16_weights.emplace_back((size_t)ct.numel());
+        avx2k::f32_to_f16((const float*)ct.data.data(), im.f16_weights.back().data(), ct.numel());
+        im.f16_by_val[v] = idx;
+    }
+    st.b_f16 = idx;
+    st.b_f16_src = (const float*)ct.data.data();
+}
+
 void lower_node(Compiler& C, const onnxm::Node& n) {
     Impl& im = C.im;
     const std::string& op = n.op;
@@ -2607,6 +2681,7 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
             return;
         }
         int o = C.new_rt(odt, os);
+        mark_b_f16(C, st);
         C.add_step(st, {o});
         reg_out(0, o);
         return;
@@ -3455,7 +3530,13 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
 // ------------------------------------------------------ step execute ---
 void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector<RT>& outs, Scratch& sc) {
     switch (st.k) {
-        case SK::MATMUL: k_matmul(ins[0], ins[1], outs[0], sc); break;
+        case SK::MATMUL: {
+            const uint16_t* bf = nullptr;
+            if (st.b_f16 >= 0 && (const float*)ins[1].p == st.b_f16_src)
+                bf = im.f16_weights[st.b_f16].data();
+            k_matmul(ins[0], ins[1], outs[0], sc, bf);
+            break;
+        }
         case SK::GEMM: {
             RT A = ins[0], B = ins[1];
             if (st.transA) {
@@ -3466,7 +3547,10 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
                 std::swap(B.shape[B.shape.size() - 2], B.shape[B.shape.size() - 1]);
                 std::swap(B.strides[B.strides.size() - 2], B.strides[B.strides.size() - 1]);
             }
-            k_matmul(A, B, outs[0], sc);
+            const uint16_t* bf = nullptr;
+            if (st.b_f16 >= 0 && (const float*)B.p == st.b_f16_src)
+                bf = im.f16_weights[st.b_f16].data();
+            k_matmul(A, B, outs[0], sc, bf);
             bool have_c = ins.size() > 2;
             if (st.alpha != 1.0f || have_c) {
                 const RT* Cp = have_c ? &ins[2] : nullptr;
@@ -3630,10 +3714,12 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
 }  // namespace
 
 // ---------------------------------------------------------- compile ----
-std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label) {
+std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bool fp16_weights) {
     auto plan = std::make_shared<Plan>();
     auto im = std::make_shared<Impl>();
     plan->impl_ = im;
+    im->want_f16 = fp16_weights && cpu::features().avx2 && cpu::features().fma &&
+                   cpu::features().f16c;
     Compiler C(*im, g, label);
     // Initializers first (they may also be listed as inputs; parse_graph
     // already filtered them out of g.inputs).

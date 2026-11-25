@@ -31,4 +31,14 @@ void w4a_saxpy64(float f, const uint8_t* prow, float* acc);
 // inner loop: one k-group of one output row.
 float w4b_dot64(const uint8_t* prow, float sc, float ze, const float* x);
 
+// fp16-stored weight kernels (M2): the values are converted on the
+// fly with F16C; compute stays fp32.
+//
+// y[i] += a * (float)x16[i] for i in [0, n).
+void saxpy_f16(float a, const uint16_t* x, float* y, int64_t n);
+// Returns sum over i in [0, n) of a[i] * (float)b16[i].
+float dot_f16(const float* a, const uint16_t* b, int64_t n);
+// Bulk conversion for plan compile time.
+void f32_to_f16(const float* src, uint16_t* dst, int64_t n);
+
 }  // namespace avx2k

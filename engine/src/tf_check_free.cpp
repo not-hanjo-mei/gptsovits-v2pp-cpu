@@ -54,12 +54,14 @@ static freeeng::Tensor npy_tensor(const NpyTensor& t) {
 int main(int argc, char** argv) {
     std::string root;  // --root is required (no baked-in default)
     std::string mode = "packed", dump_path, ref_path;
+    bool fp16_weights = false;
     int threads = 4, max_rows = 6;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
         if (a == "--root") root = next();
         else if (a == "--mode") mode = next();
+        else if (a == "--fp16-weights") fp16_weights = true;
         else if (a == "--threads") threads = std::stoi(next());
         else if (a == "--dump") dump_path = next();
         else if (a == "--ref") ref_path = next();
@@ -81,7 +83,7 @@ int main(int argc, char** argv) {
         auto compile = [&](const std::string& path, const std::string& label) {
             auto t0 = Clk::now();
             onnxm::Graph g = onnxm::load_model(path);
-            auto plan = freeeng::Plan::compile(g, label);
+            auto plan = freeeng::Plan::compile(g, label, fp16_weights && mode == "fp32");
             auto ms = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
             std::cerr << "[compile] " << label << ": " << plan->step_count() << " steps in " << (long)ms << " ms\n";
             return plan;

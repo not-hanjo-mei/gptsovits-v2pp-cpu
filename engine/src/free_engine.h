@@ -53,7 +53,15 @@ class Plan {
   public:
     // Compile from a parsed graph. Throws std::runtime_error on any op
     // or pattern outside the implemented set (the census set).
-    static std::shared_ptr<Plan> compile(const onnxm::Graph& g, std::string label);
+    // fp16_weights: store MatMul/Gemm weight operands (graph
+    // initializers) as fp16 and convert on the fly at run time (M2
+    // fp16 weight storage; halves weight traffic, compute stays
+    // fp32). Only where the CPU reports AVX2+FMA+F16C; other CPUs
+    // keep the fp32 originals. Off by default: callers opt in per
+    // plan (the GPT plans; never the vits plan, whose gate is an
+    // exact fp32 comparison).
+    static std::shared_ptr<Plan> compile(const onnxm::Graph& g, std::string label,
+                                         bool fp16_weights = false);
     void set_packed_lookup(PackedLookup fn) { lookup_ = std::move(fn); }
 
     struct Instance;

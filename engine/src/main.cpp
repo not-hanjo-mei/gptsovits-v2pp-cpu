@@ -334,6 +334,7 @@ int main(int argc, char** argv) {
     // defaults reproduce the stage-2 session configuration exactly.
     bool use_packed = false, no_arena = false, vits_baked = false;
     bool fp32_graphs = false;  // --fp32-graphs: standard-precision load path (free engine)
+    bool fp16_weights = false;  // --fp16-weights: fp16 weight storage for the GPT plans (fp32 path only)
     std::string opt_level = "all";
     // --engine free: the ORT-free engine (ORT-FREE.md phase 2). GPT runs
     // packed residency (W4) and vits packed residency by default, or the
@@ -355,6 +356,7 @@ int main(int argc, char** argv) {
         // the default with --packed is vits packed residency (S10).
         else if (a == "--vits-baked") vits_baked = true;
         else if (a == "--fp32-graphs") fp32_graphs = true;
+        else if (a == "--fp16-weights") fp16_weights = true;
         else if (a == "--no-arena") no_arena = true;
         else if (a == "--opt-level") opt_level = next();
         else if (a == "--emit-models") emit_dir = next();
@@ -403,6 +405,7 @@ int main(int argc, char** argv) {
     if (!engine_free) { std::cerr << "this is a free-only build: --engine ort is not compiled in\n"; return 2; }
 #endif
     if (fp32_graphs && !engine_free) { std::cerr << "--fp32-graphs requires --engine free\n"; return 2; }
+    if (fp16_weights && !fp32_graphs) { std::cerr << "--fp16-weights requires --fp32-graphs\n"; return 2; }
     if (engine_free && !fp32_graphs && gpt_bits != 4) { std::cerr << "--engine free supports --gpt-bits 4 only (packed graphs are W4)\n"; return 2; }
     if (engine_free && !emit_dir.empty()) { std::cerr << "--emit-models is ORT-path only\n"; return 2; }
     std::string scheme = gpt_bits == 4 ? "w4" : "w8";
@@ -451,18 +454,18 @@ int main(int argc, char** argv) {
                 // from <root>/graphs-fp32/ (the stage decoder file holds
                 // the logits variant; see DESIGN.md). No packs, no
                 // manifests, no packed lookups.
-                auto compile = [&](const std::string& path, const std::string& label) {
+                auto compile = [&](const std::string& path, const std::string& label, bool f16 = false) {
                     auto t0 = Clock::now();
                     onnxm::Graph g = onnxm::load_model(path);
-                    auto p = freeeng::Plan::compile(g, label);
+                    auto p = freeeng::Plan::compile(g, label, f16 && fp16_weights);
                     std::cerr << "[load] free plan " << label << " compiled in " << (int)ms_since(t0)
                               << " ms, " << p->step_count() << " steps; rss " << rss_kb() / 1024 << " MB\n";
                     return p;
                 };
-                fh.enc = compile(root + "/graphs-fp32/t2s_encoder_fp32.onnx", "gpt_encoder");
-                fh.first = compile(root + "/graphs-fp32/t2s_first_stage_decoder_fp32.onnx", "gpt_first");
-                fh.stage_a = compile(root + "/graphs-fp32/t2s_stage_decoder_fp32.onnx", "gpt_stage_a");
-                fh.stage_b = compile(root + "/graphs-fp32/t2s_stage_decoder_fp32.onnx", "gpt_stage_b");
+                fh.enc = compile(root + "/graphs-fp32/t2s_encoder_fp32.onnx", "gpt_encoder", true);
+                fh.first = compile(root + "/graphs-fp32/t2s_first_stage_decoder_fp32.onnx", "gpt_first", true);
+                fh.stage_a = compile(root + "/graphs-fp32/t2s_stage_decoder_fp32.onnx", "gpt_stage_a", true);
+                fh.stage_b = compile(root + "/graphs-fp32/t2s_stage_decoder_fp32.onnx", "gpt_stage_b", true);
                 fh.vits = compile(root + "/graphs-fp32/vits_fp32.onnx", "vits");
             } else {
                 fh.store = std::make_shared<packed::BlobStore>();
