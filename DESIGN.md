@@ -135,7 +135,16 @@ Same discipline as the ARM engine:
    runtime CPU detection, scalar loops unchanged elsewhere). Dev-VM
    result: Conv 20.8 s to 15.4 s, host total 32.5 s to 26.5 s for
    the gate sentence, all four correctness gates unchanged
-   (361/361, 1.000000, 299/361, 0.959880).
+   (361/361, 1.000000, 299/361, 0.959880). Cross-verified on a
+   second machine (InstaBox, AMD EPYC 4 vCPU, AVX2+FMA+AVX-512),
+   cloned from this repo and built clean: all four gates reproduce
+   exactly there (the packed correlation is bit-stable at 0.959880,
+   relrms identical), and the same sentence measures, standard
+   precision vs the W4 tier: RTF 3.15 vs 2.02 at 2 threads, RTF
+   2.10 vs 1.25 at 4 threads; peak RSS 2,586 MB vs about 255 MB.
+   The W4 kernels on x86 are still the scalar floor at this point,
+   so the W4 lead is weight traffic alone; the AVX2 packed tier is
+   still to come.
 4. **M3.** Hardening: streaming output, packaging, docs.
 5. **Final gate.** A published speed comparison, run once everything
    above is done: stock GPT-SoVITS (PyTorch CPU) vs this engine at
