@@ -36,6 +36,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "avx2_kernels.h"  // M2: AVX2 tier kernels (own TU, -mavx2)
 #include "cpu.h"
 #include "json_min.h"
 #include "npz.h"
@@ -845,17 +846,69 @@ inline void gemv_a_w4_scalar(const float* X, int64_t K, int64_t D,
     });
 }
 
+// AVX2 tier (x86-64): same group structure as gemv_a_w4_scalar, with
+// the 32-byte inner SAXPY replaced by avx2k::w4a_saxpy64. The factor
+// and the zero-point correction keep the scalar form, so the only
+// numeric difference from the scalar floor is FMA contraction inside
+// the group.
+inline void gemv_a_w4_avx2(const float* X, int64_t K, int64_t D,
+                           const uint8_t* pk, const float* sc, const uint8_t* ze,
+                           const float* bias, float* Y) {
+    const int64_t ng = D / 64;
+    kernel_pool().run([&](int idx, int nt) {
+        chunk(idx, nt, ng, [&](int64_t g0, int64_t g1) {
+            for (int64_t g = g0; g < g1; g++) {
+                float corr = 0.0f;
+                float* __restrict__ acc = Y + g * 64;
+                for (int64_t jb = 0; jb < 64; jb++) acc[jb] = bias ? bias[g * 64 + jb] : 0.0f;
+                for (int64_t i = 0; i < K; i++) {
+                    float f = X[i] * sc[(size_t)i * ng + g];
+                    corr += f * (float)ze[(size_t)i * ng + g];
+                    avx2k::w4a_saxpy64(f, pk + (size_t)i * (D / 2) + g * 32, acc);
+                }
+                for (int64_t jb = 0; jb < 64; jb++) acc[jb] -= corr;
+            }
+        });
+    });
+}
+
+// AVX2 tier for mode B (M == 1): one output row is a chain of 64-wide
+// k-group dots (avx2k::w4b_dot64); no dequantized row is materialized.
+// Requires K to be a whole number of groups; other shapes keep the
+// block path in gemm_b_w4.
+inline void gemv_b_w4_avx2(const float* X, int64_t K, int64_t D,
+                           const uint8_t* pk, const float* sc, const uint8_t* ze,
+                           const float* bias, float* Y) {
+    const int64_t ng = K / 64;
+    kernel_pool().run([&](int idx, int nt) {
+        chunk(idx, nt, D, [&](int64_t j0, int64_t j1) {
+            for (int64_t j = j0; j < j1; j++) {
+                const uint8_t* prow = pk + (size_t)j * (K / 2);
+                const float* srow = sc + (size_t)j * ng;
+                const uint8_t* zrow = ze + (size_t)j * ng;
+                float a = bias ? bias[j] : 0.0f;
+                for (int64_t g = 0; g < ng; g++)
+                    a += avx2k::w4b_dot64(prow + g * 32, srow[g], (float)zrow[g], X + g * 64);
+                Y[j] = a;
+            }
+        });
+    });
+}
+
 // Dispatch: the i8 tier first when enabled for mode A (see
 // gemv_i8_enabled_for) and the shape is a whole number of 64-wide
 // groups; then the NEON tier only when explicitly enabled
-// (POTATO_NEON_GEMV=1, see the note at POTATO_PACKED_NEON); the
-// scalar floor otherwise (and always on x86, which never compiles
-// the NEON branch).
+// (POTATO_NEON_GEMV=1, see the note at POTATO_PACKED_NEON); then the
+// AVX2 tier where the CPU reports it; the scalar floor otherwise.
 inline void gemv_a_w4(const float* X, int64_t K, int64_t D,
                       const uint8_t* pk, const float* sc, const uint8_t* ze,
                       const float* bias, float* Y) {
     if (gemv_i8_enabled_for(0) && D >= 64 && D % 64 == 0) {
         gemv_a_w4_i8(X, K, D, pk, sc, ze, bias, Y);
+        return;
+    }
+    if (cpu::features().avx2 && cpu::features().fma && D >= 64 && D % 64 == 0) {
+        gemv_a_w4_avx2(X, K, D, pk, sc, ze, bias, Y);
         return;
     }
 #if POTATO_PACKED_NEON
@@ -874,12 +927,14 @@ __attribute__((noinline)) inline void apply_tile(
     const float* __restrict__ X, int64_t K, int64_t m0, int64_t mw,
     const float* __restrict__ Wd, int64_t BD, int64_t bw,
     float* __restrict__ acc) {
+    const bool use_avx2 = cpu::features().avx2 && cpu::features().fma;
     for (int64_t i = 0; i < K; i++) {
         const float* __restrict__ wd = Wd + (size_t)i * BD;
         for (int64_t m = 0; m < mw; m++) {
             float xv = X[(size_t)(m0 + m) * K + i];
             float* __restrict__ a = acc + (size_t)m * BD;
-            for (int64_t jb = 0; jb < bw; jb++) a[jb] += xv * wd[jb];
+            if (use_avx2) avx2k::saxpy(xv, wd, a, bw);
+            else for (int64_t jb = 0; jb < bw; jb++) a[jb] += xv * wd[jb];
         }
     }
 }
@@ -949,6 +1004,10 @@ inline void gemm_b_w4(const float* X, int64_t M, int64_t K, int64_t D,
         return;
     }
 #endif
+    if (M == 1 && K >= 64 && K % 64 == 0 && cpu::features().avx2 && cpu::features().fma) {
+        gemv_b_w4_avx2(X, K, D, pk, sc, ze, bias, Y);
+        return;
+    }
     const int64_t ng = K / 64;
     kernel_pool().run([&](int idx, int nt) {
         std::vector<float> wd(K);

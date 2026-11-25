@@ -39,19 +39,19 @@ else()
 endif()
 
 if(NOT POTATO_FREE_ONLY)
-  add_executable(tf_check src/tf_check.cpp)
+  add_executable(tf_check src/tf_check.cpp src/avx2_kernels.cpp)
   target_link_libraries(tf_check PRIVATE onnxruntime)
 
-  add_executable(vits_check src/vits_check.cpp src/vits_kernels.cpp)
+  add_executable(vits_check src/vits_check.cpp src/vits_kernels.cpp src/avx2_kernels.cpp)
   target_link_libraries(vits_check PRIVATE onnxruntime)
 
-  add_executable(kbench src/kbench.cpp)
+  add_executable(kbench src/kbench.cpp src/avx2_kernels.cpp)
   target_link_libraries(kbench PRIVATE onnxruntime pthread)
 endif()
 
 # GEMV tier micro-bench (packed_core.h only, no ORT): builds for the
 # NDK target too, unlike kbench whose ORT import is x86-only.
-add_executable(gemv_bench src/gemv_bench.cpp)
+add_executable(gemv_bench src/gemv_bench.cpp src/avx2_kernels.cpp)
 if(NOT ANDROID)
   target_link_libraries(gemv_bench PRIVATE pthread)
 endif()
