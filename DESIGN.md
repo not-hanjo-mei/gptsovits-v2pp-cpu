@@ -145,6 +145,12 @@ Same discipline as the ARM engine:
    The W4 kernels on x86 are still the scalar floor at this point,
    so the W4 lead is weight traffic alone; the AVX2 packed tier is
    still to come.
+   Second kernel: the same SAXPY form vectorized inside k_matmul
+   (tiled, GEMV and small-GEMM paths), which also covers the GEMM
+   step kind. Gates unchanged (the packed vits correlation prints
+   0.959881 instead of 0.959880 because the fp32 reference side now
+   runs FMA matmuls; the packed path itself is untouched and its
+   internal packed-vs-baked check stays 1.000000).
 4. **M3.** Hardening: streaming output, packaging, docs.
 5. **Final gate.** A published speed comparison, run once everything
    above is done: stock GPT-SoVITS (PyTorch CPU) vs this engine at

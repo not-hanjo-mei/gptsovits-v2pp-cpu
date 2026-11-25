@@ -310,6 +310,7 @@ void k_matmul(const RT& A0, const RT& B0, RT& C, Scratch& sc) {
     // No contiguity forcing: every access below goes through strides,
     // and materializing a transposed view (attention V) costs more
     // than the strided reads it saves.
+    const bool use_avx2 = cpu::features().avx2 && cpu::features().fma;
     RT A = A0, B = B0;
     // Shapes: A [..., M, K], B [..., K, N] with broadcast batch dims.
     int ra = (int)A.shape.size(), rb = (int)B.shape.size();
@@ -374,7 +375,8 @@ void k_matmul(const RT& A0, const RT& B0, RT& C, Scratch& sc) {
                             const float* browp = bb + k * brow;
                             float* crow = cp0 + r * N;
                             if (bcol == 1) {
-                                for (int64_t j = 0; j < N; j++) crow[j] += av * browp[j];
+                                if (use_avx2) avx2k::saxpy(av, browp, crow, N);
+                                else for (int64_t j = 0; j < N; j++) crow[j] += av * browp[j];
                             } else {
                                 for (int64_t j = 0; j < N; j++) crow[j] += av * browp[j * bcol];
                             }
@@ -402,7 +404,8 @@ void k_matmul(const RT& A0, const RT& B0, RT& C, Scratch& sc) {
                         float av = a[k * acol];
                         const float* browp = bb + k * brow + j0 * bcol;
                         if (bcol == 1) {
-                            for (int64_t j = j0; j < j1; j++) c[j] += av * browp[j - j0];
+                            if (use_avx2) avx2k::saxpy(av, browp, c + j0, j1 - j0);
+                            else for (int64_t j = j0; j < j1; j++) c[j] += av * browp[j - j0];
                         } else {
                             for (int64_t j = j0; j < j1; j++) c[j] += av * browp[(j - j0) * bcol];
                         }
@@ -421,7 +424,8 @@ void k_matmul(const RT& A0, const RT& B0, RT& C, Scratch& sc) {
                             float av = a[m * arow + k * acol];
                             const float* browp = bb + k * brow;
                             if (bcol == 1) {
-                                for (int64_t j = 0; j < N; j++) crow[j] += av * browp[j];
+                                if (use_avx2) avx2k::saxpy(av, browp, crow, N);
+                                else for (int64_t j = 0; j < N; j++) crow[j] += av * browp[j];
                             } else {
                                 for (int64_t j = 0; j < N; j++) crow[j] += av * browp[j * bcol];
                             }
