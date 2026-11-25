@@ -157,6 +157,14 @@ Same discipline as the ARM engine:
    machine's run-to-run noise (about plus or minus 10 percent;
    four samples span 4.00 to 4.47 s at 4 threads), as expected:
    W4 decode runs the packed kernels, not k_matmul.
+   Third kernel set: AVX2 tiers for the W4 packed GEMVs (mode A
+   group SAXPY, mode B group dot, both over a shared nibble unpack;
+   the block GEMM tile apply also takes the SAXPY form). The
+   packed teacher-forced gate holds at exactly 299/361. EPYC:
+   W4 GPT decode down 13 to 23 percent, the W4 sentence at RTF
+   1.88 (2 threads) and 1.21 (4 threads). The packed VITS conv
+   time did not move; it lives in the packed conv kernels, which
+   are still scalar on x86, and is the next target.
 4. **M3.** Hardening: streaming output, packaging, docs.
 5. **Final gate.** A published speed comparison, run once everything
    above is done: stock GPT-SoVITS (PyTorch CPU) vs this engine at
