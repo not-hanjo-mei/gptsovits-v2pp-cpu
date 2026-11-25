@@ -15,6 +15,7 @@
 #include <random>
 #include <stdexcept>
 
+#include "avx2_kernels.h"  // M2: AVX2/FMA kernels for the generic fp32 path
 #include "cpu.h"
 #include "packed_core.h"
 #include "vits_kernels.h"  // phase 2: packed conv/gather kernels (ORT-free header)
@@ -1213,6 +1214,7 @@ void k_conv(const RT& X0, const RT& W0, const RT* B, RT& Y, const std::vector<in
         // loop is a contiguous (stride 1) or regularly strided SAXPY.
         int64_t L = X.shape[2], K = W.shape[2], Lout = Y.shape[2];
         int64_t stride = strides_a[0], dilv = dil[0], pl = pads[0];
+        const bool use_avx2 = cpu::features().avx2 && cpu::features().fma;
         packed::kernel_pool().run([&](int idx, int nt) {
             packed::chunk(idx, nt, N * O, [&](int64_t t0, int64_t t1) {
                 for (int64_t t = t0; t < t1; t++) {
@@ -1234,7 +1236,8 @@ void k_conv(const RT& X0, const RT& W0, const RT* B, RT& Y, const std::vector<in
                             if (l_lo >= l_hi) continue;
                             if (stride == 1) {
                                 const float* xs = xr + l_lo + base;
-                                for (int64_t l = l_lo; l < l_hi; l++) yl[l] += wv * xs[l - l_lo];
+                                if (use_avx2) avx2k::saxpy(wv, xs, yl + l_lo, l_hi - l_lo);
+                                else for (int64_t l = l_lo; l < l_hi; l++) yl[l] += wv * xs[l - l_lo];
                             } else {
                                 for (int64_t l = l_lo; l < l_hi; l++) yl[l] += wv * xr[l * stride + base];
                             }

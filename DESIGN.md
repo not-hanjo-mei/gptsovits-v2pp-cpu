@@ -127,7 +127,15 @@ Same discipline as the ARM engine:
    1.5-CPU VM. That RTF is a pre-acceleration baseline, not a result.
 3. **M2.** AVX2 kernels for decode GEMV and the heavy VITS blocks,
    AVX2 packed kernels for the W4 tier, fp16 weight storage, thread
-   pinning.
+   pinning. Profiling the standard-precision host (FE_PROFILE, dev
+   VM) put the work in order: VITS is 89% Conv (20.8 s of 23.3 s),
+   GPT is about 75% MatMul/GEMM. First kernel landed: the conv1d
+   SAXPY inner loop as an AVX2/FMA kernel in its own translation
+   unit (only that file is compiled -mavx2; callers dispatch on
+   runtime CPU detection, scalar loops unchanged elsewhere). Dev-VM
+   result: Conv 20.8 s to 15.4 s, host total 32.5 s to 26.5 s for
+   the gate sentence, all four correctness gates unchanged
+   (361/361, 1.000000, 299/361, 0.959880).
 4. **M3.** Hardening: streaming output, packaging, docs.
 5. **Final gate.** A published speed comparison, run once everything
    above is done: stock GPT-SoVITS (PyTorch CPU) vs this engine at

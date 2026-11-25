@@ -24,7 +24,7 @@ endif()
 # OFF — the shipping dual-engine build is unchanged. See ANDROID-SPIKE.md.
 option(POTATO_FREE_ONLY "tts_host: free engine only, no ONNX Runtime" OFF)
 
-add_executable(tts_host src/main.cpp src/g2p.cpp src/vits_kernels.cpp src/free_engine.cpp)
+add_executable(tts_host src/main.cpp src/g2p.cpp src/vits_kernels.cpp src/free_engine.cpp src/avx2_kernels.cpp)
 if(POTATO_FREE_ONLY)
   target_compile_definitions(tts_host PRIVATE POTATO_FREE_ONLY=1)
   if(NOT ANDROID)
@@ -63,14 +63,14 @@ target_include_directories(gemv_bench PRIVATE src)
 # Phase 2: vits_kernels.cpp joins for the packed conv kernels; its
 # declarations moved to the ORT-free vits_kernels.h, so still no ORT
 # headers or library in these binaries (verify with ldd).
-add_executable(tf_check_free src/tf_check_free.cpp src/free_engine.cpp src/vits_kernels.cpp)
+add_executable(tf_check_free src/tf_check_free.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp)
 target_link_libraries(tf_check_free PRIVATE pthread)
 target_include_directories(tf_check_free PRIVATE src)
 
 # ORT-free vits validation (phase 2): vits_check's protocol on the free
 # engine. Also deliberately ORT-free; cross-checks against the ORT path
 # through vits_check --dump files.
-add_executable(vits_check_free src/vits_check_free.cpp src/free_engine.cpp src/vits_kernels.cpp)
+add_executable(vits_check_free src/vits_check_free.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp)
 target_link_libraries(vits_check_free PRIVATE pthread)
 target_include_directories(vits_check_free PRIVATE src)
 
@@ -79,4 +79,11 @@ if(NOT POTATO_FREE_ONLY)
   set_target_properties(tf_check PROPERTIES
     BUILD_RPATH ${ORT_DIR}/lib
     INSTALL_RPATH ${ORT_DIR}/lib)
+endif()
+
+# M2: the AVX2 kernel TU is the only file compiled for the AVX2+FMA
+# baseline; everything else stays generic so the scalar fallback paths
+# keep their exact numerics (the packed gates depend on them).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    set_source_files_properties(src/avx2_kernels.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 endif()
