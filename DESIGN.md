@@ -214,3 +214,28 @@ Same discipline as the ARM engine:
   `work/fp32_full`. Its stage decoder must be the `*_logits` variant:
   the plain stage graph has no logits output; the repetition-penalty
   head exists only in the logits variant.
+
+## Final gate, partial results (2026-11-25, EPYC verification box)
+
+The user added Genie-TTS as a fourth column. Same machine (4 vCPU
+EPYC, shared), same sentence ("Hello, this is a test of the standard
+precision path."), same reference (neutral1, Chinese transcript),
+4 threads (Genie leaves ONNX Runtime at its default, which is all
+4 cores). Genie has no seed control, so its output length varies
+per run; RTF is the normalized figure.
+
+| engine | precision | RTF | peak RSS |
+|---|---|---|---|
+| Genie-TTS 2.0.2 (ORT, Python) | fp16 | **0.55** (1.72 s / 3.08 s audio; 2.27 s / 4.16 s) | 5,485 MB (whole Python process) |
+| this engine, W4 tier | W4 | 1.26–1.38 today (4.03–4.43 s / 3.20 s audio; best recorded 1.13) | 256 MB |
+| this engine, standard | fp32 | ~1.5 | 2,586 MB |
+
+One-time costs: Genie load-character + set-reference 10.6 s; this
+engine's W4 boot 0.4–0.6 s. Genie's first synthesis after load ran
+at RTF 1.24 (session warmup); the 0.55 figure is steady state.
+Output sanity-checked numerically (32 kHz, RMS ~0.10).
+
+Reading: on this box Genie's ORT fp16 stack is about 2.3× faster
+than our W4 tier in RTF, and our process is about 21× lighter.
+The remaining leg of the final gate is stock GPT-SoVITS (PyTorch
+CPU) on the same machine; the table is final only when it lands.
