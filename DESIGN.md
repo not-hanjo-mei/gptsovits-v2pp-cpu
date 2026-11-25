@@ -150,7 +150,13 @@ Same discipline as the ARM engine:
    step kind. Gates unchanged (the packed vits correlation prints
    0.959881 instead of 0.959880 because the fp32 reference side now
    runs FMA matmuls; the packed path itself is untouched and its
-   internal packed-vs-baked check stays 1.000000).
+   internal packed-vs-baked check stays 1.000000). EPYC result:
+   GPT decode time down 26 to 28 percent at both thread counts;
+   the standard-precision sentence goes to RTF 2.83 at 2 threads
+   and 1.84 at 4 threads. The W4 sentence is unchanged within the
+   machine's run-to-run noise (about plus or minus 10 percent;
+   four samples span 4.00 to 4.47 s at 4 threads), as expected:
+   W4 decode runs the packed kernels, not k_matmul.
 4. **M3.** Hardening: streaming output, packaging, docs.
 5. **Final gate.** A published speed comparison, run once everything
    above is done: stock GPT-SoVITS (PyTorch CPU) vs this engine at
