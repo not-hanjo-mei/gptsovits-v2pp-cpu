@@ -5,6 +5,11 @@
 
 #if defined(__AVX2__) && defined(__FMA__)
 #include <immintrin.h>
+#elif defined(__x86_64__)
+// The AVX-512 group kernels below are target-attributed; clang
+// needs the intrinsic declarations visible even when the TU is
+// compiled without AVX2 flags (GCC declares them either way).
+#include <immintrin.h>
 #endif
 
 namespace avx2k {
