@@ -521,3 +521,36 @@ remaining cost is small-op overhead, not memory order. The
 change also moved the vits fp32 gate statistics (maxerr
 4.34e-05 -> 6.25e-05) for zero gain, so it was reverted and
 the canonical statistics reproduce again.
+
+## Correction: stale-clone incident and the wide dot verdict (2026-11-26, night)
+
+The verification box's clone carried an uncommitted edit to
+avx2_kernels.cpp (the clang immintrin fix, applied box-side
+during the clang-21 attempt) that made every `git pull --ff-only`
+abort silently in scripts that discarded its output. Box builds
+therefore lagged HEAD by a varying amount during the late
+afternoon. Consequences, re-measured with HEAD-asserted builds:
+
+- The wide attention dot path (8d711f6) is NOT a wash. With
+  verified builds, stage-plan MATMUL is 105-109 ms against
+  164-171 ms without it -- about -120 ms per request across both
+  stage plans. It is re-landed. Its cost stands as recorded:
+  the vits fp32 gate statistics move to corr 1.000000, relrms
+  1.7e-05, maxerr 6.25253e-05 (from 1.3e-05 / 4.33773e-05), and
+  the packed internal maxerr to 1.66893e-06; the token gates
+  hold exactly (299/361, 361/361). These are the new baselines.
+- Parallel concat stays reverted: with verified builds the
+  CONCAT lines are 77-94 ms on both sides. That verdict now has
+  a sound basis.
+- The dead-step elimination (e86d653) is confirmed on the box:
+  stage UNOP calls drop 4,018 -> 1,066 per request.
+- The mode-B dotraw box figure (-90 ms of stage PACKED) was
+  measured inside the stale window and is unverified; the
+  change stays on its algebra and exact local gates.
+- The hand-written asm tile's box E2E reading from the same
+  window is likewise unverified; its isolated bench compiled
+  the sources directly and stands, as do all local gates.
+
+Box discipline from here: every verification script prints the
+clone's HEAD and working-tree status before building, and a
+failed pull fails the script.
