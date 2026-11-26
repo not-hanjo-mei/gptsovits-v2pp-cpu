@@ -239,3 +239,24 @@ Reading: on this box Genie's ORT fp16 stack is about 2.3× faster
 than our W4 tier in RTF, and our process is about 21× lighter.
 The remaining leg of the final gate is stock GPT-SoVITS (PyTorch
 CPU) on the same machine; the table is final only when it lands.
+
+## Post-gate optimization round (2026-11-26)
+
+The AVX2 conv tile was reshaped from 4 channels x 32 positions to
+4 x 16 with direct interior loads. The old shape held 16
+accumulators plus 4 position vectors in a 16-register file and
+spilled; the new one holds 11 live ymm. Micro-bench on the EPYC
+box: 29-35% ahead on every production shape (42.5 vs 32.4 GMAC/s
+at 192ch K=11), bit-identical output, all four gates unchanged.
+Same-session E2E (W4, 4 threads): vits 2,175-2,278 -> 1,512-1,592
+ms; sentence total 3,244-3,374 ms, **RTF 1.01-1.05** (was
+1.26-1.38 in the Genie session, best-ever 1.13 before the change).
+fp32 total improved to RTF 1.38 (4,336 ms). The W4 tier now sits
+on the RTF 1.0 line on this shared box.
+
+Next lever, profiled but not taken: GPT decode is 1,245 ms for 81
+steps (15.4 ms/step), of which the stage plans' kernel kinds sum
+to only ~600 ms (PACKED ~450, MATMUL ~85, SOFTMAX ~30). The rest
+is executor and pool-sync overhead across 668-step plans invoked
+per token. Closing that gap is an executor change, not a kernel
+change.
