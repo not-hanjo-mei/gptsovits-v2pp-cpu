@@ -1332,6 +1332,7 @@ void k_scatter_elements(const RT& D, const RT& I, const RT& U, RT& Y, int64_t ax
 void k_concat(const std::vector<const RT*>& ins, RT& Y, int64_t axis, Scratch& sc) {
     int rank = (int)Y.shape.size();
     if (axis < 0) axis += rank;
+    const int64_t es = (int64_t)onnxm::elem_size(Y.dtype);
     int64_t off = 0;
     for (auto* ip : ins) {
         RT sub;
@@ -1340,9 +1341,43 @@ void k_concat(const std::vector<const RT*>& ins, RT& Y, int64_t axis, Scratch& s
         sub.shape = ip->shape;
         sub.strides = Y.strides;
         // Offset along axis in elements of Y's layout.
-        sub.p = Y.p + off * Y.strides[axis] * (int64_t)onnxm::elem_size(Y.dtype);
+        sub.p = Y.p + off * Y.strides[axis] * es;
         RT in = sc.contig_of(*ip);
-        copy_tensor(sub, in);
+        // Large inputs (the KV feedback copies are ~600 KB each) go
+        // through the pool, split over the outer dims -- or over the
+        // axis itself when it is the outermost dim. Small ones keep
+        // the serial copy (pool_run's size gate decides).
+        int64_t inner = 1;
+        for (int d = (int)axis + 1; d < rank; d++) inner *= in.shape[d];
+        int64_t outer = 1;
+        for (int d = 0; d < (int)axis; d++) outer *= in.shape[d];
+        if (axis > 0 && in.contig() && Y.contig() && outer >= 2) {
+            const int64_t chunk_elems = in.shape[axis] * inner;
+            const int64_t ystride = Y.shape[axis] * inner;
+            const uint8_t* sp = in.p;
+            uint8_t* dp = sub.p;
+            packed::pool_run(in.numel(), [&](int idx, int nt) {
+                packed::chunk(idx, nt, outer, [&](int64_t o0, int64_t o1) {
+                    for (int64_t o = o0; o < o1; o++)
+                        memcpy(dp + o * ystride * es, sp + o * chunk_elems * es,
+                               (size_t)chunk_elems * es);
+                });
+            });
+        } else if (axis == 0 && in.contig() && Y.contig()) {
+            const int64_t rows = in.shape[0];
+            const int64_t row_elems = in.numel() / rows;
+            const uint8_t* sp = in.p;
+            uint8_t* dp = sub.p;
+            packed::pool_run(in.numel(), [&](int idx, int nt) {
+                packed::chunk(idx, nt, rows, [&](int64_t r0, int64_t r1) {
+                    if (r1 > r0)
+                        memcpy(dp + r0 * row_elems * es, sp + r0 * row_elems * es,
+                               (size_t)(r1 - r0) * row_elems * es);
+                });
+            });
+        } else {
+            copy_tensor(sub, in);
+        }
         off += ip->shape[axis];
     }
 }
@@ -1889,7 +1924,6 @@ struct Step {
     int b_f16 = -1;           // MATMUL/GEMM: index into Impl::f16_weights, or -1
     const float* b_f16_src = nullptr;  // fp32 base pointer the runtime B must match
     float out_scale = 1;      // MATMUL: epilogue scale folded from a downstream scalar Mul
-    int kv_cache = -1;        // CONCAT: index into Impl::kv_caches, or -1
     onnxm::Tensor fill;
     int out_dtype = 0;
 };
@@ -1931,17 +1965,6 @@ struct Impl {
     bool want_f16 = false;
     std::vector<std::vector<uint16_t>> f16_weights;
     std::map<int, int> f16_by_val;
-    // KV concat caches (see the detection in Plan::compile and the
-    // bind logic in Plan::run): persistent buffers holding the last
-    // output of a feedback Concat, with its shape and a sampled
-    // checksum of the stored tensor for resync detection.
-    struct KVCache {
-        std::vector<uint8_t> buf;
-        std::vector<int64_t> shape;
-        double sum = 0;
-        bool valid = false;
-    };
-    std::vector<KVCache> kv_caches;
 };
 
 // ------------------------------------------------------- shape helpers -
@@ -4215,21 +4238,6 @@ std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bo
     }
     while (fold_one_scalar_mul_pre(*im)) {
     }
-    // KV concat cache detection: a Concat whose first input is a
-    // graph input and whose output is a graph output is the
-    // autoregressive feedback pattern (past KV in, extended KV out,
-    // 50 instances in the stage decoder graphs). Plan::run serves
-    // repeats from a persistent per-step buffer and appends only the
-    // new slice, instead of copying the whole past every step.
-    for (auto& st : im->steps) {
-        if (st.k != SK::CONCAT || st.in.size() != 2 || st.out.size() != 1) continue;
-        const Value& pv = im->vals[st.in[0]];
-        const Value& ov = im->vals[st.out[0]];
-        if (pv.kind != Value::RT || pv.view_kind != 0 || !pv.is_input) continue;
-        if (ov.kind != Value::RT || ov.view_kind != 0 || !ov.is_output || ov.dtype != 1) continue;
-        st.kv_cache = (int)im->kv_caches.size();
-        im->kv_caches.emplace_back();
-    }
     // Liveness: last use over steps, then propagate through views
     // (reverse creation order: views are created after their bases, and
     // a view's last use must extend its base's).
@@ -4247,33 +4255,6 @@ std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bo
     plan->out_names_ = im->out_names;
     plan->n_steps_ = im->steps.size();
     return plan;
-}
-
-// Sampled checksum of a contiguous f32 tensor: up to ~256 strided
-// samples summed in double. Deterministic in the tensor's contents
-// and element count, so a KV-cache hit test is an equality check.
-static double kv_sample_sum(const RT& t) {
-    int64_t n = t.numel();
-    if (n <= 0) return 0;
-    const float* p = (const float*)t.p;
-    int64_t stride = std::max<int64_t>(1, n / 256);
-    double s = 0;
-    for (int64_t i = 0; i < n; i += stride) s += (double)p[i];
-    return s;
-}
-
-// Write src into Y at an axis offset (the tail half of a KV concat
-// whose past part is already in place in Y's buffer).
-static void k_concat_at(const RT& src0, RT& Y, int64_t axis, int64_t off, Scratch& sc) {
-    int rank = (int)Y.shape.size();
-    if (axis < 0) axis += rank;
-    RT sub;
-    sub.dtype = Y.dtype;
-    sub.shape = src0.shape;
-    sub.strides = Y.strides;
-    sub.p = Y.p + off * Y.strides[axis] * (int64_t)onnxm::elem_size(Y.dtype);
-    RT in = sc.contig_of(src0);
-    copy_tensor(sub, in);
 }
 
 // -------------------------------------------------------------- bind ---
@@ -4309,11 +4290,7 @@ static const char* g_prof_names[26] = {"MATMUL", "GEMM", "PACKED", "CONV", "LN",
                                        "PCONV", "PGATHER", "CONVT", "PAD", "EXPAND"};
 static std::map<std::string, double> g_prof_bind, g_prof_exec;
 static std::map<std::string, long> g_prof_runs;
-static long g_kv_hits = 0, g_kv_misses = 0;
 static void prof_print() {
-    if (g_kv_hits || g_kv_misses)
-        std::fprintf(stderr, "[FE_PROFILE] KV concat cache: hits %ld misses %ld\n", g_kv_hits,
-                     g_kv_misses);
     for (auto& kv : g_prof) {
         auto b = g_prof_bind.find(kv.first), e = g_prof_exec.find(kv.first);
         if (b != g_prof_bind.end())
@@ -4403,47 +4380,12 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
         if (v.kind != Value::RT) continue;
         for (auto& e : v.rshape) cshape[i].push_back(eeval(e, sv));
     }
-    // KV concat cache: for flagged CONCAT steps, if the persistent
-    // cache already holds exactly the incoming past tensor, bind the
-    // output value straight at the cache buffer (the view pass below
-    // then resolves its views against it) and let the step append
-    // only the new slice. POTATO_NO_KVCACHE=1 disables the path.
-    static const bool kv_off = std::getenv("POTATO_NO_KVCACHE") != nullptr;
-    std::vector<char> kv_hit(im.steps.size(), 0);
-    std::vector<char> kv_bound(nv, 0);
-    if (!kv_off) {
-        for (size_t si = 0; si < im.steps.size(); si++) {
-            const Step& st = im.steps[si];
-            if (st.kv_cache < 0) continue;
-            Impl::KVCache& kc = im.kv_caches[st.kv_cache];
-            const RT& past = res[st.in[0]];
-            int out_vid = st.out[0];
-            if (!kc.valid || past.dtype != 1 || !past.contig()) continue;
-            if (past.shape != kc.shape) continue;
-            if (kv_sample_sum(past) != kc.sum) continue;
-            int64_t need = 1;
-            for (auto d : cshape[out_vid]) need *= d;
-            need *= (int64_t)onnxm::elem_size(1);
-            if ((int64_t)kc.buf.size() < need) kc.buf.resize((size_t)need);
-            RT r;
-            r.dtype = 1;
-            r.p = kc.buf.data();
-            r.shape = cshape[out_vid];
-            r.strides = rowmajor(r.shape);
-            res[out_vid] = r;
-            done[out_vid] = 1;
-            kv_hit[si] = 1;
-            kv_bound[out_vid] = 1;
-            g_kv_hits++;
-        }
-    }
     // Arena assignment for materialized RT values (not views / inputs).
     struct Alloc { int vid; int64_t size; int def, use; bool out; };
     std::vector<Alloc> allocs;
     for (int i = 0; i < nv; i++) {
         Value& v = im.vals[i];
         if (v.kind != Value::RT || v.view_kind != 0 || v.is_input) continue;
-        if (kv_bound[i]) continue;
         if (v.def_step == -2) continue;  // degenerate LN side output
         int64_t sz = 1;
         for (auto d : cshape[i]) sz *= d;
@@ -4605,33 +4547,12 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
     auto exec_t0 = std::chrono::steady_clock::now();
     Scratch sc;
     std::vector<RT> sin, sout;
-    for (size_t si = 0; si < im.steps.size(); si++) {
-        const Step& st = im.steps[si];
+    for (auto& st : im.steps) {
         sin.clear();
         sout.clear();
         for (int v : st.in) sin.push_back(res[v]);
         for (int v : st.out) sout.push_back(res[v]);
         Scratch::Mark mk = sc.mark();
-        if (st.kv_cache >= 0 && kv_hit[si]) {
-            // Cache hit: the past part is already in the output
-            // buffer; append the new slice and refresh the cache
-            // bookkeeping for the next run.
-            auto p0 = profile ? std::chrono::steady_clock::now()
-                              : std::chrono::steady_clock::time_point{};
-            int64_t ax = st.axis < 0 ? st.axis + (int64_t)sout[0].shape.size() : st.axis;
-            k_concat_at(sin[1], sout[0], st.axis, sin[0].shape[ax], sc);
-            Impl::KVCache& kc = im.kv_caches[st.kv_cache];
-            kc.shape = sout[0].shape;
-            kc.sum = kv_sample_sum(sout[0]);
-            if (profile) {
-                double us = std::chrono::duration<double, std::micro>(
-                                std::chrono::steady_clock::now() - p0)
-                                .count();
-                prof_add(im.label, (int)st.k, us);
-            }
-            sc.reset(mk);
-            continue;
-        }
         if (profile) {
             auto p0 = std::chrono::steady_clock::now();
             exec_step(im, st, sin, sout, sc);
@@ -4641,20 +4562,6 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
             exec_step(im, st, sin, sout, sc);
         }
         sc.reset(mk);
-        if (st.kv_cache >= 0) {
-            // Cache miss: store the full concat result for the next
-            // run. The output is a materialized arena value, hence
-            // contiguous.
-            Impl::KVCache& kc = im.kv_caches[st.kv_cache];
-            const RT& Y = sout[0];
-            size_t bytes = (size_t)Y.numel() * onnxm::elem_size(Y.dtype);
-            if (kc.buf.size() < bytes) kc.buf.resize(bytes);
-            memcpy(kc.buf.data(), Y.p, bytes);
-            kc.shape = Y.shape;
-            kc.sum = kv_sample_sum(Y);
-            kc.valid = true;
-            g_kv_misses++;
-        }
     }
     if (profile)
         g_prof_exec[im.label] +=
