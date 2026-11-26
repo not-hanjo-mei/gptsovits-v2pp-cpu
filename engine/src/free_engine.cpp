@@ -551,6 +551,71 @@ void k_layernorm(const RT& X0, const RT* W, const RT* B, RT& Y, int64_t axis, fl
     else packed::kernel_pool().run(body);
 }
 
+// Fused attention (fuse_one_attn): Q [B,H,M,32], K as the transposed
+// view [B,H,32,L] (position stride = strides[3]), V [B,H,L,32].
+// Scores use the same float dot as k_matmul's wide path (the
+// double-accumulation classic path when the position stride is 32,
+// mirroring its S == K condition), the softmax replicates
+// k_softmax's row math exactly, and probs*V goes through pv_n32 --
+// the three-step sequence is bit-identical.
+void k_attn(const RT& Q, const RT& K, const RT& V, RT& Y, Scratch& sc) {
+    if (Q.shape.size() != 4 || K.shape.size() != 4 || V.shape.size() != 4)
+        fail("attn: rank");
+    const int64_t B = Q.shape[0], H = Q.shape[1], M = Q.shape[2], D = Q.shape[3];
+    const int64_t L = K.shape[3];
+    if (D != 32 || K.shape[0] != B || K.shape[1] != H || K.shape[2] != 32 ||
+        V.shape[0] != B || V.shape[1] != H || V.shape[2] != L || V.shape[3] != 32 ||
+        Q.strides[3] != 1 || K.strides[2] != 1 || V.strides[3] != 1 || !Y.contig() ||
+        Y.shape != Q.shape)
+        fail("attn: layout");
+    float* scores = (float*)sc.alloc((size_t)L * sizeof(float));
+    const bool classic = K.strides[3] == 32;
+    const bool use_avx2 = cpu::features().avx2 && cpu::features().fma;
+    for (int64_t b = 0; b < B; b++)
+        for (int64_t h = 0; h < H; h++) {
+            const float* kb = (const float*)K.p + b * K.strides[0] + h * K.strides[1];
+            const float* vb = (const float*)V.p + b * V.strides[0] + h * V.strides[1];
+            for (int64_t m = 0; m < M; m++) {
+                const float* q = (const float*)Q.p + b * Q.strides[0] + h * Q.strides[1] +
+                                 m * Q.strides[2];
+                for (int64_t l = 0; l < L; l++) {
+                    const float* krow = kb + l * K.strides[3];
+                    if (classic) {
+                        double s = 0;
+                        for (int64_t d = 0; d < 32; d++) s += (double)q[d] * krow[d];
+                        scores[l] = (float)s;
+                    } else if (use_avx2) {
+                        scores[l] = avx2k::dot_f32(q, krow, 32);
+                    } else {
+                        float s = 0;
+                        for (int64_t d = 0; d < 32; d++) s += q[d] * krow[d];
+                        scores[l] = s;
+                    }
+                }
+                float mx = -INFINITY;
+                for (int64_t l = 0; l < L; l++) mx = std::max(mx, scores[l]);
+                double sum = 0;
+                for (int64_t l = 0; l < L; l++) {
+                    scores[l] = std::exp(scores[l] - mx);
+                    sum += scores[l];
+                }
+                float inv = (float)(1.0 / sum);
+                for (int64_t l = 0; l < L; l++) scores[l] *= inv;
+                float* y = (float*)Y.p + ((b * H + h) * M + m) * 32;
+                if (use_avx2) {
+                    avx2k::pv_n32(scores, vb, V.strides[2], L, y);
+                } else {
+                    for (int64_t d = 0; d < 32; d++) y[d] = 0.0f;
+                    for (int64_t l = 0; l < L; l++) {
+                        float av = scores[l];
+                        const float* vrow = vb + l * V.strides[2];
+                        for (int64_t d = 0; d < 32; d++) y[d] += av * vrow[d];
+                    }
+                }
+            }
+        }
+}
+
 void k_softmax(const RT& X0, RT& Y, int64_t axis, Scratch& sc) {
     RT X = sc.contig_of(X0);
     int rank = (int)X.shape.size();
@@ -1898,7 +1963,7 @@ enum class SK { MATMUL, GEMM, PACKED, CONV, LN, SOFTMAX, REDUCESUM, ARGMAX, TOPK
                 // Phase 2 (vits): packed conv family, fp32 ConvTranspose,
                 // Pad, Expand. PCONV also carries PackedConvTranspose
                 // (pc_transpose), PGATHER is PackedGather.
-                PCONV, PGATHER, CONVT, PAD, EXPAND };
+                PCONV, PGATHER, CONVT, PAD, EXPAND, ATTN };
 struct Step {
     SK k = SK::COPY;
     std::vector<int> in, out;
@@ -3866,6 +3931,7 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
         case SK::EXPAND: k_expand(ins[0], outs[0]); break;
         case SK::LN: k_layernorm(ins[0], ins.size() > 1 ? &ins[1] : nullptr, ins.size() > 2 ? &ins[2] : nullptr, outs[0], st.axis, st.eps, sc); break;
         case SK::SOFTMAX: k_softmax(ins[0], outs[0], st.axis, sc); break;
+        case SK::ATTN: k_attn(ins[0], ins[1], ins[2], outs[0], sc); break;
         case SK::REDUCESUM: {
             if (st.l2) { k_reducel2(ins[0], outs[0], st.axes, st.keepdims); break; }
             k_reducesum(ins[0], outs[0], st.axes, st.keepdims);
@@ -4320,6 +4386,8 @@ static void dce_pure_steps(Impl& im) {
     }
 }
 
+static bool fuse_one_attn(Impl& im);  // defined below, with the folds
+
 std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bool fp16_weights) {
     auto plan = std::make_shared<Plan>();
     auto im = std::make_shared<Impl>();
@@ -4384,6 +4452,8 @@ std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bo
     }
     while (fuse_one_leaky(*im)) {
     }
+    while (fuse_one_attn(*im)) {
+    }
     dce_pure_steps(*im);
     // Liveness: last use over steps, then propagate through views
     // (reverse creation order: views are created after their bases, and
@@ -4428,13 +4498,13 @@ std::vector<int64_t> read_meta_ints(const RT& t) {
 // FE_PROFILE accumulators (see Plan::run). Kind order matches enum SK.
 // Totals are kept per plan label so a decode step (stage plans) can be
 // read separately from prefill (first) and the encoder.
-struct ProfAcc { double us[26] = {}; long n[26] = {}; };
+struct ProfAcc { double us[27] = {}; long n[27] = {}; };
 static std::map<std::string, ProfAcc> g_prof;
-static const char* g_prof_names[26] = {"MATMUL", "GEMM", "PACKED", "CONV", "LN", "SOFTMAX",
+static const char* g_prof_names[27] = {"MATMUL", "GEMM", "PACKED", "CONV", "LN", "SOFTMAX",
                                        "REDUCESUM", "ARGMAX", "TOPK", "CUMSUM", "GATHER",
                                        "GATHER_EL", "SCATTER_EL", "CONCAT", "CONSTSHAPE",
                                        "RANDNORM", "BINOP", "UNOP", "CAST", "WHERE", "COPY",
-                                       "PCONV", "PGATHER", "CONVT", "PAD", "EXPAND"};
+                                       "PCONV", "PGATHER", "CONVT", "PAD", "EXPAND", "ATTN"};
 static std::map<std::string, double> g_prof_bind, g_prof_exec;
 static std::map<std::string, long> g_prof_runs;
 static void prof_print() {
@@ -4444,7 +4514,7 @@ static void prof_print() {
             std::fprintf(stderr, "[FE_PROFILE] plan=%s runs=%ld bind %.1f ms exec %.1f ms\n", kv.first.c_str(),
                          g_prof_runs[kv.first], b->second / 1000.0, e->second / 1000.0);
         std::fprintf(stderr, "[FE_PROFILE] per-kind totals, plan=%s:\n", kv.first.c_str());
-        for (int i = 0; i < 26; i++)
+        for (int i = 0; i < 27; i++)
             if (kv.second.n[i]) std::fprintf(stderr, "  %-10s %8ld calls %12.1f ms\n", g_prof_names[i], kv.second.n[i], kv.second.us[i] / 1000.0);
     }
     std::fprintf(stderr, "[FE_PROFILE] binop paths (all plans):\n");
@@ -4457,7 +4527,7 @@ static void prof_print() {
 static void prof_add(const std::string& label, int kind, double us) {
     static bool reg = (std::atexit(prof_print), true);
     (void)reg;
-    if (kind >= 0 && kind < 26) { ProfAcc& a = g_prof[label]; a.us[kind] += us; a.n[kind]++; }
+    if (kind >= 0 && kind < 27) { ProfAcc& a = g_prof[label]; a.us[kind] += us; a.n[kind]++; }
 }
 
 void Plan::release_arena() {
@@ -4465,6 +4535,76 @@ void Plan::release_arena() {
     std::vector<uint8_t>().swap(im.arena);
     std::vector<uint8_t>().swap(im.out_arena);
     arena_bytes_ = 0;
+}
+
+// Fuse MATMUL -> SOFTMAX(last axis) -> MATMUL into one ATTN step
+// (the GPT attention block; 24 sites per stage plan, 24 in the
+// encoder and first-stage plans). The intermediate scores/probs
+// values lose their only consumers. Bit-identical by construction
+// (see k_attn). Conservative: single-use intermediates, no view
+// children, no graph outputs, no epilogue scales on either matmul.
+static bool fuse_one_attn(Impl& im) {
+    auto& steps = im.steps;
+    auto& vals = im.vals;
+    std::vector<int> uses(vals.size(), 0), view_kids(vals.size(), 0);
+    for (auto& s : steps)
+        for (int v : s.in) uses[v]++;
+    for (auto& v : vals) {
+        if (v.kind == Value::RT && v.view_kind != 0 && v.base >= 0) view_kids[v.base]++;
+        for (int m : {v.meta0, v.meta1, v.meta2, v.meta3})
+            if (m >= 0) uses[m]++;
+    }
+    for (size_t i = 0; i < steps.size(); i++) {
+        Step& s0 = steps[i];
+        if (s0.k != SK::MATMUL || s0.in.size() != 2 || s0.out.size() != 1) continue;
+        if (s0.out_scale != 1.0f) continue;
+        int vscores = s0.out[0];
+        if (vals[vscores].is_output || uses[vscores] != 1 || view_kids[vscores] != 0) continue;
+        int js = -1;
+        for (size_t j = 0; j < steps.size(); j++)
+            if (steps[j].k == SK::SOFTMAX && steps[j].in.size() == 1 &&
+                steps[j].in[0] == vscores && steps[j].out.size() == 1) {
+                js = (int)j;
+                break;
+            }
+        if (js < 0) continue;
+        if (!(steps[js].axis == -1 || steps[js].axis == 3)) continue;
+        int vprobs = steps[js].out[0];
+        if (vals[vprobs].is_output || uses[vprobs] != 1 || view_kids[vprobs] != 0) continue;
+        int ms = -1;
+        for (size_t j = 0; j < steps.size(); j++)
+            if (steps[j].k == SK::MATMUL && steps[j].in.size() == 2 &&
+                steps[j].in[0] == vprobs && steps[j].out.size() == 1) {
+                ms = (int)j;
+                break;
+            }
+        if (ms < 0) continue;
+        Step& s2 = steps[ms];
+        if (s2.out_scale != 1.0f) continue;
+        int vctx = s2.out[0];
+        int vq = s0.in[0], vk = s0.in[1], vv = s2.in[1];
+        s0.k = SK::ATTN;
+        s0.in = {vq, vk, vv};
+        s0.out = {vctx};
+        vals[vctx].def_step = (int)i;
+        vals[vscores].def_step = -2;
+        vals[vprobs].def_step = -2;
+        int e1 = std::max(js, ms), e2 = std::min(js, ms);
+        steps.erase(steps.begin() + e1);
+        steps.erase(steps.begin() + e2);
+        for (auto& v : vals) {
+            if (v.def_step == e1 || v.def_step == e2) {
+                v.def_step = -2;
+            } else {
+                int d = v.def_step;
+                if (d > e2) d--;
+                if (d > e1) d--;
+                v.def_step = d;
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inputs) {
