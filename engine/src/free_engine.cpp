@@ -35,7 +35,10 @@ struct KvCache {
         int64_t cap_rows = 0;
         void reserve(int64_t rows, int64_t rowf) {
             if (rows <= cap_rows) return;
-            auto nb = std::make_unique<float[]>((size_t)rows * (size_t)rowf);
+            // new float[n] without parentheses: default-initialized
+            // (unfilled). make_unique<float[]>(n) would value-
+            // initialize, i.e. zero the whole capacity.
+            std::unique_ptr<float[]> nb(new float[(size_t)rows * (size_t)rowf]);
             if (buf && len > 0)
                 std::memcpy(nb.get(), buf.get(), (size_t)len * (size_t)rowf * sizeof(float));
             buf = std::move(nb);
