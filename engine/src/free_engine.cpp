@@ -4309,7 +4309,11 @@ static const char* g_prof_names[26] = {"MATMUL", "GEMM", "PACKED", "CONV", "LN",
                                        "PCONV", "PGATHER", "CONVT", "PAD", "EXPAND"};
 static std::map<std::string, double> g_prof_bind, g_prof_exec;
 static std::map<std::string, long> g_prof_runs;
+static long g_kv_hits = 0, g_kv_misses = 0;
 static void prof_print() {
+    if (g_kv_hits || g_kv_misses)
+        std::fprintf(stderr, "[FE_PROFILE] KV concat cache: hits %ld misses %ld\n", g_kv_hits,
+                     g_kv_misses);
     for (auto& kv : g_prof) {
         auto b = g_prof_bind.find(kv.first), e = g_prof_exec.find(kv.first);
         if (b != g_prof_bind.end())
@@ -4430,6 +4434,7 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
             done[out_vid] = 1;
             kv_hit[si] = 1;
             kv_bound[out_vid] = 1;
+            g_kv_hits++;
         }
     }
     // Arena assignment for materialized RT values (not views / inputs).
@@ -4648,6 +4653,7 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
             kc.shape = Y.shape;
             kc.sum = kv_sample_sum(Y);
             kc.valid = true;
+            g_kv_misses++;
         }
     }
     if (profile)
