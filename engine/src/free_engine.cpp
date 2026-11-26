@@ -1888,6 +1888,7 @@ struct Step {
     bool l2 = false;          // REDUCESUM: ReduceL2 (sqrt of sum of squares)
     int b_f16 = -1;           // MATMUL/GEMM: index into Impl::f16_weights, or -1
     const float* b_f16_src = nullptr;  // fp32 base pointer the runtime B must match
+    float out_scale = 1;      // MATMUL: epilogue scale folded from a downstream scalar Mul
     onnxm::Tensor fill;
     int out_dtype = 0;
 };
@@ -3660,6 +3661,17 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
             if (st.b_f16 >= 0 && (const float*)ins[1].p == st.b_f16_src)
                 bf = im.f16_weights[st.b_f16].data();
             k_matmul(ins[0], ins[1], outs[0], sc, bf);
+            if (st.out_scale != 1.0f) {
+                // Folded scalar Mul: scale in place, in the output's
+                // own layout. The double round-trip is exact for an
+                // fp32 value times an fp32 scalar, so this is
+                // bit-identical to the separate Mul step.
+                auto ya = align_of(outs[0], outs[0].shape.size());
+                odometer(outs[0].shape, [&](const std::vector<int64_t>& c) {
+                    int64_t yo = off_of(outs[0], c, ya);
+                    write_d(outs[0], yo, read_d(outs[0], yo) * (double)st.out_scale);
+                });
+            }
             break;
         }
         case SK::GEMM: {
@@ -3839,6 +3851,108 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
 }  // namespace
 
 // ---------------------------------------------------------- compile ----
+// ------------------------------------------------- scalar-mul fold ---
+// Fold "Mul(MatMul(..), scalar-const)" into the matmul: the scalar
+// becomes the matmul's epilogue scale (GEMM: its alpha, when the
+// Gemm has no C input) and the Mul step is erased, its consumers
+// rewired to the matmul-side value. Motivated by the attention
+// score scale in the GPT stage plans: as a standalone step it walks
+// the score tensor in the consumer's layout (~200 ms per request);
+// as an epilogue it rides the matmul's own write pass. Bit-identical:
+// the epilogue multiplies each finished fp32 product by the same
+// fp32 scalar the Mul would have used (the double round-trip in the
+// epilogue is exact for an fp32 value times an fp32 scalar).
+// Conservative by construction: the matmul output value, resolved
+// through its view chain, must reach this Mul and nothing else.
+static bool fold_one_scalar_mul(Impl& im) {
+    auto& vals = im.vals;
+    auto& steps = im.steps;
+    std::vector<int> uses(vals.size(), 0), view_kids(vals.size(), 0);
+    for (auto& s : steps)
+        for (int v : s.in) uses[v]++;
+    for (size_t i = 0; i < vals.size(); i++) {
+        const Value& v = vals[i];
+        if (v.kind == Value::RT && v.view_kind != 0 && v.base >= 0) {
+            uses[v.base]++;
+            view_kids[v.base]++;
+        }
+        for (int m : {v.meta0, v.meta1, v.meta2, v.meta3})
+            if (m >= 0) uses[m]++;
+    }
+    for (int v : im.out_vals) uses[v]++;
+    for (int s2i = 0; s2i < (int)steps.size(); s2i++) {
+        Step& s2 = steps[s2i];
+        if (s2.k != SK::BINOP || s2.bop != BinOp::MUL || s2.in.size() != 2 ||
+            s2.out.size() != 1)
+            continue;
+        int vx = -1;
+        float scale = 0;
+        for (int t = 0; t < 2; t++) {
+            const Value& vc = vals[s2.in[t]];
+            if (vc.kind == Value::CONSTV && vc.ct.data_type == 1 && vc.ct.numel() == 1 &&
+                vc.ct.data.size() >= 4) {
+                scale = *(const float*)vc.ct.data.data();
+                vx = s2.in[1 - t];
+            }
+        }
+        if (vx < 0) continue;
+        int vy = s2.out[0];
+        if (vals[vy].kind != Value::RT || vals[vy].view_kind != 0) continue;
+        if (view_kids[vy] != 0) continue;
+        bool meta_ref = false;
+        for (auto& v : vals)
+            for (int m : {v.meta0, v.meta1, v.meta2, v.meta3})
+                if (m == vy) meta_ref = true;
+        if (meta_ref) continue;
+        // Resolve vx through views to its base value.
+        int vb = vx;
+        std::vector<int> chain;
+        while (vals[vb].kind == Value::RT && vals[vb].view_kind != 0 && vals[vb].base >= 0) {
+            chain.push_back(vb);
+            vb = vals[vb].base;
+        }
+        if (vals[vb].kind != Value::RT || vals[vb].view_kind != 0) continue;
+        if (vals[vb].is_output) continue;
+        // Use-count discipline: every value on the path is consumed
+        // exactly by the next link (and vb by nothing else); any
+        // extra consumer, meta ref or output flag breaks the equalities.
+        if (view_kids[vb] != (chain.empty() ? 0 : 1)) continue;
+        if (uses[vb] != view_kids[vb] + (chain.empty() ? 1 : 0)) continue;
+        bool ok = true;
+        for (size_t ci = 0; ci < chain.size(); ci++) {
+            int w = chain[ci];
+            if (vals[w].is_output) ok = false;
+            if (view_kids[w] != (ci == 0 ? 0 : 1)) ok = false;
+            if (uses[w] != view_kids[w] + (ci == 0 ? 1 : 0)) ok = false;
+        }
+        if (!ok) continue;
+        int s1i = vals[vb].def_step;
+        if (s1i < 0 || s1i >= (int)steps.size()) continue;
+        Step& s1 = steps[s1i];
+        if (s1.out.size() != 1 || s1.out[0] != vb) continue;
+        if (s1.k == SK::MATMUL) {
+            s1.out_scale *= scale;
+        } else if (s1.k == SK::GEMM && s1.in.size() == 2) {
+            s1.alpha *= scale;
+        } else {
+            continue;
+        }
+        for (auto& s : steps)
+            for (int& v : s.in)
+                if (v == vy) v = vx;
+        for (int& v : im.out_vals)
+            if (v == vy) v = vx;
+        if (vals[vy].is_output) vals[vx].is_output = true;
+        vals[vy].def_step = -2;
+        vals[vy].is_output = false;
+        steps.erase(steps.begin() + s2i);
+        for (auto& v : vals)
+            if (v.def_step > s2i) v.def_step--;
+        return true;
+    }
+    return false;
+}
+
 std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bool fp16_weights) {
     auto plan = std::make_shared<Plan>();
     auto im = std::make_shared<Impl>();
@@ -3896,6 +4010,8 @@ std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bo
         im->vals[id].is_output = true;
         im->out_names.push_back(vo.name);
         im->out_vals.push_back(id);
+    }
+    while (fold_one_scalar_mul(*im)) {
     }
     // Liveness: last use over steps, then propagate through views
     // (reverse creation order: views are created after their bases, and
