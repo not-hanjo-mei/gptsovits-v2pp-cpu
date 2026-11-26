@@ -31,6 +31,19 @@ void w4a_saxpy64(float f, const uint8_t* prow, float* acc);
 // inner loop: one k-group of one output row.
 float w4b_dot64(const uint8_t* prow, float sc, float ze, const float* x);
 
+// Elementwise f32 kernels over contiguous ranges. op codes mirror
+// free_engine's enum orderings (BinOp: ADD SUB MUL DIV POW MAXIMUM
+// LESS GREATER EQUAL OR AND; UnOp: NEG SQRT SIN COS EXP TANH
+// SIGMOID RELU ABS LEAKY). Only ops whose vector form is exactly
+// the IEEE scalar result are handled (ADD/SUB/MUL/DIV and the
+// comparisons; NEG/SQRT/RELU/ABS/LEAKY); the functions return false
+// for the rest and the caller keeps its scalar path (POW, MAXIMUM
+// with its NaN corner, and the libm transcendentals).
+// a_scalar / b_scalar broadcast element 0 across the range.
+bool binop_f32(int op, const float* a, const float* b, float* y, int64_t n, bool a_scalar,
+               bool b_scalar);
+bool unop_f32(int op, const float* a, float* y, int64_t n, float alpha);
+
 // fp16-stored weight kernels (M2): the values are converted on the
 // fly with F16C; compute stays fp32.
 //

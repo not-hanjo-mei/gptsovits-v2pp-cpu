@@ -1,5 +1,6 @@
 #include "avx2_kernels.h"
 
+#include <cmath>
 #include <cstring>
 
 #if defined(__AVX2__) && defined(__FMA__)
@@ -93,6 +94,130 @@ float w4b_dot64(const uint8_t* prow, float sc, float ze, const float* x) {
     }
     return a;
 #endif
+}
+
+namespace {
+// Elementwise op codes, mirroring free_engine's BinOp / UnOp order.
+enum { EB_ADD, EB_SUB, EB_MUL, EB_DIV, EB_POW, EB_MAX, EB_LESS, EB_GREATER, EB_EQUAL, EB_OR, EB_AND };
+enum { EU_NEG, EU_SQRT, EU_SIN, EU_COS, EU_EXP, EU_TANH, EU_SIGMOID, EU_RELU, EU_ABS, EU_LEAKY };
+
+#if defined(__AVX2__) && defined(__FMA__)
+template <int OP>
+inline __m256 ebinop_vec(__m256 a, __m256 b) {
+    switch (OP) {
+        case EB_ADD: return _mm256_add_ps(a, b);
+        case EB_SUB: return _mm256_sub_ps(a, b);
+        case EB_MUL: return _mm256_mul_ps(a, b);
+        case EB_DIV: return _mm256_div_ps(a, b);
+        case EB_LESS: return _mm256_and_ps(_mm256_cmp_ps(a, b, _CMP_LT_OQ), _mm256_set1_ps(1.0f));
+        case EB_GREATER: return _mm256_and_ps(_mm256_cmp_ps(b, a, _CMP_LT_OQ), _mm256_set1_ps(1.0f));
+        case EB_EQUAL: return _mm256_and_ps(_mm256_cmp_ps(a, b, _CMP_EQ_OQ), _mm256_set1_ps(1.0f));
+        case EB_OR:
+            return _mm256_and_ps(
+                _mm256_or_ps(_mm256_cmp_ps(a, _mm256_setzero_ps(), _CMP_NEQ_OQ),
+                             _mm256_cmp_ps(b, _mm256_setzero_ps(), _CMP_NEQ_OQ)),
+                _mm256_set1_ps(1.0f));
+        case EB_AND:
+            return _mm256_and_ps(
+                _mm256_and_ps(_mm256_cmp_ps(a, _mm256_setzero_ps(), _CMP_NEQ_OQ),
+                              _mm256_cmp_ps(b, _mm256_setzero_ps(), _CMP_NEQ_OQ)),
+                _mm256_set1_ps(1.0f));
+    }
+    return a;
+}
+template <int OP>
+inline __m256 eunop_vec(__m256 a, __m256 alpha) {
+    switch (OP) {
+        case EU_NEG: return _mm256_xor_ps(a, _mm256_set1_ps(-0.0f));
+        case EU_SQRT: return _mm256_sqrt_ps(a);
+        case EU_RELU: return _mm256_max_ps(a, _mm256_setzero_ps());
+        case EU_ABS: return _mm256_and_ps(a, _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF)));
+        case EU_LEAKY: {
+            __m256 m = _mm256_cmp_ps(a, _mm256_setzero_ps(), _CMP_GT_OQ);
+            return _mm256_blendv_ps(_mm256_mul_ps(alpha, a), a, m);
+        }
+    }
+    return a;
+}
+#endif
+
+template <int OP>
+inline float ebinop_scalar(float a, float b) {
+    switch (OP) {
+        case EB_ADD: return a + b;
+        case EB_SUB: return a - b;
+        case EB_MUL: return a * b;
+        case EB_DIV: return a / b;
+        case EB_LESS: return a < b ? 1.0f : 0.0f;
+        case EB_GREATER: return a > b ? 1.0f : 0.0f;
+        case EB_EQUAL: return a == b ? 1.0f : 0.0f;
+        case EB_OR: return (a != 0 || b != 0) ? 1.0f : 0.0f;
+        case EB_AND: return (a != 0 && b != 0) ? 1.0f : 0.0f;
+    }
+    return a;
+}
+template <int OP>
+inline float eunop_scalar(float a, float alpha) {
+    switch (OP) {
+        case EU_NEG: return -a;
+        case EU_SQRT: return std::sqrt(a);
+        case EU_RELU: return a > 0 ? a : 0.0f;
+        case EU_ABS: return std::fabs(a);
+        case EU_LEAKY: return a > 0 ? a : alpha * a;
+    }
+    return a;
+}
+
+template <int OP>
+void ebinop_run(const float* a, const float* b, float* y, int64_t n, bool as, bool bs) {
+    int64_t i = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+    const __m256 av = as ? _mm256_set1_ps(a[0]) : _mm256_setzero_ps();
+    const __m256 bv = bs ? _mm256_set1_ps(b[0]) : _mm256_setzero_ps();
+    for (; i + 8 <= n; i += 8) {
+        __m256 va = as ? av : _mm256_loadu_ps(a + i);
+        __m256 vb = bs ? bv : _mm256_loadu_ps(b + i);
+        _mm256_storeu_ps(y + i, ebinop_vec<OP>(va, vb));
+    }
+#endif
+    for (; i < n; i++) y[i] = ebinop_scalar<OP>(a[as ? 0 : i], b[bs ? 0 : i]);
+}
+template <int OP>
+void eunop_run(const float* a, float* y, int64_t n, float alpha) {
+    int64_t i = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+    const __m256 al = _mm256_set1_ps(alpha);
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(y + i, eunop_vec<OP>(_mm256_loadu_ps(a + i), al));
+#endif
+    for (; i < n; i++) y[i] = eunop_scalar<OP>(a[i], alpha);
+}
+}  // namespace
+
+bool binop_f32(int op, const float* a, const float* b, float* y, int64_t n, bool a_scalar,
+               bool b_scalar) {
+    switch (op) {
+        case EB_ADD: ebinop_run<EB_ADD>(a, b, y, n, a_scalar, b_scalar); return true;
+        case EB_SUB: ebinop_run<EB_SUB>(a, b, y, n, a_scalar, b_scalar); return true;
+        case EB_MUL: ebinop_run<EB_MUL>(a, b, y, n, a_scalar, b_scalar); return true;
+        case EB_DIV: ebinop_run<EB_DIV>(a, b, y, n, a_scalar, b_scalar); return true;
+        case EB_LESS: ebinop_run<EB_LESS>(a, b, y, n, a_scalar, b_scalar); return true;
+        case EB_GREATER: ebinop_run<EB_GREATER>(a, b, y, n, a_scalar, b_scalar); return true;
+        case EB_EQUAL: ebinop_run<EB_EQUAL>(a, b, y, n, a_scalar, b_scalar); return true;
+        case EB_OR: ebinop_run<EB_OR>(a, b, y, n, a_scalar, b_scalar); return true;
+        case EB_AND: ebinop_run<EB_AND>(a, b, y, n, a_scalar, b_scalar); return true;
+        default: return false;
+    }
+}
+bool unop_f32(int op, const float* a, float* y, int64_t n, float alpha) {
+    switch (op) {
+        case EU_NEG: eunop_run<EU_NEG>(a, y, n, alpha); return true;
+        case EU_SQRT: eunop_run<EU_SQRT>(a, y, n, alpha); return true;
+        case EU_RELU: eunop_run<EU_RELU>(a, y, n, alpha); return true;
+        case EU_ABS: eunop_run<EU_ABS>(a, y, n, alpha); return true;
+        case EU_LEAKY: eunop_run<EU_LEAKY>(a, y, n, alpha); return true;
+        default: return false;
+    }
 }
 
 namespace {
