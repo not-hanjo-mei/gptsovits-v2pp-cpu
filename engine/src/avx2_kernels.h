@@ -38,6 +38,10 @@ float dot_f32(const float* a, const float* b, int64_t n);
 // accumulators held in registers across the K loop. One FMA per
 // element in k-ascending order, exactly as the SAXPY form.
 void pv_n32(const float* a, const float* B, int64_t S, int64_t K, float* y);
+// Exact integer group dot for the i8 GEMV tier (mode B):
+// sum_{b<32} xq[2b] * (pg[b] >> 4) + xq[2b+1] * (pg[b] & 0xF),
+// int8 activations against uint4 weights, int32 result.
+int32_t w4b_idot64(const uint8_t* pg, const int8_t* xq);
 // Dequantize one 64-element group of a mode-B row (32 packed bytes)
 // into fp32 with the group's scale and zero point.
 void w4_dequant64(const uint8_t* prow, float sc, float ze, float* out);

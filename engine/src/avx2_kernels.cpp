@@ -167,6 +167,36 @@ void pv_n32(const float* a, const float* B, int64_t S, int64_t K, float* y) {
 #endif
 }
 
+int32_t w4b_idot64(const uint8_t* pg, const int8_t* xq) {
+#if defined(__AVX2__)
+    // Two 16-byte halves; per half, nibble-unpack to 32 uint8 in the
+    // [hi, lo] interleave the packed layout uses, maddubs against
+    // the int8 activations (pairwise i16), madd to i32.
+    auto half = [](const uint8_t* p, const int8_t* x) -> __m128i {
+        __m128i pv = _mm_loadu_si128((const __m128i*)p);
+        __m128i lo = _mm_and_si128(pv, _mm_set1_epi8(0x0F));
+        __m128i hi = _mm_and_si128(_mm_srli_epi16(pv, 4), _mm_set1_epi8(0x0F));
+        __m128i w0 = _mm_unpacklo_epi8(hi, lo);
+        __m128i w1 = _mm_unpackhi_epi8(hi, lo);
+        __m128i x0 = _mm_loadu_si128((const __m128i*)x);
+        __m128i x1 = _mm_loadu_si128((const __m128i*)(x + 16));
+        __m128i s0 = _mm_maddubs_epi16(w0, x0);
+        __m128i s1 = _mm_maddubs_epi16(w1, x1);
+        __m128i one = _mm_set1_epi16(1);
+        return _mm_add_epi32(_mm_madd_epi16(s0, one), _mm_madd_epi16(s1, one));
+    };
+    __m128i acc = _mm_add_epi32(half(pg, xq), half(pg + 16, xq + 32));
+    acc = _mm_add_epi32(acc, _mm_srli_si128(acc, 8));
+    acc = _mm_add_epi32(acc, _mm_srli_si128(acc, 4));
+    return _mm_cvtsi128_si32(acc);
+#else
+    int32_t s = 0;
+    for (int b = 0; b < 32; b++)
+        s += (int32_t)xq[2 * b] * (pg[b] >> 4) + (int32_t)xq[2 * b + 1] * (pg[b] & 0xF);
+    return s;
+#endif
+}
+
 float w4b_dotraw64(const uint8_t* prow, const float* x) {
 #if defined(__AVX2__) && defined(__FMA__)
     __m256 w[8];

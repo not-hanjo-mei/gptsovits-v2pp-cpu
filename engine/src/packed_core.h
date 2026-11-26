@@ -852,6 +852,41 @@ inline void gemv_b_w4_i8_portable(const float* X, int64_t K, int64_t D,
     });
 }
 
+// Mode B, AVX2 executor: same shared prelude and the same fp32
+// combine sequence as the portable form; only the group dot
+// changes, and it is exact integer arithmetic (avx2k::w4b_idot64),
+// so results are bit-equal to the portable executor.
+inline void gemv_b_w4_i8_avx2(const float* X, int64_t K, int64_t D,
+                              const uint8_t* pk, const float* sc, const uint8_t* ze,
+                              const float* bias, float* Y) {
+    const int64_t ng = K / 64;
+    std::vector<float> sumx((size_t)ng), sx((size_t)ng);
+    std::vector<int8_t> xq((size_t)ng * 64);
+    gemv_b_i8_prelude(X, ng, sumx.data(), sx.data(), xq.data());
+    pool_run(K * D, [&](int idx, int nt) {
+        chunk(idx, nt, D, [&](int64_t j0, int64_t j1) {
+            for (int64_t j = j0; j < j1; j++) {
+                const uint8_t* prow = pk + (size_t)j * (K / 2);
+                const float* srow = sc + (size_t)j * ng;
+                const uint8_t* zrow = ze + (size_t)j * ng;
+                float y = bias ? bias[j] : 0.0f;
+                for (int64_t g = 0; g < ng; g++) {
+                    const int8_t* xg = xq.data() + (size_t)g * 64;
+                    const uint8_t* pg = prow + g * 32;
+                    int32_t idot = avx2k::w4b_idot64(pg, xg);
+                    y += srow[g] * (sx[g] * (float)idot - (float)zrow[g] * sumx[g]);
+                }
+                for (int64_t i = ng * 64; i < K; i++) {
+                    uint8_t byte = prow[i / 2];
+                    int nib = (i % 2 == 0) ? (byte >> 4) : (byte & 0xF);
+                    y += X[i] * ((float)nib - (float)zrow[i / 64]) * srow[i / 64];
+                }
+                Y[j] = y;
+            }
+        });
+    });
+}
+
 // Tier entry points: NEON executor when SDOT silicon is present and
 // the mode is not forced to "sim"; the portable executor otherwise
 // (reachable only when the tier is enabled, see gemv_i8_enabled_for).
@@ -873,6 +908,12 @@ inline void gemv_b_w4_i8(const float* X, int64_t K, int64_t D,
 #if POTATO_PACKED_NEON
     if (gemv_i8_mode() != 2 && cpu::features().sdot) {
         gemv_b_w4_i8_neon(X, K, D, pk, sc, ze, bias, Y);
+        return;
+    }
+#endif
+#if defined(__x86_64__)
+    if (gemv_i8_mode() != 2 && cpu::features().avx2) {
+        gemv_b_w4_i8_avx2(X, K, D, pk, sc, ze, bias, Y);
         return;
     }
 #endif
@@ -909,7 +950,12 @@ inline bool gemv_i8_enabled_for(int which) {
     int m = gemv_i8_mode();
     if (m == 0) return false;
     if (m == 2) return true;
-    if (m == 1) return gemv_i8_have_sdot();
+    // Explicit "1": SDOT silicon, or AVX2 (mode B has an AVX2
+    // executor; mode A still runs the portable executor on x86 --
+    // an evaluation configuration there, not a default). The
+    // unset default stays SDOT-only: the listening-verdict
+    // promotions behind it were made on ARM.
+    if (m == 1) return gemv_i8_have_sdot() || cpu::features().avx2;
     return gemv_i8_have_sdot();  // unset: both modes where SDOT
 }
 
