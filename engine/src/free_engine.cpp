@@ -12,6 +12,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include <random>
 #include <stdexcept>
 
@@ -4577,6 +4580,16 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
     std::vector<size_t>& off_o = im.boff_o;
     size_t arena_total = plan_arena(work, im.arena, off_w);
     size_t out_total = plan_arena(outa, im.out_arena, off_o);
+#if defined(__linux__)
+    // POTATO_HUGEPAGES=1: ask THP to back the big arenas with 2 MB
+    // pages (advisory; the streaming kernels walk these end to end
+    // every step). Experiment gate, default off.
+    static const bool hugepages = std::getenv("POTATO_HUGEPAGES") != nullptr;
+    if (hugepages) {
+        if (im.arena.size() >= (2u << 20)) madvise(im.arena.data(), im.arena.size(), MADV_HUGEPAGE);
+        if (im.out_arena.size() >= (2u << 20)) madvise(im.out_arena.data(), im.out_arena.size(), MADV_HUGEPAGE);
+    }
+#endif
     arena_bytes_ = arena_total + out_total;
     for (auto& a : allocs) {
         RT r;
