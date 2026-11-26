@@ -558,7 +558,7 @@ void k_layernorm(const RT& X0, const RT* W, const RT* B, RT& Y, int64_t axis, fl
 // mirroring its S == K condition), the softmax replicates
 // k_softmax's row math exactly, and probs*V goes through pv_n32 --
 // the three-step sequence is bit-identical.
-void k_attn(const RT& Q, const RT& K, const RT& V, RT& Y, Scratch& sc) {
+void k_attn(const RT& Q, const RT& K, const RT& V, RT& Y, Scratch& sc, float score_scale) {
     if (Q.shape.size() != 4 || K.shape.size() != 4 || V.shape.size() != 4)
         fail("attn: rank");
     const int64_t B = Q.shape[0], H = Q.shape[1], M = Q.shape[2], D = Q.shape[3];
@@ -592,6 +592,9 @@ void k_attn(const RT& Q, const RT& K, const RT& V, RT& Y, Scratch& sc) {
                         scores[l] = s;
                     }
                 }
+                if (score_scale != 1.0f)
+                    for (int64_t l = 0; l < L; l++)
+                        scores[l] = (float)((double)scores[l] * (double)score_scale);
                 float mx = -INFINITY;
                 for (int64_t l = 0; l < L; l++) mx = std::max(mx, scores[l]);
                 double sum = 0;
@@ -3931,7 +3934,7 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
         case SK::EXPAND: k_expand(ins[0], outs[0]); break;
         case SK::LN: k_layernorm(ins[0], ins.size() > 1 ? &ins[1] : nullptr, ins.size() > 2 ? &ins[2] : nullptr, outs[0], st.axis, st.eps, sc); break;
         case SK::SOFTMAX: k_softmax(ins[0], outs[0], st.axis, sc); break;
-        case SK::ATTN: k_attn(ins[0], ins[1], ins[2], outs[0], sc); break;
+        case SK::ATTN: k_attn(ins[0], ins[1], ins[2], outs[0], sc, st.out_scale); break;
         case SK::REDUCESUM: {
             if (st.l2) { k_reducel2(ins[0], outs[0], st.axes, st.keepdims); break; }
             k_reducesum(ins[0], outs[0], st.axes, st.keepdims);
@@ -4557,7 +4560,10 @@ static bool fuse_one_attn(Impl& im) {
     for (size_t i = 0; i < steps.size(); i++) {
         Step& s0 = steps[i];
         if (s0.k != SK::MATMUL || s0.in.size() != 2 || s0.out.size() != 1) continue;
-        if (s0.out_scale != 1.0f) continue;
+        // s0.out_scale (the attention score scale, folded into the
+        // scores matmul by the pre-fold) stays on the ATTN step;
+        // k_attn applies it to the scores before the softmax with
+        // the same double multiply the epilogue used.
         int vscores = s0.out[0];
         if (vals[vscores].is_output || uses[vscores] != 1 || view_kids[vscores] != 0) continue;
         int js = -1;
