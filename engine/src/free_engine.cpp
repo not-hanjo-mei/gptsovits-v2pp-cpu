@@ -819,33 +819,28 @@ static BinopPathStat g_binop_paths[6];
 static const char* g_binop_path_names[6] = {"f32_fast", "rows", "walk_par", "serial_odom", "generic_odom", "axis_rows"};
 static bool fe_profile_on() { static const bool on = std::getenv("FE_PROFILE") != nullptr; return on; }
 
-// Generalized rows: walk all but one axis as an outer odometer and
-// run a flat inner loop on the chosen axis. Axis choice, in order:
-// a unit-stride output axis (streaming stores; operand strides on
-// it may be any constant — the attention score scale [heads, pos,
-// kv] with pos-major operand storage is this case, a strided read
-// against a unit store), else a unit-stride operand axis with
-// strided stores (measured slower: scattered stores cost more than
-// scattered reads, kept only as a fallback). With unit output
-// stride and unit-or-broadcast operands the inner loop delegates
-// to the AVX2 kernels.
+// Generalized rows for the case binop_rows misses only because the
+// flat axis is not the last one: walk all but one axis as an outer
+// odometer, run the AVX2 kernel on the chosen axis. Selection is
+// restricted to the vectorizable case (see the note inside).
 bool binop_axis_rows(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* as, const int64_t* bs,
                      const int64_t* ys, int r, const int64_t* oshape) {
-    static const bool disabled = std::getenv("POTATO_NO_AXIS") != nullptr;
-    if (disabled) return false;
+    // Only the fully vectorizable case is taken: unit output stride
+    // and unit-or-broadcast operands on the chosen axis, so the
+    // inner loop delegates to the AVX2 kernels. Strided forms were
+    // measured SLOWER than the linear odometer walk in an
+    // interleaved A/B on the attention pattern (axis 362-378 ms vs
+    // walk 291-300 ms per request): the walk's Y-linear order keeps
+    // reusing the operand's cache window, scattered access in
+    // either direction loses to it.
     int d = -1;
-    for (int i = 0; i < r; i++)
-        if (ys[i] == 1 && oshape[i] >= 2 && (d < 0 || oshape[i] > oshape[d])) d = i;
-    if (d < 0) {
-        for (int i = 0; i < r; i++) {
-            if (ys[i] < 1) continue;
-            bool au = as[i] == 1, bu = bs[i] == 1;
-            if (!au && !bu) continue;
-            if (!(as[i] == 0 || au) || !(bs[i] == 0 || bu)) continue;
-            if (d < 0 || oshape[i] > oshape[d]) d = i;
-        }
+    for (int i = 0; i < r; i++) {
+        if (ys[i] != 1 || oshape[i] < 2) continue;
+        if (!((as[i] == 0 || as[i] == 1) && (bs[i] == 0 || bs[i] == 1))) continue;
+        if (as[i] != 1 && bs[i] != 1) continue;
+        if (d < 0 || oshape[i] > oshape[d]) d = i;
     }
-    if (d < 0 || oshape[d] < 2) return false;
+    if (d < 0) return false;
     const int64_t D = oshape[d];
     const int64_t outer = Y.numel() / D;
     int64_t suf[8];
@@ -878,30 +873,6 @@ bool binop_axis_rows(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* a
                     cpu::features().avx2 && cpu::features().fma &&
                     avx2k::binop_f32((int)op, ap, bp, yp, D, sa == 0, sb == 0))
                     continue;
-                // Strided-read forms are miss-latency bound; a
-                // software prefetch ahead of the read pointer hides
-                // most of it (POTATO_AXIS_NOPF=1 disables for A/B).
-                static const bool axis_pf = std::getenv("POTATO_AXIS_NOPF") == nullptr;
-                if (axis_pf && sa >= 16) {
-                    const int64_t PF = 16;
-                    int64_t i = 0;
-                    for (; i + PF < D; i++) {
-                        __builtin_prefetch(ap + (i + PF) * sa, 0, 1);
-                        yp[i * sy] = binop_apply_f(op, ap[i * sa], bp[i * sb]);
-                    }
-                    for (; i < D; i++) yp[i * sy] = binop_apply_f(op, ap[i * sa], bp[i * sb]);
-                    continue;
-                }
-                if (axis_pf && sb >= 16) {
-                    const int64_t PF = 16;
-                    int64_t i = 0;
-                    for (; i + PF < D; i++) {
-                        __builtin_prefetch(bp + (i + PF) * sb, 0, 1);
-                        yp[i * sy] = binop_apply_f(op, ap[i * sa], bp[i * sb]);
-                    }
-                    for (; i < D; i++) yp[i * sy] = binop_apply_f(op, ap[i * sa], bp[i * sb]);
-                    continue;
-                }
                 for (int64_t i = 0; i < D; i++) yp[i * sy] = binop_apply_f(op, ap[i * sa], bp[i * sb]);
             }
         });
