@@ -600,6 +600,66 @@ __attribute__((target("avx2,fma"))) void conv_tile_avx2(
         }
     }
 }
+
+// AVX-512F port of the tile above: identical loop structure and
+// accumulation order (Ci outer, tap inner, one FMA per output
+// channel per tap), with the 16 positions in a single zmm instead
+// of two ymm. Bit-identical output to conv_tile_avx2.
+__attribute__((target("avx512f"))) void conv_tile_avx512(
+    const float* Xn, int64_t L, const float* wbuf, int64_t C, int64_t Ci, int64_t K, int64_t pad_l,
+    int64_t dil, const float* bias, float* Yn, int64_t Lout, int64_t lt0, int64_t lt_len,
+    int64_t o0, int64_t ob) {
+    alignas(64) float win[16 + 64];
+    alignas(64) float spill[4][16];
+    const int64_t span = (K - 1) * dil + 16;
+    for (int64_t tt0 = lt0; tt0 < lt0 + lt_len; tt0 += 16) {
+        int64_t tn = std::min<int64_t>(16, lt0 + lt_len - tt0);
+        __m512 acc[4];
+        for (int64_t o = 0; o < 4; o++)
+            acc[o] = _mm512_set1_ps(o < ob && bias ? bias[o0 + o] : 0.0f);
+        const int64_t src0 = tt0 - pad_l;
+        const bool interior = tn == 16 && src0 >= 0 && src0 + span <= L;
+        const int64_t wn = tn + (K - 1) * dil;
+        for (int64_t i = 0; i < Ci; i++) {
+            const float* xi = Xn + (size_t)i * L;
+            const float* base;
+            if (interior) {
+                base = xi + src0;
+            } else {
+                for (int64_t w = 0; w < wn; w++) {
+                    int64_t s = src0 + w;
+                    win[w] = (s >= 0 && s < L) ? xi[s] : 0.0f;
+                }
+                base = win;
+            }
+            for (int64_t kk = 0; kk < K; kk++) {
+                __m512 x = _mm512_loadu_ps(base + kk * dil);
+                int64_t c = i * K + kk;
+                for (int64_t o = 0; o < ob; o++) {
+                    __m512 w = _mm512_set1_ps(wbuf[(size_t)(o0 + o) * C + c]);
+                    acc[o] = _mm512_fmadd_ps(w, x, acc[o]);
+                }
+            }
+        }
+        for (int64_t o = 0; o < ob; o++) {
+            float* y = Yn + (size_t)(o0 + o) * Lout + tt0;
+            if (tn == 16) {
+                _mm512_storeu_ps(y, acc[o]);
+            } else {
+                _mm512_store_ps(spill[o], acc[o]);
+                for (int64_t tt = 0; tt < tn; tt++) y[tt] = spill[o][tt];
+            }
+        }
+    }
+}
+
+bool conv_tile_has_avx512() {
+    static const bool on = [] {
+        if (std::getenv("POTATO_NO_AVX512")) return false;
+        return cpu::features().avx512;
+    }();
+    return on;
+}
 #endif
 
 void conv1d_fast_impl(const float* X, int64_t N, int64_t Ci, int64_t L,
@@ -655,6 +715,11 @@ void conv1d_fast_impl(const float* X, int64_t N, int64_t Ci, int64_t L,
                 {
                     int64_t o0 = blk * OB4, ob = std::min(OB4, O - o0);
 #if defined(__x86_64__)
+                    if (window_ok && conv_tile_has_avx512()) {
+                        conv_tile_avx512(Xn, L, wbuf, C, Ci, K, pad_l, dil, bias, Yn, Lout, lt0,
+                                         lt_len, o0, ob);
+                        continue;
+                    }
                     if (window_ok && cpu::features().avx2) {
                         conv_tile_avx2(Xn, L, wbuf, C, Ci, K, pad_l, dil, bias, Yn, Lout, lt0, lt_len,
                                        o0, ob);

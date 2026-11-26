@@ -1368,6 +1368,7 @@ void k_conv(const RT& X0, const RT& W0, const RT* B, RT& Y, const std::vector<in
         int64_t L = X.shape[2], K = W.shape[2], Lout = Y.shape[2];
         int64_t stride = strides_a[0], dilv = dil[0], pl = pads[0];
         const bool use_avx2 = cpu::features().avx2 && cpu::features().fma;
+        const bool use_avx512 = use_avx2 && packed::conv_tile_has_avx512();
         if (stride == 1 && (K - 1) * dilv <= 64 && use_avx2) {
             // Register-blocked tile (4 output channels x 32 positions,
             // shared with the packed path): the SAXPY form below
@@ -1392,8 +1393,14 @@ void k_conv(const RT& X0, const RT& W0, const RT* B, RT& Y, const std::vector<in
                     int64_t n = task / (nblocks * ntiles);
                     int64_t o0 = blk * OB4, ob = std::min(OB4, O - o0);
                     int64_t lt0 = tile * LT, lt_len = std::min(LT, Lout - lt0);
-                    packed::conv_tile_avx2(x + (size_t)n * C * L, L, w, C * K, C, K, pl, dilv, bias,
-                                           y + (size_t)n * O * Lout, Lout, lt0, lt_len, o0, ob);
+                    if (use_avx512)
+                        packed::conv_tile_avx512(x + (size_t)n * C * L, L, w, C * K, C, K, pl, dilv,
+                                                 bias, y + (size_t)n * O * Lout, Lout, lt0, lt_len,
+                                                 o0, ob);
+                    else
+                        packed::conv_tile_avx2(x + (size_t)n * C * L, L, w, C * K, C, K, pl, dilv,
+                                               bias, y + (size_t)n * O * Lout, Lout, lt0, lt_len,
+                                               o0, ob);
                 }
             });
             return;
