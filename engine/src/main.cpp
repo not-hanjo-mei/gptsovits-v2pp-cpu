@@ -754,9 +754,12 @@ int main(int argc, char** argv) {
                     // receives the real past tensors (copied in);
                     // later runs pass them as missing and the plans
                     // read/append the cache buffers directly.
-                    auto kvc = freeeng::make_kv_cache();
-                    fh.stage_a->set_kv_cache(kvc);
-                    fh.stage_b->set_kv_cache(kvc);
+                    static const bool use_kv = std::getenv("POTATO_NO_KV") == nullptr;
+                    auto kvc = use_kv ? freeeng::make_kv_cache() : nullptr;
+                    if (kvc) {
+                        fh.stage_a->set_kv_cache(kvc);
+                        fh.stage_b->set_kv_cache(kvc);
+                    }
                     auto past_mask_of = [](const std::vector<std::string>& names) {
                         std::vector<char> m(names.size(), 0);
                         for (size_t i = 0; i < names.size(); i++)
@@ -803,7 +806,7 @@ int main(int argc, char** argv) {
                         const std::vector<char>& pmask = use_a ? past_mask_b : past_mask_a;
                         state.assign(perm.size(), freeeng::Tensor{});
                         for (size_t i = 0; i < perm.size(); i++)
-                            state[i] = pmask[i] ? freeeng::Tensor{} : out[perm[i]];
+                            state[i] = (use_kv && pmask[i]) ? freeeng::Tensor{} : out[perm[i]];
                         use_a = !use_a;
                     }
                     t_dec = ms_since(t0);
