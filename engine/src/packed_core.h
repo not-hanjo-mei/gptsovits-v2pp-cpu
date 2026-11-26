@@ -191,9 +191,12 @@ inline void set_kernel_threads(int n) { kernel_pool().init(n); }
 // per thread). Below the threshold the body runs serially on the
 // calling thread; chunk partitioning assigns each output element to
 // exactly one chunk with the same inner order, so results are
-// bit-identical either way. Threshold in MACs, default 2^20 (the
-// same gate k_matmul already used), tunable via POTATO_POOL_MIN_MAC
-// for A/B measurement.
+// bit-identical either way. Threshold in MACs, tunable via
+// POTATO_POOL_MIN_MAC. Default 2^19 from an interleaved A/B on the
+// EPYC box (2026-11-26): decode medians 1,400 ms at 2^19 vs
+// 1,530 at 2^18 and 1,841 at 2^20 (k_matmul's older gate) — the
+// smallest GEMVs stop paying the barrier, mid-size ones keep the
+// threads.
 inline int64_t pool_min_mac() {
     static const int64_t v = [] {
         const char* e = std::getenv("POTATO_POOL_MIN_MAC");
@@ -201,7 +204,7 @@ inline int64_t pool_min_mac() {
             long long x = std::atoll(e);
             if (x > 0) return (int64_t)x;
         }
-        return (int64_t)1 << 20;
+        return (int64_t)1 << 19;
     }();
     return v;
 }
