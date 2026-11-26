@@ -482,3 +482,42 @@ runs (PCONV ~1,283/1,360 ms vs 1,428/1,446 at 1024; 256, 2048
 and 4096 in between) -- an ~8% spread, inside the box's session
 noise, so the default stays 1024 and the knob stays for
 per-machine tuning.
+
+## Executor and attention round (2026-11-26, evening)
+
+Three hypotheses were measured and rejected; the record is kept
+so they are not retried blind.
+
+Executor overhead: FE_PROFILE per-kind sums match plan exec
+times to ~0.5 us per step in the stage plans. There is no
+hidden dispatch tax to reclaim.
+
+KV concat cache: the stage plans spend ~190 ms per request in
+Concat, almost all of it copying the past KV. A persistent
+per-step cache buffer was built (sampled-checksum resync,
+append-only on a hit) -- and the hit counter showed 0 hits in
+17,689 stores. The host ping-pongs between the two stage plans,
+so each plan's incoming past is always one slice longer than
+its own cache; worse, a row-major buffer cannot grow along a
+middle axis in place at all (the layout itself depends on the
+axis length), so a hit would have read stale offsets. The
+feature was removed in full. A correct version needs a
+capacity-padded layout and a strided presentation to every
+consumer; that is a redesign, not a patch.
+
+Parallel concat: splitting the ~600 KB KV copies over the pool
+measured no gain on the verification box (CONCAT 89-98 ms
+serial vs 100-111 ms parallel, same sessions). The copies are
+bound by shared-vCPU bandwidth there, not by core count.
+
+Wide attention dot: the stage score MatMuls read K from a
+position-major [L, 512] buffer as stride-512 scalar gathers in
+the general path, which looked like the obvious waste. An
+AVX2 float dot fast path over the contiguous 32-float rows
+measured stage MATMUL 174-180 ms before and 181-183 ms after
+-- nothing. The gather pattern reuses each cache line across
+the head-dim loop and the hardware prefetcher keeps up; the
+remaining cost is small-op overhead, not memory order. The
+change also moved the vits fp32 gate statistics (maxerr
+4.34e-05 -> 6.25e-05) for zero gain, so it was reverted and
+the canonical statistics reproduce again.
