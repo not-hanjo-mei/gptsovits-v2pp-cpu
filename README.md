@@ -40,8 +40,8 @@ seed 42. RTF is wall time divided by audio duration; lower is better.
 
 | Configuration | RTF | Peak RSS |
 |---|---|---|
-| This engine, W4 tier, all dispatch tiers | 0.71–0.81 | 256 MB |
-| This engine, W4 tier, AVX2 only | 0.68–0.84 | 256 MB |
+| This engine, W4 tier, all dispatch tiers | 0.67–0.81 | 256 MB |
+| This engine, W4 tier, AVX2 only | 0.66–0.84 | 256 MB |
 | This engine, fp32 | ~1.4–1.5 | 2,586 MB |
 | Genie-TTS (ONNX Runtime, same machine) | 0.55 | 5,485 MB |
 

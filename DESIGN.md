@@ -650,3 +650,42 @@ sentence: AVX2-only 2,176-2,390 ms (RTF 0.68-0.75, decode
 day's rounds removed roughly a quarter of the sentence time.
 Remaining documented pool (multi-day, unstarted): row-interleaved
 W4 repack, fused decode attention, an indexed Plan::run API.
+
+## Multi-day pool, worked (2026-11-26, night)
+
+- Indexed Plan::run (c888d0f): run_vec takes inputs in
+  input_names() order and returns outputs in output_names()
+  order; the map form is an adapter over it. The host decode
+  loop keeps stage state as a tensor vector and permutes slots
+  between the ping-pong plans with name-derived index tables
+  built once -- no per-step maps or renamed key strings.
+  Token sequences identical; decode -22 to -32 ms per request
+  (interleaved medians) on the box.
+- Row-interleaved W4 repack: evaluated at kernel level first.
+  A 4-row interleaved mode-B kernel sharing activation loads
+  runs 16.3 GMAC/s against the dotraw kernel's 14.6 at the
+  512x512 decode shape (+12%) -- the per-row nibble unpack does
+  not amortize on AVX2-float (the published wins are integer-dot
+  architectures). Below the bar for a pack-format change; the
+  project is closed with the number recorded.
+- Fused attention step (15721b6, fec501b): compile-time fusion
+  of MATMUL -> SOFTMAX(last axis) -> MATMUL into one ATTN step
+  (24 sites per GPT plan). Scores use k_matmul's wide dot (or
+  its double-accumulation classic form at position stride 32),
+  the scores matmul's folded out_scale is applied to the scores
+  with the epilogue's double multiply, the softmax replicates
+  k_softmax's row math, and probs*V uses pv_n32 -- bit-identical,
+  all gates exact. Verified firing on the box (984 ATTN calls
+  per stage plan per request); stage exec -40 and -57 ms in two
+  interleaved pairs, about -80 to -110 ms per request across
+  both stage plans. The cache-owning variant (persistent KV
+  buffers replacing the Concat outputs) remains unbuilt: it
+  needs a padded-capacity layout and cross-plan sync, see the
+  removed KV cache entry above.
+
+End state at fec501b: box E2E, standard sentence -- AVX2-only
+2,118-2,190 ms (RTF 0.66-0.68, decode 705-751), all tiers
+2,157-2,180 ms. Against the ~3,180 ms AVX2-only figure from
+before the evening campaign, the day removed about a third of
+the sentence time. The documented pool is now empty except the
+cache-owning attention variant above.
