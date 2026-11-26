@@ -622,13 +622,32 @@ bool aligned_strides(const RT& t, const std::vector<int64_t>& oshape, int64_t* o
     return true;
 }
 
+// Drop size-1 dims from an aligned shape/stride set: their coordinate
+// is always 0, so the compacted walk visits exactly the same elements
+// in the same order. This turns layouts like [C, L, 1] (a plain
+// [C, L] tensor with a trailing degenerate dim, the common vits
+// per-channel scale/bias shape) back into rows the fast path takes.
+static int compact_dims(const std::vector<int64_t>& oshape, const int64_t* as, const int64_t* bs,
+                        const int64_t* ys, int64_t* ca, int64_t* cb, int64_t* cy, int64_t* cs) {
+    int r = 0;
+    for (size_t d = 0; d < oshape.size(); d++) {
+        if (oshape[d] == 1 && oshape.size() > 1) continue;
+        cs[r] = oshape[d];
+        ca[r] = as[d];
+        if (cb) cb[r] = bs[d];
+        cy[r] = ys[d];
+        r++;
+    }
+    return r;
+}
+
 // Pool-parallel strided binary walk (f32): each thread decomposes its
 // start index once, then walks incrementally.
-void binop_walk_par(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* as, const int64_t* bs, const int64_t* ys) {
-    int r = (int)Y.shape.size();
+void binop_walk_par(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* as, const int64_t* bs, const int64_t* ys,
+                    int r, const int64_t* oshape) {
     int64_t suf[8];
     suf[r - 1] = 1;
-    for (int d = r - 2; d >= 0; d--) suf[d] = suf[d + 1] * Y.shape[d + 1];
+    for (int d = r - 2; d >= 0; d--) suf[d] = suf[d + 1] * oshape[d + 1];
     int64_t n = Y.numel();
     const float* a = (const float*)A.p;
     const float* b = (const float*)B.p;
@@ -647,9 +666,9 @@ void binop_walk_par(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* as
                 y[yo] = binop_apply_f(op, a[ao], b[bo]);
                 for (int d = r - 1; d >= 0; d--) {
                     ao += as[d]; bo += bs[d]; yo += ys[d];
-                    if (++coord[d] < Y.shape[d]) break;
+                    if (++coord[d] < oshape[d]) break;
                     coord[d] = 0;
-                    ao -= as[d] * Y.shape[d]; bo -= bs[d] * Y.shape[d]; yo -= ys[d] * Y.shape[d];
+                    ao -= as[d] * oshape[d]; bo -= bs[d] * oshape[d]; yo -= ys[d] * oshape[d];
                 }
             }
         });
@@ -695,16 +714,16 @@ float unop_apply_f(UnOp op, float a, double alpha) {
 // each output row is one flat loop the compiler can vectorize, instead
 // of a per-element odometer walk. Outer offsets are decomposed once
 // per row. Returns false when the layout does not qualify.
-bool binop_rows(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* as, const int64_t* bs, const int64_t* ys) {
-    int r = (int)Y.shape.size();
+bool binop_rows(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* as, const int64_t* bs, const int64_t* ys,
+                int r, const int64_t* oshape) {
     if (r < 1 || ys[r - 1] != 1) return false;
     if ((as[r - 1] != 0 && as[r - 1] != 1) || (bs[r - 1] != 0 && bs[r - 1] != 1)) return false;
-    int64_t D = Y.shape[r - 1];
+    int64_t D = oshape[r - 1];
     int64_t rows = Y.numel() / D;
     int64_t suf[8];
     if (r >= 2) {
         suf[r - 2] = 1;
-        for (int d = r - 3; d >= 0; d--) suf[d] = suf[d + 1] * Y.shape[d + 1];
+        for (int d = r - 3; d >= 0; d--) suf[d] = suf[d + 1] * oshape[d + 1];
     }
     const float* a = (const float*)A.p;
     const float* b = (const float*)B.p;
@@ -749,16 +768,16 @@ bool binop_rows(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* as, co
     else body(0, 1);
     return true;
 }
-bool unop_rows(UnOp op, const RT& A, RT& Y, double alpha, const int64_t* as, const int64_t* ys) {
-    int r = (int)Y.shape.size();
+bool unop_rows(UnOp op, const RT& A, RT& Y, double alpha, const int64_t* as, const int64_t* ys,
+               int r, const int64_t* oshape) {
     if (r < 1 || ys[r - 1] != 1) return false;
     if (as[r - 1] != 0 && as[r - 1] != 1) return false;
-    int64_t D = Y.shape[r - 1];
+    int64_t D = oshape[r - 1];
     int64_t rows = Y.numel() / D;
     int64_t suf[8];
     if (r >= 2) {
         suf[r - 2] = 1;
-        for (int d = r - 3; d >= 0; d--) suf[d] = suf[d + 1] * Y.shape[d + 1];
+        for (int d = r - 3; d >= 0; d--) suf[d] = suf[d + 1] * oshape[d + 1];
     }
     const float* a = (const float*)A.p;
     float* y = (float*)Y.p;
@@ -816,8 +835,24 @@ void k_binop(BinOp op, const RT& A, const RT& B, RT& Y) {
     if (A.dtype == 1 && B.dtype == 1 && Y.dtype == 1) {
         int64_t as[8], bs[8], ys[8];
         if (aligned_strides(A, Y.shape, as) && aligned_strides(B, Y.shape, bs) && aligned_strides(Y, Y.shape, ys)) {
-            if (binop_rows(op, A, B, Y, as, bs, ys)) { note(1); return; }
-            if (Y.numel() >= 8192) { binop_walk_par(op, A, B, Y, as, bs, ys); note(2); return; }
+            int64_t ca[8], cb[8], cy[8], cs[8];
+            int cr = compact_dims(Y.shape, as, bs, ys, ca, cb, cy, cs);
+            if (binop_rows(op, A, B, Y, ca, cb, cy, cr, cs)) { note(1); return; }
+            if (Y.numel() >= 8192) {
+                if (std::getenv("FE_WALK_DEBUG")) {
+                    int r = (int)Y.shape.size();
+                    std::fprintf(stderr, "[WALK] op=%d rank=%d shape=", (int)op, r);
+                    for (int d = 0; d < r; d++) std::fprintf(stderr, "%s%lld", d ? "x" : "", (long long)Y.shape[d]);
+                    std::fprintf(stderr, " as=[");
+                    for (int d = 0; d < r; d++) std::fprintf(stderr, "%s%lld", d ? "," : "", (long long)as[d]);
+                    std::fprintf(stderr, "] bs=[");
+                    for (int d = 0; d < r; d++) std::fprintf(stderr, "%s%lld", d ? "," : "", (long long)bs[d]);
+                    std::fprintf(stderr, "] ys=[");
+                    for (int d = 0; d < r; d++) std::fprintf(stderr, "%s%lld", d ? "," : "", (long long)ys[d]);
+                    std::fprintf(stderr, "] n=%lld\n", (long long)Y.numel());
+                }
+                binop_walk_par(op, A, B, Y, ca, cb, cy, cr, cs); note(2); return;
+            }
             int r = (int)Y.shape.size();
             int64_t coord[8] = {0};
             int64_t ao = 0, bo = 0, yo = 0;
@@ -872,7 +907,9 @@ void k_unop(UnOp op, const RT& A, RT& Y, double alpha = 0.0) {
     if (A.dtype == 1 && Y.dtype == 1) {
         int64_t as[8], ys[8];
         if (aligned_strides(A, Y.shape, as) && aligned_strides(Y, Y.shape, ys)) {
-            if (unop_rows(op, A, Y, alpha, as, ys)) return;
+            int64_t ca[8], cy[8], cs[8];
+            int cr = compact_dims(Y.shape, as, nullptr, ys, ca, nullptr, cy, cs);
+            if (unop_rows(op, A, Y, alpha, ca, cy, cr, cs)) return;
             int r = (int)Y.shape.size();
             int64_t coord[8] = {0};
             int64_t ao = 0, yo = 0;
