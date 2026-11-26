@@ -678,10 +678,7 @@ W4 repack, fused decode attention, an indexed Plan::run API.
   all gates exact. Verified firing on the box (984 ATTN calls
   per stage plan per request); stage exec -40 and -57 ms in two
   interleaved pairs, about -80 to -110 ms per request across
-  both stage plans. The cache-owning variant (persistent KV
-  buffers replacing the Concat outputs) remains unbuilt: it
-  needs a padded-capacity layout and cross-plan sync, see the
-  removed KV cache entry above.
+  both stage plans.
 
 End state at fec501b: box E2E, standard sentence -- AVX2-only
 2,118-2,190 ms (RTF 0.66-0.68, decode 705-751), all tiers
@@ -689,3 +686,31 @@ End state at fec501b: box E2E, standard sentence -- AVX2-only
 before the evening campaign, the day removed about a third of
 the sentence time. The documented pool is now empty except the
 cache-owning attention variant above.
+
+## Stateful KV cache (2026-11-26, late)
+
+The last pool item. Compile-time detection marks every
+Concat(graph_input, new_slice) -> graph output pair at axis 0
+(the stage graphs' 48 past/present pairs; the KV tensors are
+[L, 1, 512] position-major rows, which is what makes this
+tractable). With a shared KvCache attached (Plan::set_kv_cache,
+one per request, both stage plans), bind views the past input
+into the pair's padded buffer -- the first run's supplied
+tensor is copied in (row-wise; the first plan's presents are
+row-strided slices of the QKV projection), later runs pass the
+pasts as missing -- and the concat step appends only the new
+row and advances the slot length. Growth happens at bind time
+only, into uninitialized allocations (both std::vector resize
+and make_unique value-initialize, and zero-filling ~100 MB of
+capacity cost ~50 ms per session in bind time before this was
+caught). POTATO_NO_KV=1 restores the copy protocol end to end.
+Token sequences are bit-identical to the copy protocol on both
+the first and the second request of a process. Box accounting:
+stage-plan CONCAT 144-162 ms -> ~6.5 ms per 84 runs, bind
+within ~12 ms of the copy protocol per 84 runs after the
+zero-fill fix; same-binary interleaved totals put the win at
+roughly 90-130 ms per request. End state at 3df41cf, AVX2-only:
+totals 1,962-2,184 ms across the evening's sessions (RTF
+0.61-0.68) for the standard sentence, against ~3,180 ms before
+the evening campaign -- about 40% of the sentence time removed
+in a day. The documented pool is now empty.
