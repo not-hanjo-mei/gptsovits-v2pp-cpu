@@ -876,6 +876,30 @@ bool binop_axis_rows(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* a
                     cpu::features().avx2 && cpu::features().fma &&
                     avx2k::binop_f32((int)op, ap, bp, yp, D, sa == 0, sb == 0))
                     continue;
+                // Strided-read forms are miss-latency bound; a
+                // software prefetch ahead of the read pointer hides
+                // most of it (POTATO_AXIS_NOPF=1 disables for A/B).
+                static const bool axis_pf = std::getenv("POTATO_AXIS_NOPF") == nullptr;
+                if (axis_pf && sa >= 16) {
+                    const int64_t PF = 16;
+                    int64_t i = 0;
+                    for (; i + PF < D; i++) {
+                        __builtin_prefetch(ap + (i + PF) * sa, 0, 1);
+                        yp[i * sy] = binop_apply_f(op, ap[i * sa], bp[i * sb]);
+                    }
+                    for (; i < D; i++) yp[i * sy] = binop_apply_f(op, ap[i * sa], bp[i * sb]);
+                    continue;
+                }
+                if (axis_pf && sb >= 16) {
+                    const int64_t PF = 16;
+                    int64_t i = 0;
+                    for (; i + PF < D; i++) {
+                        __builtin_prefetch(bp + (i + PF) * sb, 0, 1);
+                        yp[i * sy] = binop_apply_f(op, ap[i * sa], bp[i * sb]);
+                    }
+                    for (; i < D; i++) yp[i * sy] = binop_apply_f(op, ap[i * sa], bp[i * sb]);
+                    continue;
+                }
                 for (int64_t i = 0; i < D; i++) yp[i * sy] = binop_apply_f(op, ap[i * sa], bp[i * sb]);
             }
         });
