@@ -57,6 +57,13 @@ if(NOT ANDROID)
 endif()
 target_include_directories(gemv_bench PRIVATE src)
 
+# Packed-conv tile micro-bench (vits_kernels only, no ORT).
+add_executable(vits_bench src/vits_bench.cpp src/vits_kernels.cpp src/avx2_kernels.cpp)
+if(NOT ANDROID)
+  target_link_libraries(vits_bench PRIVATE pthread)
+endif()
+target_include_directories(vits_bench PRIVATE src)
+
 # ORT-free engine (ORT-FREE.md): GPT-side replacement, phase 1.
 # Deliberately NOT linked against onnxruntime -- the point of the
 # exercise. Parallel existence only; shipping defaults unchanged.
