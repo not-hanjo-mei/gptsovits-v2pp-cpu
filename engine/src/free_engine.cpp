@@ -1332,7 +1332,6 @@ void k_scatter_elements(const RT& D, const RT& I, const RT& U, RT& Y, int64_t ax
 void k_concat(const std::vector<const RT*>& ins, RT& Y, int64_t axis, Scratch& sc) {
     int rank = (int)Y.shape.size();
     if (axis < 0) axis += rank;
-    const int64_t es = (int64_t)onnxm::elem_size(Y.dtype);
     int64_t off = 0;
     for (auto* ip : ins) {
         RT sub;
@@ -1341,44 +1340,9 @@ void k_concat(const std::vector<const RT*>& ins, RT& Y, int64_t axis, Scratch& s
         sub.shape = ip->shape;
         sub.strides = Y.strides;
         // Offset along axis in elements of Y's layout.
-        sub.p = Y.p + off * Y.strides[axis] * es;
+        sub.p = Y.p + off * Y.strides[axis] * (int64_t)onnxm::elem_size(Y.dtype);
         RT in = sc.contig_of(*ip);
-        // Large inputs (the KV feedback copies are ~600 KB each) go
-        // through the pool, split over the outer dims -- or over the
-        // axis itself when it is the outermost dim. The pool work
-        // figure is bytes moved, so the size gate keeps small copies
-        // serial and lets the ~600 KB class parallelize.
-        int64_t inner = 1;
-        for (int d = (int)axis + 1; d < rank; d++) inner *= in.shape[d];
-        int64_t outer = 1;
-        for (int d = 0; d < (int)axis; d++) outer *= in.shape[d];
-        if (axis > 0 && in.contig() && Y.contig() && outer >= 2) {
-            const int64_t chunk_elems = in.shape[axis] * inner;
-            const int64_t ystride = Y.shape[axis] * inner;
-            const uint8_t* sp = in.p;
-            uint8_t* dp = sub.p;
-            packed::pool_run(in.numel() * es, [&](int idx, int nt) {
-                packed::chunk(idx, nt, outer, [&](int64_t o0, int64_t o1) {
-                    for (int64_t o = o0; o < o1; o++)
-                        memcpy(dp + o * ystride * es, sp + o * chunk_elems * es,
-                               (size_t)chunk_elems * es);
-                });
-            });
-        } else if (axis == 0 && in.contig() && Y.contig()) {
-            const int64_t rows = in.shape[0];
-            const int64_t row_elems = in.numel() / rows;
-            const uint8_t* sp = in.p;
-            uint8_t* dp = sub.p;
-            packed::pool_run(in.numel() * es, [&](int idx, int nt) {
-                packed::chunk(idx, nt, rows, [&](int64_t r0, int64_t r1) {
-                    if (r1 > r0)
-                        memcpy(dp + r0 * row_elems * es, sp + r0 * row_elems * es,
-                               (size_t)(r1 - r0) * row_elems * es);
-                });
-            });
-        } else {
-            copy_tensor(sub, in);
-        }
+        copy_tensor(sub, in);
         off += ip->shape[axis];
     }
 }
