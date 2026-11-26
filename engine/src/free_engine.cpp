@@ -4722,15 +4722,7 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
             KvCache::Slot& slot = im.kv->slots[pi];
             const Tensor& t = inputs[pr.in_idx];
             if (t.data != nullptr) {
-                bool contig = t.contiguous() ||
-                              (t.strides.size() == t.shape.size() && t.strides == rowmajor(t.shape));
-                if (!contig) {
-                    std::string msg = "kv: past input not contiguous: " + im.in_names[pr.in_idx] + " shape";
-                    for (auto d : t.shape) msg += " " + std::to_string(d);
-                    msg += " strides";
-                    for (auto d : t.strides) msg += " " + std::to_string(d);
-                    fail(msg);
-                }
+                if (t.dtype != 1) fail("kv: past input not fp32");
                 int64_t rows = t.shape.empty() ? 0 : t.shape[0];
                 int64_t rowf = rows > 0 ? t.numel() / rows : 0;
                 if (slot.len < 0 || slot.len != rows) {
@@ -4739,7 +4731,21 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
                         slot.buf.resize((size_t)cap * (size_t)rowf);
                         slot.cap_rows = cap;
                     }
-                    std::memcpy(slot.buf.data(), t.data, (size_t)rows * (size_t)rowf * sizeof(float));
+                    // The source may be a strided view (the first
+                    // plan's presents are row-strided slices of the
+                    // QKV projection); copy elementwise into the
+                    // packed buffer.
+                    RT src;
+                    src.dtype = t.dtype;
+                    src.p = const_cast<uint8_t*>(t.data);
+                    src.shape = t.shape;
+                    src.strides = t.strides.empty() ? rowmajor(t.shape) : t.strides;
+                    RT dst;
+                    dst.dtype = 1;
+                    dst.p = (uint8_t*)slot.buf.data();
+                    dst.shape = t.shape;
+                    dst.strides = rowmajor(t.shape);
+                    copy_tensor(dst, src);
                     slot.len = rows;
                     slot.shape = t.shape;
                 }
