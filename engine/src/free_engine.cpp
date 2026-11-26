@@ -4792,7 +4792,7 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
         static double kv_pre_us = 0;
         static long kv_pre_n = 0;
         kv_pre_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - kv_t0).count();
-        if (++kv_pre_n == 84)
+        if (++kv_pre_n == 84) std::fprintf(stderr, "[KV_SPLIT] nv=%d pairs=%zu\n", nv, im.kv_pairs.size()); if (kv_pre_n == 84)
             std::fprintf(stderr, "[KV_SPLIT] pre-bind total %.1f ms over %ld runs\n", kv_pre_us / 1000.0, kv_pre_n);
     }
     // Inputs (indexed parallel to in_names; null data = missing).
