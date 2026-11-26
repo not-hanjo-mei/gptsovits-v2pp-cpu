@@ -297,3 +297,40 @@ invocation, not the decode gap). Final shipped samples (W4,
 4 threads): 2,871-3,400 ms per sentence, **RTF 0.90-1.06**,
 decode 1,053-1,298 ms, stage PACKED 212 + 214 ms, PCONV
 1,400 ms, RSS 256 MB.
+
+## Genie study round (2026-11-26, evening)
+
+Took Genie-TTS apart on the same box to find where its RTF 0.55
+comes from. Three findings:
+
+1. **AVX-512 is real but small.** perf sampling of steady-state
+   Genie synthesis puts ~13% of CPU in MLAS's AVX512F SGEMM kernel
+   (zmm vbroadcastss/vfmadd231ps, verified by disassembly). ORT
+   1.22 has no switch to disable it (raw CPUID dispatch; glibc
+   hwcaps masking verified ineffective — the kernel stays hot).
+   On Zen 4 the 512-bit datapath is double-pumped, so the kernel's
+   AVX2 form would cost only ~0-20% more: AVX-512 explains a
+   single-digit percent of wall time, not the ~2x RTF gap.
+2. **The graphs are the same graphs.** Genie's converted set is
+   the same export family as ours (vits: 218 Conv, ~8k nodes with
+   ~3k Constants the ORT optimizer folds at load). ORT's edge is
+   kernels + graph fusions (FusedConv, FusedMatMul appear in its
+   profile) + its thread pool, not a different model.
+3. **The single biggest hot spot in Genie's profile (~25% of
+   samples) is its thread-pool dispatch/spin code** — ORT workers
+   spin before parking. Transferred that: `packed::Pool` is now
+   spin-then-block on both sides (workers spin on the generation
+   counter, the caller spins on the completion counter;
+   POTATO_POOL_SPIN, default 5000, 0 = old condvar pool).
+   Interleaved same-session A/B on the EPYC box (W4, 4 threads,
+   medians of 3): total 3,318 -> 2,961 ms (**RTF ~0.92**, range
+   0.87-0.99), decode 1,238 -> 1,077 ms, vits 1,557 -> 1,398 ms.
+   Spin won every round on every component.
+
+One bug worth remembering: the first spin version incremented the
+generation counter outside the pool mutex and wedged a worker at
+generation ~17,662 of the fp32 TF gate (lost wakeup against the
+wait predicate; a temporary watchdog build caught the exact
+state). The increment stays inside the mutex; the spin reads are
+lock-free. All four gates reproduce exactly (299/361, 361/361,
+0.959881, 1.000000).
