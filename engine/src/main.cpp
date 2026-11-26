@@ -256,11 +256,12 @@ static void write_wav(const std::string& path, const float* audio, size_t n, int
     f.write("RIFF", 4); w32(36 + (uint32_t)n * 2); f.write("WAVE", 4);
     f.write("fmt ", 4); w32(16); w16(1); w16(1); w32(sr); w32(sr * 2); w16(2); w16(16);
     f.write("data", 4); w32((uint32_t)n * 2);
+    std::vector<int16_t> pcm(n);
     for (size_t i = 0; i < n; i++) {
         float x = std::max(-1.0f, std::min(1.0f, audio[i]));
-        int16_t v = (int16_t)std::lrint(x * 32767.0f);
-        f.write((char*)&v, 2);
+        pcm[i] = (int16_t)std::lrint(x * 32767.0f);
     }
+    f.write((char*)pcm.data(), (std::streamsize)n * 2);
 }
 
 // ---- minimal wav IO for the offline --deess-file verification mode ----
