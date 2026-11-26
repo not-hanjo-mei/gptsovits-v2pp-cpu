@@ -617,7 +617,7 @@ void conv1d_fast_impl(const float* X, int64_t N, int64_t Ci, int64_t L,
     if (!w_override) {
         auto dq0 = std::chrono::steady_clock::now();
         wbuf_owned.resize((size_t)O * C);
-        kernel_pool().run([&](int idx, int nt) {
+        pool_run(O * C, [&](int idx, int nt) {
             chunk(idx, nt, O, [&](int64_t r0, int64_t r1) {
                 for (int64_t r = r0; r < r1; r++)
                     dequant_row(pk, sc, ze, mode, r, C, wbuf_owned.data() + (size_t)r * C);
@@ -641,7 +641,7 @@ void conv1d_fast_impl(const float* X, int64_t N, int64_t Ci, int64_t L,
     // take more units; a unit is ~0.1-1 ms of work.
     std::atomic<int64_t> next_task{0};
     const int64_t total_tasks = N * ntiles * nblocks;
-    kernel_pool().run([&](int, int) {
+    pool_run((int64_t)N * O * Lout * C, [&](int, int) {
         while (true) {
             int64_t task = next_task.fetch_add(1, std::memory_order_relaxed);
             if (task >= total_tasks) break;
@@ -771,7 +771,7 @@ void conv_transpose1d_fast(const float* X, int64_t N, int64_t Ci, int64_t L,
 void gather_packed(const uint8_t* pk, const float* sc, const uint8_t* ze, int mode,
                    int64_t rows, int64_t cols, const int64_t* idx, int64_t nidx, float* Y) {
     (void)rows;
-    kernel_pool().run([&](int widx, int nt) {
+    pool_run(nidx * cols, [&](int widx, int nt) {
         chunk(widx, nt, nidx, [&](int64_t i0, int64_t i1) {
             for (int64_t i = i0; i < i1; i++)
                 dequant_row(pk, sc, ze, (int)mode, idx[i], cols, Y + (size_t)i * cols);

@@ -185,6 +185,32 @@ struct Pool {
 inline Pool& kernel_pool() { static Pool p; return p; }
 inline void set_kernel_threads(int n) { kernel_pool().init(n); }
 
+// Work-size gate for pool dispatch. A pool run is a condvar barrier:
+// on a contended box its round-trip costs more wall time than the
+// math of a small kernel (a 512x512 decode GEMV is ~3-5 us of math
+// per thread). Below the threshold the body runs serially on the
+// calling thread; chunk partitioning assigns each output element to
+// exactly one chunk with the same inner order, so results are
+// bit-identical either way. Threshold in MACs, default 2^20 (the
+// same gate k_matmul already used), tunable via POTATO_POOL_MIN_MAC
+// for A/B measurement.
+inline int64_t pool_min_mac() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("POTATO_POOL_MIN_MAC");
+        if (e && *e) {
+            long long x = std::atoll(e);
+            if (x > 0) return (int64_t)x;
+        }
+        return (int64_t)1 << 20;
+    }();
+    return v;
+}
+template <typename F>
+inline void pool_run(int64_t work_mac, F&& fn) {
+    if (work_mac < pool_min_mac()) { fn(0, 1); return; }
+    kernel_pool().run(std::forward<F>(fn));
+}
+
 // Partition [0, total) into n contiguous chunks; call f(begin, end) for ours.
 template <typename F>
 inline void chunk(int idx, int n, int64_t total, F&& f) {
@@ -319,7 +345,7 @@ inline void gemv_a_w4_neon(const float* X, int64_t K, int64_t D,
                            const uint8_t* pk, const float* sc, const uint8_t* ze,
                            const float* bias, float* Y) {
     const int64_t ng = D / 64;
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(K * D, [&](int idx, int nt) {
         chunk(idx, nt, ng, [&](int64_t g0, int64_t g1) {
             for (int64_t g = g0; g < g1; g++) {
                 float32x4_t acc[16];
@@ -366,7 +392,7 @@ inline void gemv_b_w4_neon(const float* X, int64_t K, int64_t D,
         for (int t = 0; t < 64; t++) s += xg[t];
         sumx[g] = s;
     }
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(K * D, [&](int idx, int nt) {
         chunk(idx, nt, D, [&](int64_t j0, int64_t j1) {
             for (int64_t j = j0; j < j1; j++) {
                 const uint8_t* prow = pk + (size_t)j * (K / 2);
@@ -438,7 +464,7 @@ inline void gemv_a_w4_i8_wk_neon(const float* X, int64_t K, int64_t D,
                               const uint8_t* pk, const float* sc, const uint8_t* ze,
                               const float* bias, float* Y) {
     const int64_t ng = D / 64;
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(K * D, [&](int idx, int nt) {
         thread_local std::vector<float> fbuf;
         thread_local std::vector<int8_t> fq;
         if ((int64_t)fbuf.size() < K) { fbuf.resize((size_t)K); fq.resize((size_t)K); }
@@ -511,7 +537,7 @@ inline void gemv_a_w4_i8_neon(const float* X, int64_t K, int64_t D,
                               const float* bias, float* Y) {
     const int64_t ng = D / 64;
     const int64_t nb_max = (K + kGemvA8Block - 1) / kGemvA8Block;
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(K * D, [&](int idx, int nt) {
         thread_local std::vector<float> fbuf, sfb;
         thread_local std::vector<int8_t> fq;
         if ((int64_t)fbuf.size() < K) { fbuf.resize((size_t)K); fq.resize((size_t)K); }
@@ -600,7 +626,7 @@ inline void gemv_b_w4_i8_neon(const float* X, int64_t K, int64_t D,
     xq_heap.assign((size_t)ng * 64, 0);
     xq = xq_heap.data();
     gemv_b_i8_prelude(X, ng, sumx, sx, xq);
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(K * D, [&](int idx, int nt) {
         chunk(idx, nt, D, [&](int64_t j0, int64_t j1) {
             for (int64_t j = j0; j < j1; j++) {
                 const uint8_t* prow = pk + (size_t)j * (K / 2);
@@ -645,7 +671,7 @@ inline void gemv_a_w4_i8_wk_portable(const float* X, int64_t K, int64_t D,
                                      const uint8_t* pk, const float* sc, const uint8_t* ze,
                                      const float* bias, float* Y) {
     const int64_t ng = D / 64;
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(K * D, [&](int idx, int nt) {
         thread_local std::vector<float> fbuf;
         thread_local std::vector<int8_t> fq;
         if ((int64_t)fbuf.size() < K) { fbuf.resize((size_t)K); fq.resize((size_t)K); }
@@ -683,7 +709,7 @@ inline void gemv_a_w4_i8_portable(const float* X, int64_t K, int64_t D,
                                   const float* bias, float* Y) {
     const int64_t ng = D / 64;
     const int64_t nb_max = (K + kGemvA8Block - 1) / kGemvA8Block;
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(K * D, [&](int idx, int nt) {
         thread_local std::vector<float> fbuf, sfb;
         thread_local std::vector<int8_t> fq;
         if ((int64_t)fbuf.size() < K) { fbuf.resize((size_t)K); fq.resize((size_t)K); }
@@ -725,7 +751,7 @@ inline void gemv_b_w4_i8_portable(const float* X, int64_t K, int64_t D,
     std::vector<float> sumx((size_t)ng), sx((size_t)ng);
     std::vector<int8_t> xq((size_t)ng * 64);
     gemv_b_i8_prelude(X, ng, sumx.data(), sx.data(), xq.data());
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(K * D, [&](int idx, int nt) {
         chunk(idx, nt, D, [&](int64_t j0, int64_t j1) {
             for (int64_t j = j0; j < j1; j++) {
                 const uint8_t* prow = pk + (size_t)j * (K / 2);
@@ -824,7 +850,7 @@ inline void gemv_a_w4_scalar(const float* X, int64_t K, int64_t D,
                              const uint8_t* pk, const float* sc, const uint8_t* ze,
                              const float* bias, float* Y) {
     const int64_t ng = D / 64;
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(K * D, [&](int idx, int nt) {
         chunk(idx, nt, ng, [&](int64_t g0, int64_t g1) {
             for (int64_t g = g0; g < g1; g++) {
                 float corr = 0.0f;
@@ -855,7 +881,7 @@ inline void gemv_a_w4_avx2(const float* X, int64_t K, int64_t D,
                            const uint8_t* pk, const float* sc, const uint8_t* ze,
                            const float* bias, float* Y) {
     const int64_t ng = D / 64;
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(K * D, [&](int idx, int nt) {
         chunk(idx, nt, ng, [&](int64_t g0, int64_t g1) {
             for (int64_t g = g0; g < g1; g++) {
                 float corr = 0.0f;
@@ -880,7 +906,7 @@ inline void gemv_b_w4_avx2(const float* X, int64_t K, int64_t D,
                            const uint8_t* pk, const float* sc, const uint8_t* ze,
                            const float* bias, float* Y) {
     const int64_t ng = K / 64;
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(K * D, [&](int idx, int nt) {
         chunk(idx, nt, D, [&](int64_t j0, int64_t j1) {
             for (int64_t j = j0; j < j1; j++) {
                 const uint8_t* prow = pk + (size_t)j * (K / 2);
@@ -948,7 +974,7 @@ inline void gemm_a_w4(const float* X, int64_t M, int64_t K, int64_t D,
     const int64_t BD = 128;  // output block
     const int64_t MT = 32;   // row tile: keeps the dequantized block hot in L2
     int64_t nblocks = (D + BD - 1) / BD;
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(M * K * D, [&](int idx, int nt) {
         thread_local std::vector<float> Wd, acc;
         if (Wd.size() < (size_t)K * BD) Wd.resize((size_t)K * BD);
         if (acc.size() < (size_t)MT * BD) acc.resize((size_t)MT * BD);
@@ -1009,7 +1035,7 @@ inline void gemm_b_w4(const float* X, int64_t M, int64_t K, int64_t D,
         return;
     }
     const int64_t ng = K / 64;
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(M * K * D, [&](int idx, int nt) {
         std::vector<float> wd(K);
         chunk(idx, nt, D, [&](int64_t j0, int64_t j1) {
             for (int64_t j = j0; j < j1; j++) {
@@ -1038,7 +1064,7 @@ inline void gemm_a_w8(const float* X, int64_t M, int64_t K, int64_t D,
                       const uint8_t* pk, const float* sc, const float* bias, float* Y) {
     const int64_t BD = 256;
     int64_t nblocks = (D + BD - 1) / BD;
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(M * K * D, [&](int idx, int nt) {
         thread_local std::vector<float> acc, f;
         if (acc.size() < (size_t)std::max<int64_t>(M, 1) * BD) acc.resize((size_t)std::max<int64_t>(M, 1) * BD);
         if ((int64_t)f.size() < M) f.resize((size_t)M);
@@ -1069,7 +1095,7 @@ inline void gemm_a_w8(const float* X, int64_t M, int64_t K, int64_t D,
 // mode 3: W stored (D, K) int8; scale per stored row (= per output dim).
 inline void gemm_b_w8(const float* X, int64_t M, int64_t K, int64_t D,
                       const uint8_t* pk, const float* sc, const float* bias, float* Y) {
-    kernel_pool().run([&](int idx, int nt) {
+    pool_run(M * K * D, [&](int idx, int nt) {
         chunk(idx, nt, D, [&](int64_t j0, int64_t j1) {
             for (int64_t j = j0; j < j1; j++) {
                 const int8_t* qrow = (const int8_t*)(pk + (size_t)j * K);
