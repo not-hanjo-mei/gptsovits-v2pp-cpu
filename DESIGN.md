@@ -414,3 +414,27 @@ on AVX2-only machines and POTATO_NO_AVX512 disables it -- but
 it is frozen: no further AVX-512 optimization work. Optimization
 effort returns to the AVX2 tier, including a newer-clang check
 and hand-written assembly where they measurably pay.
+
+## Attention scale fold (2026-11-26, afternoon)
+
+The GPT stage plans scale Q and K by d^(-1/4) in standalone Mul
+steps (the scalar computed at runtime as
+Sqrt(Cast(Div(1, Sqrt(Shape[..]))))). As steps, those Muls walk
+the [1, 16, L, 32] tensors in a gathered layout: ~300 ms of
+BINOP time per request. Two compile-time folds in
+Plan::compile now move such scales into the consuming matmul's
+epilogue (Step::out_scale; Gemm alpha when it has no C input):
+a post-matmul fold for Mul(MatMul, const) and a pre-matmul fold
+for MatMul(Mul(x, const-expr)) whose scalar resolver evaluates
+CONSTV / Cast / Sqrt / Neg / Add / Sub / Mul / Div chains and
+1-element SYMVALs (shape-derived dims). Both folds are
+bit-identical (the epilogue's double round-trip is exact at
+fp32, sqrt/div included) and conservative: the scaled value's
+consumer path must be unique. All four gates reproduce exactly,
+locally and on the box. FE_PROFILE on the box: stage-plan BINOP
+calls drop by 1,968 + 1,920 per request, stage BINOP time
+~313 ms -> ~14 ms. A wall-clock A/B the same afternoon was
+unreadable -- the shared box's baseline swung 2.4-4.8 s between
+runs -- so the profile accounting is the recorded evidence.
+Known rejection: a scaled tensor feeding two matmuls (encoder)
+stays unfolded; it runs once per request and is not the target.
