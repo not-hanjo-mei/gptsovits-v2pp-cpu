@@ -593,15 +593,18 @@ bool binop_f32_fast(BinOp op, const RT& A, const RT& B, RT& Y) {
     bool as = A.numel() == n, bs = B.numel() == n;
     if (!as && A.numel() != 1) return false;
     if (!bs && B.numel() != 1) return false;
+    auto range = [&](int64_t i0, int64_t i1) {
+        if (cpu::features().avx2 && cpu::features().fma &&
+            avx2k::binop_f32((int)op, as ? a + i0 : a, bs ? b + i0 : b, y + i0, i1 - i0, !as, !bs))
+            return;
+        for (int64_t i = i0; i < i1; i++) y[i] = binop_apply_f(op, a[as ? i : 0], b[bs ? i : 0]);
+    };
     if (n >= (1 << 17)) {
         packed::kernel_pool().run([&](int idx, int nt) {
-            packed::chunk(idx, nt, n, [&](int64_t i0, int64_t i1) {
-                for (int64_t i = i0; i < i1; i++)
-                    y[i] = binop_apply_f(op, a[as ? i : 0], b[bs ? i : 0]);
-            });
+            packed::chunk(idx, nt, n, [&](int64_t i0, int64_t i1) { range(i0, i1); });
         });
     } else {
-        for (int64_t i = 0; i < n; i++) y[i] = binop_apply_f(op, a[as ? i : 0], b[bs ? i : 0]);
+        range(0, n);
     }
     return true;
 }
@@ -630,7 +633,7 @@ void binop_walk_par(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* as
     const float* a = (const float*)A.p;
     const float* b = (const float*)B.p;
     float* y = (float*)Y.p;
-    packed::kernel_pool().run([&](int idx, int nt) {
+    packed::pool_run(n * 16, [&](int idx, int nt) {
         packed::chunk(idx, nt, n, [&](int64_t i0, int64_t i1) {
             int64_t coord[8] = {0};
             int64_t ao = 0, bo = 0, yo = 0;
@@ -720,13 +723,21 @@ bool binop_rows(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* as, co
                 const float* bp = b + bo;
                 float* yp = y + yo;
                 if (asl == 1 && bsl == 1) {
-                    for (int64_t i = 0; i < D; i++) yp[i] = binop_apply_f(op, ap[i], bp[i]);
+                    if (!(cpu::features().avx2 && cpu::features().fma &&
+                          avx2k::binop_f32((int)op, ap, bp, yp, D, false, false)))
+                        for (int64_t i = 0; i < D; i++) yp[i] = binop_apply_f(op, ap[i], bp[i]);
                 } else if (asl == 1) {
-                    float bv = bp[0];
-                    for (int64_t i = 0; i < D; i++) yp[i] = binop_apply_f(op, ap[i], bv);
+                    if (!(cpu::features().avx2 && cpu::features().fma &&
+                          avx2k::binop_f32((int)op, ap, bp, yp, D, false, true))) {
+                        float bv = bp[0];
+                        for (int64_t i = 0; i < D; i++) yp[i] = binop_apply_f(op, ap[i], bv);
+                    }
                 } else if (bsl == 1) {
-                    float av = ap[0];
-                    for (int64_t i = 0; i < D; i++) yp[i] = binop_apply_f(op, av, bp[i]);
+                    if (!(cpu::features().avx2 && cpu::features().fma &&
+                          avx2k::binop_f32((int)op, ap, bp, yp, D, true, false))) {
+                        float av = ap[0];
+                        for (int64_t i = 0; i < D; i++) yp[i] = binop_apply_f(op, av, bp[i]);
+                    }
                 } else {
                     float v = binop_apply_f(op, ap[0], bp[0]);
                     for (int64_t i = 0; i < D; i++) yp[i] = v;
@@ -764,7 +775,9 @@ bool unop_rows(UnOp op, const RT& A, RT& Y, double alpha, const int64_t* as, con
                 const float* ap = a + ao;
                 float* yp = y + yo;
                 if (asl == 1) {
-                    for (int64_t i = 0; i < D; i++) yp[i] = unop_apply_f(op, ap[i], alpha);
+                    if (!(cpu::features().avx2 && cpu::features().fma &&
+                          avx2k::unop_f32((int)op, ap, yp, D, (float)alpha)))
+                        for (int64_t i = 0; i < D; i++) yp[i] = unop_apply_f(op, ap[i], alpha);
                 } else {
                     float v = unop_apply_f(op, ap[0], alpha);
                     for (int64_t i = 0; i < D; i++) yp[i] = v;
@@ -841,14 +854,18 @@ void k_unop(UnOp op, const RT& A, RT& Y, double alpha = 0.0) {
         const float* a = (const float*)A.p;
         float* y = (float*)Y.p;
         int64_t n = Y.numel();
+        auto range = [&](int64_t i0, int64_t i1) {
+            if (cpu::features().avx2 && cpu::features().fma &&
+                avx2k::unop_f32((int)op, a + i0, y + i0, i1 - i0, (float)alpha))
+                return;
+            for (int64_t i = i0; i < i1; i++) y[i] = unop_apply_f(op, a[i], alpha);
+        };
         if (n >= (1 << 17)) {
             packed::kernel_pool().run([&](int idx, int nt) {
-                packed::chunk(idx, nt, n, [&](int64_t i0, int64_t i1) {
-                    for (int64_t i = i0; i < i1; i++) y[i] = unop_apply_f(op, a[i], alpha);
-                });
+                packed::chunk(idx, nt, n, [&](int64_t i0, int64_t i1) { range(i0, i1); });
             });
         } else {
-            for (int64_t i = 0; i < n; i++) y[i] = unop_apply_f(op, a[i], alpha);
+            range(0, n);
         }
         return;
     }
@@ -1265,7 +1282,7 @@ void k_conv(const RT& X0, const RT& W0, const RT* B, RT& Y, const std::vector<in
             // box for this branch's first, static, version).
             std::atomic<int64_t> next_task{0};
             const int64_t total_tasks = N * ntiles * nblocks;
-            packed::kernel_pool().run([&](int, int) {
+            packed::pool_run(N * O * Lout * C * K, [&](int, int) {
                 while (true) {
                     int64_t task = next_task.fetch_add(1, std::memory_order_relaxed);
                     if (task >= total_tasks) break;
@@ -1280,7 +1297,7 @@ void k_conv(const RT& X0, const RT& W0, const RT* B, RT& Y, const std::vector<in
             });
             return;
         }
-        packed::kernel_pool().run([&](int idx, int nt) {
+        packed::pool_run(N * O * Lout * C * K, [&](int idx, int nt) {
             packed::chunk(idx, nt, N * O, [&](int64_t t0, int64_t t1) {
                 for (int64_t t = t0; t < t1; t++) {
                     int64_t n = t / O, o = t % O;
@@ -1316,7 +1333,7 @@ void k_conv(const RT& X0, const RT& W0, const RT* B, RT& Y, const std::vector<in
     // sp == 2: direct dot-product form, one output line (n, o) per task.
     int64_t H = X.shape[2], Wd = X.shape[3], KH = W.shape[2], KW = W.shape[3];
     int64_t Hout = Y.shape[2], Wout = Y.shape[3];
-    packed::kernel_pool().run([&](int idx, int nt) {
+    packed::pool_run(N * O * Hout * Wout * C * KH * KW, [&](int idx, int nt) {
         packed::chunk(idx, nt, N * O, [&](int64_t t0, int64_t t1) {
             for (int64_t t = t0; t < t1; t++) {
                 int64_t n = t / O, o = t % O;
@@ -1419,7 +1436,7 @@ void k_convtranspose(const RT& X0, const RT& W0, const RT* B, RT& Y,
             // (kks descending makes the implied input shift increase by
             // exactly 1 per tap: a stride-1 conv with pad_l = -shift0,
             // the same form conv_transpose1d_fast uses).
-            packed::kernel_pool().run([&](int idx, int nt) {
+            packed::pool_run(N * O * Lm * Ci * Kp, [&](int idx, int nt) {
                 packed::chunk(idx, nt, N * O, [&](int64_t t0, int64_t t1) {
                     for (int64_t t = t0; t < t1; t++) {
                         int64_t n = t / O, o = t % O;
@@ -1454,7 +1471,7 @@ void k_convtranspose(const RT& X0, const RT& W0, const RT* B, RT& Y,
         }
         // overflow (Kp > 64) falls through to the gather form.
     }
-    packed::kernel_pool().run([&](int idx, int nt) {
+    packed::pool_run(N * O * osp * Ci * ksp, [&](int idx, int nt) {
         packed::chunk(idx, nt, N * O, [&](int64_t l0, int64_t l1) {
             std::vector<int64_t> oc(sp), kc(sp), li(sp);
             for (int64_t ln = l0; ln < l1; ln++) {
