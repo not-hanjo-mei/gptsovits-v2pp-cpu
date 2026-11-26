@@ -554,3 +554,60 @@ afternoon. Consequences, re-measured with HEAD-asserted builds:
 Box discipline from here: every verification script prints the
 clone's HEAD and working-tree status before building, and a
 failed pull fails the script.
+
+## Brainstorm campaign (2026-11-26, night)
+
+Four parallel research passes (kernels, graph rewrites, runtime
+systems, outside techniques) produced a ranked pool; every item
+was verified or measured before any code was written.
+
+Verified away (no code): the fp32 vits weight-norm chains are
+already constant-folded at compile (BINOP totals prove it); the
+ConvTranspose family is 4.6% of PCONV compute, at parity with
+ORT's 78 ms -- not a gap.
+
+Shipped, each gated and interleaved-A/B'd on the box:
+- Dead-step elimination after the scalar folds: stage UNOP calls
+  4,018 -> 1,066 per request (e86d653).
+- LeakyReLU epilogue fusion into conv / conv-transpose /
+  packed-conv / residual-add steps (46 sites in the vits plan):
+  vits UNOP 32-37 -> 13 ms (7c3d633). The other 31 Add cases have
+  a genuine second consumer and stay steps.
+- Bind workspace reuse (persistent res/cshape/planner/Scratch):
+  stage bind 45 -> 35 ms per plan, about -22 ms per request,
+  planner arithmetic unchanged (49d61df).
+- gemm_b_w4 prefill block path (vector dequant + transpose +
+  apply_tile, was scalar dequant + scalar dot): gpt_first PACKED
+  326-337 -> 221-224 ms (12c25a0).
+
+Measured and not adopted:
+- PCONV block grouping (POTATO_PCONV_G): G=2/4/8 at LT 256-512
+  all flat to worse than G=1/LT=1024 -- the X slices are served
+  by the shared L3, not re-streamed from DRAM. Knob stays,
+  default unchanged (fdfcd7b).
+- pshufb LUT nibble unpack: bit-identical and 5% SLOWER in the
+  mode-B dot harness (77.9 -> 73.7 GMAC/s); the widening tail
+  dominates. Not shipped.
+- Huge pages (POTATO_HUGEPAGES madvise on the arenas): engages
+  (RSS +~5 MB of rounding) with no elapsed-time separation --
+  the hypervisor appears to back guest RAM with large pages
+  already. Gate stays, default off (39cdbcb).
+- PGO build: gpt_first exec -12% but stage exec +9% in the same
+  interleaved session; net zero inside the box's noise. Not
+  adopted (two-pass build burden for no proven gain).
+
+Known remaining pool, documented and deliberately not started
+(multi-day class): panel-packed GEMM for the packed conv and
+the fp32 first stage; load-time row-interleaved W4 repack;
+fused single-pass decode attention; an AVX2 executor for the
+existing i8 GEMV tier (numerics change -- needs gate counts and
+a listening verdict before any default); the probs*V register
+kernel; an indexed Plan::run API for the host decode loop.
+
+End state: all four gates at their baselines (299/361, 361/361,
+0.959881 with internal maxerr 1.66893e-06, fp32 corr 1.000000 /
+relrms 1.7e-05 / maxerr 6.25253e-05). AVX2-only E2E on the box:
+2,523-2,684 ms (RTF 0.79-0.84) against ~3,180 ms before the
+campaign; the interleaved profile deltas account for about
+270 ms of it directly (wide dot ~120, gemm_b ~105, bind ~22,
+Leaky ~20), the rest is second-order step-count reduction.
