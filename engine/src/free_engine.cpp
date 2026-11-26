@@ -4740,7 +4740,14 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
                 int64_t rows = t.shape.empty() ? 0 : t.shape[0];
                 int64_t rowf = rows > 0 ? t.numel() / rows : 0;
                 if (slot.len < 0 || slot.len != rows) {
-                    slot.reserve(std::max<int64_t>(rows * 2, 1024), rowf);
+                    // POTATO_KV_INIT_CAP (rows) overrides the
+                    // initial capacity; small values exercise the
+                    // growth path in tests.
+                    static const int64_t init_cap = [] {
+                        const char* e = std::getenv("POTATO_KV_INIT_CAP");
+                        return e ? std::atoll(e) : 1024;
+                    }();
+                    slot.reserve(std::max<int64_t>(rows * 2, init_cap), rowf);
                     // The source may be a strided view (the first
                     // plan's presents are row-strided slices of the
                     // QKV projection). Rows are contiguous blocks:
