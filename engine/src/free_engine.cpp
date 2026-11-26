@@ -4722,7 +4722,9 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
             KvCache::Slot& slot = im.kv->slots[pi];
             const Tensor& t = inputs[pr.in_idx];
             if (t.data != nullptr) {
-                if (!t.contiguous()) fail("kv: past input not contiguous");
+                bool contig = t.contiguous() ||
+                              (t.strides.size() == t.shape.size() && t.strides == rowmajor(t.shape));
+                if (!contig) fail("kv: past input not contiguous");
                 int64_t rows = t.shape.empty() ? 0 : t.shape[0];
                 int64_t rowf = rows > 0 ? t.numel() / rows : 0;
                 if (slot.len < 0 || slot.len != rows) {
