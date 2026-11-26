@@ -362,3 +362,26 @@ gates reproduce exactly. Remaining vits gap to Genie (~380 ms of
 node time): production-vs-isolation rate loss, the transposed
 convs, and ~45 ms of elementwise; the kernel-rate remainder is
 MLAS's GEMM panel packing.
+
+## Compiler check (2026-11-26, afternoon)
+
+Builds use GCC (13.3 dev VM, 14.2 EPYC box), Release (-O3), no
+global -march; ISA tiers are per-function target attributes.
+Measured whether the compiler matters, same tile bench, one
+thread, 192x192 K11 L=12000 (GMAC/s):
+
+| tile | g++ 14.2 | clang 19.1 |
+|---|---|---|
+| AVX2 4x16 | 41.2 | 16.7 |
+| AVX-512 4x32 (shipping) | 100.0 | 106.0 |
+| AVX-512 8x32 | 21.3 (spills) | 121.9 |
+
+The compiler swings individual kernels by up to 2.5x in either
+direction: clang's allocator handles the 16-accumulator zmm tile
+that makes GCC spill, and beats even ORT's 113.5 on that shape;
+GCC is far better on the AVX2 baseline tile. ORT sidesteps the
+whole question -- MLAS kernels are hand-written assembly. Verdict:
+the unified build stays on GCC (the AVX2 tier is the product
+baseline and must not regress); an optional per-TU clang build of
+just the AVX-512 tile is recorded as a possible ~6% end-to-end
+gain on AVX-512 machines, not built.
