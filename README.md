@@ -41,7 +41,7 @@ seed 42. RTF is wall time divided by audio duration; lower is better.
 | Configuration | RTF | Peak RSS |
 |---|---|---|
 | This engine, W4 tier, all dispatch tiers | 0.77–0.81 | 256 MB |
-| This engine, W4 tier, AVX2 only | 0.92–1.01 | 256 MB |
+| This engine, W4 tier, AVX2 only | 0.79–0.84 | 256 MB |
 | This engine, fp32 | ~1.4–1.5 | 2,586 MB |
 | Genie-TTS (ONNX Runtime, same machine) | 0.55 | 5,485 MB |
 
@@ -71,6 +71,10 @@ Where the speed comes from:
 - Compile-time folding of the attention score scale into the matmul
   epilogues, and AVX2 elementwise kernels for the ops whose vector
   form is bit-exact against the scalar one.
+- LeakyReLU fused into the convolution and residual-add epilogues,
+  dead-step elimination after the compile-time folds, a blocked
+  vector prefill path for the mode-B W4 GEMM, and a bind workspace
+  whose buffers persist across decode steps.
 
 ## Build and run
 
