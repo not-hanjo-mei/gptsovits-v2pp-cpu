@@ -125,6 +125,22 @@ float dot_f32(const float* a, const float* b, int64_t n) {
 #endif
 }
 
+void w4_dequant64(const uint8_t* prow, float sc, float ze, float* out) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 w[8];
+    w4_unpack64(prow, w);
+    const __m256 vs = _mm256_set1_ps(sc), vz = _mm256_set1_ps(ze);
+    for (int q = 0; q < 8; q++)
+        _mm256_storeu_ps(out + q * 8, _mm256_mul_ps(_mm256_sub_ps(w[q], vz), vs));
+#else
+    for (int i = 0; i < 64; i++) {
+        uint8_t byte = prow[i / 2];
+        int nib = (i % 2 == 0) ? (byte >> 4) : (byte & 0xF);
+        out[i] = ((float)nib - ze) * sc;
+    }
+#endif
+}
+
 float w4b_dotraw64(const uint8_t* prow, const float* x) {
 #if defined(__AVX2__) && defined(__FMA__)
     __m256 w[8];

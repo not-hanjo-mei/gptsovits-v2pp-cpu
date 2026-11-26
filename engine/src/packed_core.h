@@ -1150,6 +1150,56 @@ inline void gemm_b_w4(const float* X, int64_t M, int64_t K, int64_t D,
         gemv_b_w4_avx2(X, K, D, pk, sc, ze, bias, Y);
         return;
     }
+    // Prefill (M > 1) block path, mirroring gemm_a_w4: dequantize a
+    // block of output rows with the vector unpack, transpose into
+    // [K][BD] so apply_tile runs its SAXPY form, accumulate per row
+    // tile. The scalar path below stays for the shapes and machines
+    // this does not cover (it dequantized row by row and dotted in
+    // scalar code). Accumulation per output now follows apply_tile's
+    // i order with FMA, like the mode-A block path.
+    if (M > 1 && K >= 64 && K % 64 == 0 && cpu::features().avx2 && cpu::features().fma) {
+        const int64_t BD = 128;
+        const int64_t MT = 32;
+        const int64_t ng = K / 64;
+        int64_t nblocks = (D + BD - 1) / BD;
+        pool_run(M * K * D, [&](int idx, int nt) {
+            thread_local std::vector<float> Wd, WdT, acc;
+            if (Wd.size() < (size_t)BD * K) Wd.resize((size_t)BD * K);
+            if (WdT.size() < (size_t)K * BD) WdT.resize((size_t)K * BD);
+            if (acc.size() < (size_t)MT * BD) acc.resize((size_t)MT * BD);
+            chunk(idx, nt, nblocks, [&](int64_t b0, int64_t b1) {
+                for (int64_t blk = b0; blk < b1; blk++) {
+                    int64_t j0 = blk * BD;
+                    int64_t bw = std::min(BD, D - j0);
+                    for (int64_t jb = 0; jb < bw; jb++) {
+                        int64_t j = j0 + jb;
+                        const uint8_t* prow = pk + (size_t)j * (K / 2);
+                        const float* srow = sc + (size_t)j * ng;
+                        const uint8_t* zrow = ze + (size_t)j * ng;
+                        float* wd = &Wd[(size_t)jb * K];
+                        for (int64_t g = 0; g < ng; g++)
+                            avx2k::w4_dequant64(prow + g * 32, srow[g], (float)zrow[g], wd + g * 64);
+                    }
+                    for (int64_t i = 0; i < K; i++) {
+                        float* wdt = &WdT[(size_t)i * BD];
+                        for (int64_t jb = 0; jb < bw; jb++) wdt[jb] = Wd[(size_t)jb * K + i];
+                    }
+                    for (int64_t m0 = 0; m0 < M; m0 += MT) {
+                        int64_t mw = std::min(MT, M - m0);
+                        for (int64_t m = 0; m < mw; m++)
+                            for (int64_t jb = 0; jb < bw; jb++) acc[(size_t)m * BD + jb] = bias ? bias[j0 + jb] : 0.0f;
+                        apply_tile(X, K, m0, mw, WdT.data(), BD, bw, acc.data());
+                        for (int64_t m = 0; m < mw; m++) {
+                            float* y = Y + (size_t)(m0 + m) * D + j0;
+                            const float* a = &acc[(size_t)m * BD];
+                            for (int64_t jb = 0; jb < bw; jb++) y[jb] = a[jb];
+                        }
+                    }
+                }
+            });
+        });
+        return;
+    }
     const int64_t ng = K / 64;
     pool_run(M * K * D, [&](int idx, int nt) {
         std::vector<float> wd(K);

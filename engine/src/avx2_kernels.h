@@ -34,6 +34,9 @@ float w4b_dot64(const uint8_t* prow, float sc, float ze, const float* x);
 // scalar fallback accumulates in double, matching the attention
 // fast path's historical numerics on machines without AVX2.
 float dot_f32(const float* a, const float* b, int64_t n);
+// Dequantize one 64-element group of a mode-B row (32 packed bytes)
+// into fp32 with the group's scale and zero point.
+void w4_dequant64(const uint8_t* prow, float sc, float ze, float* out);
 // Raw nibble dot: sum of unpacked weights times x, with no scale or
 // zero-point applied. Callers fold those in algebraically --
 // sum((w - ze) * sc * x) == sc * dotraw - sc * ze * sum(x) -- which
