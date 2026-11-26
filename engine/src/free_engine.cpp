@@ -815,9 +815,68 @@ bool unop_rows(UnOp op, const RT& A, RT& Y, double alpha, const int64_t* as, con
 // Kept from the 2026-11-10 knife-5 diagnosis (ORT-FREE.md section
 // 12): walk_par is where decode's elementwise time lives.
 struct BinopPathStat { long n = 0; double us = 0; long long elems = 0; double max_us = 0; };
-static BinopPathStat g_binop_paths[5];
-static const char* g_binop_path_names[5] = {"f32_fast", "rows", "walk_par", "serial_odom", "generic_odom"};
+static BinopPathStat g_binop_paths[6];
+static const char* g_binop_path_names[6] = {"f32_fast", "rows", "walk_par", "serial_odom", "generic_odom", "axis_rows"};
 static bool fe_profile_on() { static const bool on = std::getenv("FE_PROFILE") != nullptr; return on; }
+
+// Generalized rows: pick any axis where at least one operand is
+// unit-stride and both are unit-or-broadcast, and walk the remaining
+// axes as an outer odometer. Covers the attention score layout
+// [heads, pos, kv] stored pos-major: the output's last axis is the
+// operand's strided axis, so neither the flat nor the last-axis
+// rows path applies, but the pos axis is unit in the operand and a
+// constant stride in the output. The inner loop is odometer-free;
+// with a unit output stride it delegates to the AVX2 kernels.
+bool binop_axis_rows(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* as, const int64_t* bs,
+                     const int64_t* ys, int r, const int64_t* oshape) {
+    int d = -1;
+    for (int i = 0; i < r; i++) {
+        if (ys[i] < 1) continue;
+        bool au = as[i] == 1, bu = bs[i] == 1;
+        if (!au && !bu) continue;
+        if (!(as[i] == 0 || au) || !(bs[i] == 0 || bu)) continue;
+        if (d < 0 || oshape[i] > oshape[d]) d = i;
+    }
+    if (d < 0 || oshape[d] < 2) return false;
+    const int64_t D = oshape[d];
+    const int64_t outer = Y.numel() / D;
+    int64_t suf[8];
+    {
+        int64_t acc = 1;
+        for (int i = r - 1; i >= 0; i--) {
+            if (i == d) continue;
+            suf[i] = acc;
+            acc *= oshape[i];
+        }
+    }
+    const float* a = (const float*)A.p;
+    const float* b = (const float*)B.p;
+    float* y = (float*)Y.p;
+    const int64_t sa = as[d], sb = bs[d], sy = ys[d];
+    auto body = [&](int idx, int nt) {
+        packed::chunk(idx, nt, outer, [&](int64_t o0, int64_t o1) {
+            for (int64_t oo = o0; oo < o1; oo++) {
+                int64_t ao = 0, bo = 0, yo = 0, rem = oo;
+                for (int i = 0; i < r; i++) {
+                    if (i == d) continue;
+                    int64_t c = rem / suf[i];
+                    rem -= c * suf[i];
+                    ao += c * as[i]; bo += c * bs[i]; yo += c * ys[i];
+                }
+                const float* ap = a + ao;
+                const float* bp = b + bo;
+                float* yp = y + yo;
+                if (sy == 1 && cpu::features().avx2 && cpu::features().fma &&
+                    avx2k::binop_f32((int)op, ap, bp, yp, D, sa == 0, sb == 0))
+                    continue;
+                for (int64_t i = 0; i < D; i++) yp[i * sy] = binop_apply_f(op, ap[i * sa], bp[i * sb]);
+            }
+        });
+    };
+    if (Y.numel() >= (1 << 17)) packed::kernel_pool().run(body);
+    else body(0, 1);
+    return true;
+}
 
 void k_binop(BinOp op, const RT& A, const RT& B, RT& Y) {
     const bool prof = fe_profile_on();
@@ -838,6 +897,7 @@ void k_binop(BinOp op, const RT& A, const RT& B, RT& Y) {
             int64_t ca[8], cb[8], cy[8], cs[8];
             int cr = compact_dims(Y.shape, as, bs, ys, ca, cb, cy, cs);
             if (binop_rows(op, A, B, Y, ca, cb, cy, cr, cs)) { note(1); return; }
+            if (binop_axis_rows(op, A, B, Y, ca, cb, cy, cr, cs)) { note(5); return; }
             if (Y.numel() >= 8192) {
                 if (std::getenv("FE_WALK_DEBUG")) {
                     int r = (int)Y.shape.size();
@@ -3889,7 +3949,7 @@ static void prof_print() {
             if (kv.second.n[i]) std::fprintf(stderr, "  %-10s %8ld calls %12.1f ms\n", g_prof_names[i], kv.second.n[i], kv.second.us[i] / 1000.0);
     }
     std::fprintf(stderr, "[FE_PROFILE] binop paths (all plans):\n");
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < 6; i++)
         if (g_binop_paths[i].n)
             std::fprintf(stderr, "  %-12s %8ld calls %12.1f ms  %14lld elems  max %.1f ms\n",
                          g_binop_path_names[i], g_binop_paths[i].n, g_binop_paths[i].us / 1000.0,
