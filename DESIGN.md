@@ -462,3 +462,14 @@ gates reproduce their canonical stats locally and on the box
 (the box packed internal maxerr moved 2.29e-06 -> 2.32e-06,
 corr/relrms unchanged). POTATO_NO_ASM=1 restores the intrinsics
 tile; edge chunks, tails and odd Ci still use it.
+
+## Mode-B GEMV dotraw (2026-11-26)
+
+The AVX2 mode-B dot folded scale/zero out of the inner loop:
+sum((w - ze) * sc * x) == sc * dotraw(w, x) - sc * ze * sum(x),
+with the group sums of x computed once per GEMV instead of once
+per row. The isolated gemv_bench cannot see it (13.8 GMAC/s
+either way; that shape is overhead-bound), but the host profile
+can: stage-plan PACKED 250 + 260 ms -> 212 + 208 ms per request
+in AVX2-only mode, about -90 ms. Gates exact (299/361 holds;
+the restructure flipped no tokens).
