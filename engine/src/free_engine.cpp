@@ -4141,6 +4141,59 @@ static bool fold_one_scalar_mul_pre(Impl& im) {
     return false;
 }
 
+// Dead-step elimination, run after the scalar folds: the folds
+// rewire the scale chains' consumers onto the pre-Mul values and
+// leave the chains' own steps (Shape, Cast, Sqrt, Div, ...) behind
+// with no live reader. A step is removed when its kind is pure (no
+// RNG state, no side effects) and none of its outputs is used -- by
+// another step, as the base of a used view, through a meta
+// reference, or as a graph output. Iterated to a fixpoint so whole
+// chains collapse. Removed values follow the folds' convention
+// (def_step = -2) and later def_steps shift down.
+static void dce_pure_steps(Impl& im) {
+    auto& steps = im.steps;
+    auto& vals = im.vals;
+    auto pure = [](SK k) {
+        switch (k) {
+            case SK::UNOP: case SK::BINOP: case SK::CAST: case SK::CONSTSHAPE:
+            case SK::COPY: case SK::EXPAND: case SK::WHERE: case SK::REDUCESUM:
+            case SK::CUMSUM: case SK::GATHER: case SK::GATHER_EL: case SK::CONCAT:
+            case SK::PAD:
+                return true;
+            default:
+                return false;
+        }
+    };
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        std::vector<char> used(vals.size(), 0);
+        for (auto& s : steps)
+            for (int v : s.in) used[v] = 1;
+        for (int v : im.out_vals) used[v] = 1;
+        for (auto& v : vals)
+            for (int m : {v.meta0, v.meta1, v.meta2, v.meta3})
+                if (m >= 0) used[m] = 1;
+        for (int i = (int)vals.size() - 1; i >= 0; i--)
+            if (used[i] && vals[i].kind == Value::RT && vals[i].view_kind != 0 && vals[i].base >= 0)
+                used[vals[i].base] = 1;
+        for (int s = (int)steps.size() - 1; s >= 0; s--) {
+            Step& st = steps[s];
+            if (!pure(st.k)) continue;
+            bool dead = true;
+            for (int v : st.out)
+                if (used[v] || vals[v].is_output) dead = false;
+            if (!dead) continue;
+            for (int v : st.out) vals[v].def_step = -2;
+            steps.erase(steps.begin() + s);
+            for (auto& v : vals)
+                if (v.def_step > s) v.def_step--;
+            changed = true;
+            break;  // indices shifted; recompute use counts
+        }
+    }
+}
+
 std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bool fp16_weights) {
     auto plan = std::make_shared<Plan>();
     auto im = std::make_shared<Impl>();
@@ -4203,6 +4256,7 @@ std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bo
     }
     while (fold_one_scalar_mul_pre(*im)) {
     }
+    dce_pure_steps(*im);
     // Liveness: last use over steps, then propagate through views
     // (reverse creation order: views are created after their bases, and
     // a view's last use must extend its base's).
