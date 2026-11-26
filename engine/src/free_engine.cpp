@@ -401,6 +401,24 @@ void k_matmul(const RT& A0, const RT& B0, RT& C, Scratch& sc, const uint16_t* Bf
         else dot_body(0, 1);
         return;
     }
+    // Decode probs*V: one query row per head against a
+    // position-major V cache (row stride 512), N == 32 outputs.
+    // The tiled path below keeps the 32 accumulators in memory;
+    // this path keeps them in registers across the whole K loop.
+    // Same FMA order as mm_saxpy (k ascending, one FMA per
+    // element), so results are bit-identical.
+    if (!Bf16 && use_avx2 && M == 1 && N == 32 && acol == 1 && bcol == 1 && brow >= 32 &&
+        C.contig()) {
+        auto pv_body = [&](int idx, int nt) {
+            packed::chunk(idx, nt, batch, [&](int64_t b0, int64_t b1) {
+                for (int64_t b = b0; b < b1; b++)
+                    avx2k::pv_n32(ap0 + aoff[b], bp0 + boff[b], brow, K, cp0 + b * 32);
+            });
+        };
+        if ((int64_t)batch * N * K >= (1 << 20)) packed::kernel_pool().run(pv_body);
+        else pv_body(0, 1);
+        return;
+    }
     int64_t rows = (int64_t)batch * M;
     if (rows >= 4) {
         // One pool run over all (batch, row) pairs: per-batch pool

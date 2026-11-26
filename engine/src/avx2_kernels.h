@@ -34,6 +34,10 @@ float w4b_dot64(const uint8_t* prow, float sc, float ze, const float* x);
 // scalar fallback accumulates in double, matching the attention
 // fast path's historical numerics on machines without AVX2.
 float dot_f32(const float* a, const float* b, int64_t n);
+// Decode probs*V for one head: y[32] = sum_k a[k] * B[k*S .. k*S+32),
+// accumulators held in registers across the K loop. One FMA per
+// element in k-ascending order, exactly as the SAXPY form.
+void pv_n32(const float* a, const float* B, int64_t S, int64_t K, float* y);
 // Dequantize one 64-element group of a mode-B row (32 packed bytes)
 // into fp32 with the group's scale and zero point.
 void w4_dequant64(const uint8_t* prow, float sc, float ze, float* out);

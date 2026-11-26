@@ -141,6 +141,32 @@ void w4_dequant64(const uint8_t* prow, float sc, float ze, float* out) {
 #endif
 }
 
+void pv_n32(const float* a, const float* B, int64_t S, int64_t K, float* y) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps(),
+           acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    for (int64_t k = 0; k < K; k++) {
+        const __m256 bc = _mm256_set1_ps(a[k]);
+        const float* row = B + k * S;
+        acc0 = _mm256_fmadd_ps(bc, _mm256_loadu_ps(row), acc0);
+        acc1 = _mm256_fmadd_ps(bc, _mm256_loadu_ps(row + 8), acc1);
+        acc2 = _mm256_fmadd_ps(bc, _mm256_loadu_ps(row + 16), acc2);
+        acc3 = _mm256_fmadd_ps(bc, _mm256_loadu_ps(row + 24), acc3);
+    }
+    _mm256_storeu_ps(y, acc0);
+    _mm256_storeu_ps(y + 8, acc1);
+    _mm256_storeu_ps(y + 16, acc2);
+    _mm256_storeu_ps(y + 24, acc3);
+#else
+    for (int j = 0; j < 32; j++) y[j] = 0.0f;
+    for (int64_t k = 0; k < K; k++) {
+        float av = a[k];
+        const float* row = B + k * S;
+        for (int j = 0; j < 32; j++) y[j] += av * row[j];
+    }
+#endif
+}
+
 float w4b_dotraw64(const uint8_t* prow, const float* x) {
 #if defined(__AVX2__) && defined(__FMA__)
     __m256 w[8];
