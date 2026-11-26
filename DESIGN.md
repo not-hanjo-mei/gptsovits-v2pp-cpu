@@ -277,3 +277,23 @@ shipped-default samples (W4, 4 threads): 3,192-3,694 ms per
 sentence, **RTF 1.00-1.15**, decode 1,189-1,486 ms, RSS 256 MB.
 Across both optimization rounds the sentence went from
 4,026-4,426 ms (RTF 1.26-1.38, Genie session) to 3,192-3,694 ms.
+
+## Elementwise round (2026-11-26, later still)
+
+AVX2 elementwise kernels (exactly-IEEE ops only: ADD/SUB/MUL/DIV,
+comparisons, NEG/SQRT/RELU/ABS/LEAKY) wired into the binop/unop
+fast paths: vits UNOP 97 -> 41 ms, BINOP 55 -> 39 ms per request.
+Size-1 dim compaction before path selection returns [C, L, 1]
+layouts to the rows path. Two measured dead ends, kept out: a
+generalized strided axis path for the attention score scale
+(227M elements) lost to the plain linear odometer walk in an
+interleaved A/B (362-378 ms vs 291-300 ms; the walk's Y-linear
+order reuses the operand cache window, scattered access in
+either direction loses), and software prefetch on the strided
+form was ~3% worse than none. The axis path ships restricted to
+the vectorizable middle-axis case. FE_PROFILE also gained
+per-plan bind vs exec lines (bind is ~1.2 ms per stage-plan
+invocation, not the decode gap). Final shipped samples (W4,
+4 threads): 2,871-3,400 ms per sentence, **RTF 0.90-1.06**,
+decode 1,053-1,298 ms, stage PACKED 212 + 214 ms, PCONV
+1,400 ms, RSS 256 MB.
