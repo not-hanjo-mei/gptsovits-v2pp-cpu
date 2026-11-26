@@ -473,3 +473,12 @@ either way; that shape is overhead-bound), but the host profile
 can: stage-plan PACKED 250 + 260 ms -> 212 + 208 ms per request
 in AVX2-only mode, about -90 ms. Gates exact (299/361 holds;
 the restructure flipped no tokens).
+
+## PCONV tile width sweep (2026-11-26)
+
+POTATO_PCONV_LT tunes the packed conv's position-tile width
+(default 1024). On the EPYC box, LT=512 measured lowest in both
+runs (PCONV ~1,283/1,360 ms vs 1,428/1,446 at 1024; 256, 2048
+and 4096 in between) -- an ~8% spread, inside the box's session
+noise, so the default stays 1024 and the knob stays for
+per-machine tuning.
