@@ -96,10 +96,10 @@ __attribute__((target("avx2,fma"))) void conv_tile_avx2(
     const float* Xn, int64_t L, const float* wbuf, int64_t C, int64_t Ci, int64_t K,
     int64_t pad_l, int64_t dil, const float* bias, float* Yn, int64_t Lout, int64_t lt0,
     int64_t lt_len, int64_t o0, int64_t ob);
-// The same tile on AVX-512F: one zmm covers the 16 positions, so
-// the tap loop is one load + one broadcast FMA per output channel.
-// Same accumulation order per output element as the AVX2 tile, so
-// results are bit-identical. Worthwhile only where the 512-bit
+// The same tile on AVX-512F, widened to 32 positions (zmm pairs)
+// for eight accumulator chains; same accumulation order per output
+// element as the AVX2 tile, so results are bit-identical.
+// Worthwhile only where the 512-bit
 // datapath is full-width (Zen 5 class: measured 176 vs 88 GMAC/s
 // single-thread FMA peak on the EPYC verification box, 2026-11-26;
 // on double-pumped silicon it merely ties AVX2). Dispatch:
