@@ -4698,7 +4698,8 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
     Impl& im = *std::static_pointer_cast<Impl>(impl_);
     if (inputs.size() != im.in_names.size()) fail("run_vec: input count mismatch");
     im.lookup = lookup_;
-    im.kv = kv_cache_;
+    static const bool no_kv = std::getenv("POTATO_NO_KV") != nullptr;
+    im.kv = no_kv ? nullptr : kv_cache_;
     static const bool prof_run = std::getenv("FE_PROFILE") != nullptr;
     auto run_t0 = std::chrono::steady_clock::now();
     int nv = (int)im.vals.size();
