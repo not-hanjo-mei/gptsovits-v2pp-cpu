@@ -128,21 +128,52 @@ inline int gemv_i8_only() {
 namespace packed {
 
 // ---------------- tiny thread pool for the kernels ----------------
+// Spin-then-block barrier, modelled on what ORT's thread pool does:
+// workers spin on the generation counter before parking on the
+// condvar, and the caller spins on the completion counter before
+// waiting. Dependent kernels in a decode step arrive microseconds
+// apart, so a worker that is still spinning picks the next job up
+// with no futex round-trip; on a contended box that round-trip was
+// measured at 10-50 us against ~3-5 us of math for a small GEMV.
+// Scheduling only: chunk partitioning is unchanged, so results are
+// bit-identical for any spin budget. POTATO_POOL_SPIN sets the spin
+// iterations (default 5000); 0 restores the pure condvar pool.
+inline int pool_spin_iters() {
+    static const int v = [] {
+        const char* e = std::getenv("POTATO_POOL_SPIN");
+        if (e && *e) {
+            long x = std::atol(e);
+            if (x >= 0) return (int)x;
+        }
+        return 5000;
+    }();
+    return v;
+}
+inline void pool_spin_pause() {
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ volatile("pause");
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ volatile("yield");
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
+
 struct Pool {
     int n = 1;
     std::vector<std::thread> ts;
     std::mutex m;
     std::condition_variable cv, done_cv;
     std::function<void(int, int)> job;
-    int njobs = 0, finished = 0;
-    bool stop = false;
+    std::atomic<int> njobs{0}, finished{0};
+    std::atomic<bool> stop{false};
     // Without this the static pool's implicit destructor destroys the
     // condition_variable while workers are parked in wait() and process
     // exit hangs forever (found via kbench: main sat in pthread_cond_destroy).
     ~Pool() {
         {
             std::lock_guard<std::mutex> lk(m);
-            stop = true;
+            stop.store(true, std::memory_order_release);
         }
         cv.notify_all();
         for (auto& t : ts)
@@ -156,16 +187,37 @@ struct Pool {
     }
     void worker(int idx) {
         int seen = 0;
-        std::unique_lock<std::mutex> lk(m);
-        while (!stop) {
-            cv.wait(lk, [&] { return stop || njobs > seen; });
-            if (stop) return;
-            seen = njobs;
-            auto j = job;
-            lk.unlock();
+        const int spin = pool_spin_iters();
+        while (!stop.load(std::memory_order_acquire)) {
+            int cur = njobs.load(std::memory_order_acquire);
+            if (cur == seen) {
+                for (int s = 0; s < spin; s++) {
+                    pool_spin_pause();
+                    if (stop.load(std::memory_order_acquire)) return;
+                    cur = njobs.load(std::memory_order_acquire);
+                    if (cur != seen) break;
+                }
+            }
+            if (cur == seen) {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [&] {
+                    return stop.load(std::memory_order_acquire) ||
+                           njobs.load(std::memory_order_acquire) > seen;
+                });
+                if (stop.load(std::memory_order_acquire)) return;
+                cur = njobs.load(std::memory_order_acquire);
+            }
+            seen = cur;
+            std::function<void(int, int)> j;
+            {
+                std::lock_guard<std::mutex> lk(m);
+                j = job;
+            }
             j(idx, n);
-            lk.lock();
-            if (++finished == n - 1) done_cv.notify_one();
+            if (finished.fetch_add(1, std::memory_order_acq_rel) == n - 2) {
+                std::lock_guard<std::mutex> lk(m);
+                done_cv.notify_one();
+            }
         }
     }
     // Run fn(idx, nthreads) on the pool plus the calling thread (idx 0).
@@ -173,12 +225,29 @@ struct Pool {
         if (n <= 1) { fn(0, 1); return; }
         {
             std::lock_guard<std::mutex> lk(m);
-            job = fn; finished = 0; njobs++;
+            job = fn;
+            finished.store(0, std::memory_order_relaxed);
+            // The generation increment must stay inside the mutex:
+            // the workers' wait predicate reads njobs under the same
+            // lock, and incrementing after the unlock reopens the
+            // classic lost-wakeup window (predicate checked, waiter
+            // not yet parked, notify fires into the gap). That race
+            // wedged a worker at generation ~17k of the fp32 TF gate;
+            // the spin path only masked it by usually catching the
+            // new generation before parking.
+            njobs.fetch_add(1, std::memory_order_release);
         }
         cv.notify_all();
         fn(0, n);
+        const int spin = pool_spin_iters();
+        for (int s = 0; s < spin; s++) {
+            if (finished.load(std::memory_order_acquire) == n - 1) return;
+            pool_spin_pause();
+        }
         std::unique_lock<std::mutex> lk(m);
-        done_cv.wait(lk, [&] { return finished == n - 1; });
+        done_cv.wait(lk, [&] {
+            return finished.load(std::memory_order_acquire) == n - 1;
+        });
     }
 };
 
