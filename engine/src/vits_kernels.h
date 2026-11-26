@@ -92,6 +92,10 @@ void conv_transpose1d_fast(const float* X, int64_t N, int64_t Ci, int64_t L,
 // wbuf rows are output channels of Ci*K floats, the same layout the
 // packed path dequantizes into -- which is also the plain fp32 Conv
 // weight layout, so the fp32 engine's k_conv reuses this tile.
+// Interior 4-channel chunks with even Ci route to the hand-written
+// assembly core (conv16_asm.S) when built in; it interleaves input
+// channel pairs, so its summation order differs at the 1e-5 level.
+// POTATO_NO_ASM=1 restores the intrinsics tile everywhere.
 __attribute__((target("avx2,fma"))) void conv_tile_avx2(
     const float* Xn, int64_t L, const float* wbuf, int64_t C, int64_t Ci, int64_t K,
     int64_t pad_l, int64_t dil, const float* bias, float* Yn, int64_t Lout, int64_t lt0,

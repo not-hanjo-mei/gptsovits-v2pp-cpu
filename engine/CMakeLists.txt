@@ -24,7 +24,19 @@ endif()
 # OFF — the shipping dual-engine build is unchanged. See ANDROID-SPIKE.md.
 option(POTATO_FREE_ONLY "tts_host: free engine only, no ONNX Runtime" OFF)
 
-add_executable(tts_host src/main.cpp src/g2p.cpp src/vits_kernels.cpp src/free_engine.cpp src/avx2_kernels.cpp)
+# Hand-written AVX2 conv tile core (x86_64 only): vits_kernels.cpp
+# routes eligible chunks to it when POTATO_HAVE_ASM_TILE is set.
+# POTATO_NO_ASM=1 at runtime disables it without a rebuild. This
+# block must precede the add_executable calls that use the var.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    enable_language(ASM)
+    set(POTATO_ASM_SRC src/conv16_asm.S)
+    add_compile_definitions(POTATO_HAVE_ASM_TILE=1)
+else()
+    set(POTATO_ASM_SRC "")
+endif()
+
+add_executable(tts_host src/main.cpp src/g2p.cpp src/vits_kernels.cpp src/free_engine.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
 if(POTATO_FREE_ONLY)
   target_compile_definitions(tts_host PRIVATE POTATO_FREE_ONLY=1)
   if(NOT ANDROID)
@@ -42,7 +54,7 @@ if(NOT POTATO_FREE_ONLY)
   add_executable(tf_check src/tf_check.cpp src/avx2_kernels.cpp)
   target_link_libraries(tf_check PRIVATE onnxruntime)
 
-  add_executable(vits_check src/vits_check.cpp src/vits_kernels.cpp src/avx2_kernels.cpp)
+  add_executable(vits_check src/vits_check.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
   target_link_libraries(vits_check PRIVATE onnxruntime)
 
   add_executable(kbench src/kbench.cpp src/avx2_kernels.cpp)
@@ -58,7 +70,7 @@ endif()
 target_include_directories(gemv_bench PRIVATE src)
 
 # Packed-conv tile micro-bench (vits_kernels only, no ORT).
-add_executable(vits_bench src/vits_bench.cpp src/vits_kernels.cpp src/avx2_kernels.cpp)
+add_executable(vits_bench src/vits_bench.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
 if(NOT ANDROID)
   target_link_libraries(vits_bench PRIVATE pthread)
 endif()
@@ -70,14 +82,14 @@ target_include_directories(vits_bench PRIVATE src)
 # Phase 2: vits_kernels.cpp joins for the packed conv kernels; its
 # declarations moved to the ORT-free vits_kernels.h, so still no ORT
 # headers or library in these binaries (verify with ldd).
-add_executable(tf_check_free src/tf_check_free.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp)
+add_executable(tf_check_free src/tf_check_free.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
 target_link_libraries(tf_check_free PRIVATE pthread)
 target_include_directories(tf_check_free PRIVATE src)
 
 # ORT-free vits validation (phase 2): vits_check's protocol on the free
 # engine. Also deliberately ORT-free; cross-checks against the ORT path
 # through vits_check --dump files.
-add_executable(vits_check_free src/vits_check_free.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp)
+add_executable(vits_check_free src/vits_check_free.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
 target_link_libraries(vits_check_free PRIVATE pthread)
 target_include_directories(vits_check_free PRIVATE src)
 
@@ -94,3 +106,5 @@ endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set_source_files_properties(src/avx2_kernels.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 endif()
+
+

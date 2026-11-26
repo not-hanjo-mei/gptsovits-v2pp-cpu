@@ -545,7 +545,7 @@ void vits_tile_override(int v) { vits_tile_ovr().store(v, std::memory_order_rela
 // directly from the input row (each tap reads 16 consecutive floats
 // starting at src0 + kk*dil); only chunks touching an edge use the
 // zero-padded window gather.
-__attribute__((target("avx2,fma"))) void conv_tile_avx2(
+__attribute__((target("avx2,fma"))) void conv_tile_avx2_intr(
     const float* Xn, int64_t L, const float* wbuf, int64_t C, int64_t Ci, int64_t K, int64_t pad_l,
     int64_t dil, const float* bias, float* Yn, int64_t Lout, int64_t lt0, int64_t lt_len,
     int64_t o0, int64_t ob) {
@@ -599,6 +599,71 @@ __attribute__((target("avx2,fma"))) void conv_tile_avx2(
             }
         }
     }
+}
+
+#if defined(POTATO_HAVE_ASM_TILE)
+// Hand-written assembly core (conv16_asm.S): one interior
+// 16-position chunk, 4 output channels, even Ci. It walks input
+// channels in pairs, so each accumulator's two FMA hits per tap
+// sit a full row apart -- the dependency distance the intrinsics
+// version cannot reach (its per-tap hits are ~14 instructions
+// apart against a 4-5 cycle FMA latency, which caps it near 47%
+// of the AVX2 FMA peak). The price is summation order: row pairs
+// interleave, so results differ from the sequential tile at the
+// 1e-5 level (same class as FMA contraction). Micro-bench on the
+// EPYC box (192->192 K=11, 1 thread): 50.4 vs 39.3 GMAC/s.
+// POTATO_NO_ASM=1 disables it without a rebuild.
+extern "C" void conv16_asm(const float* X, int64_t L, const float* W, int64_t C,
+                           int64_t Ci, int64_t K, int64_t dil, float* acc);
+static bool conv_asm_ok() {
+    static const bool ok = !std::getenv("POTATO_NO_ASM");
+    return ok;
+}
+#endif
+
+// Public AVX2 tile: interior full chunks with 4 output channels
+// and even Ci go to the assembly core when built in; everything
+// else (edge chunks, short tails, odd Ci, other block sizes) uses
+// the intrinsics tile above, unchanged.
+__attribute__((target("avx2,fma"))) void conv_tile_avx2(
+    const float* Xn, int64_t L, const float* wbuf, int64_t C, int64_t Ci, int64_t K, int64_t pad_l,
+    int64_t dil, const float* bias, float* Yn, int64_t Lout, int64_t lt0, int64_t lt_len,
+    int64_t o0, int64_t ob) {
+#if defined(POTATO_HAVE_ASM_TILE)
+    if (ob == 4 && (Ci % 2) == 0 && conv_asm_ok()) {
+        const int64_t span = (K - 1) * dil + 16;
+        const int64_t lt_end = lt0 + lt_len;
+        int64_t tt0 = lt0;
+        auto interior = [&](int64_t t) {
+            const int64_t s = t - pad_l;
+            return t + 16 <= lt_end && s >= 0 && s + span <= L;
+        };
+        // At most one non-interior chunk at the left edge.
+        if (tt0 < lt_end && !interior(tt0)) {
+            conv_tile_avx2_intr(Xn, L, wbuf, C, Ci, K, pad_l, dil, bias, Yn, Lout, tt0,
+                                std::min<int64_t>(16, lt_end - tt0), o0, ob);
+            tt0 += 16;
+        }
+        for (; interior(tt0); tt0 += 16) {
+            const int64_t src0 = tt0 - pad_l;
+            alignas(32) float acc[64];
+            for (int64_t o = 0; o < 4; o++)
+                for (int64_t p = 0; p < 16; p++) acc[o * 16 + p] = bias ? bias[o0 + o] : 0.0f;
+            conv16_asm(Xn + src0, L, wbuf + (size_t)o0 * C, C, Ci, K, dil, acc);
+            for (int64_t o = 0; o < 4; o++) {
+                _mm256_storeu_ps(Yn + (size_t)(o0 + o) * Lout + tt0, _mm256_load_ps(acc + o * 16));
+                _mm256_storeu_ps(Yn + (size_t)(o0 + o) * Lout + tt0 + 8,
+                                 _mm256_load_ps(acc + o * 16 + 8));
+            }
+        }
+        // Right edge / short tail, if any remains.
+        if (tt0 < lt_end)
+            conv_tile_avx2_intr(Xn, L, wbuf, C, Ci, K, pad_l, dil, bias, Yn, Lout, tt0,
+                                lt_end - tt0, o0, ob);
+        return;
+    }
+#endif
+    conv_tile_avx2_intr(Xn, L, wbuf, C, Ci, K, pad_l, dil, bias, Yn, Lout, lt0, lt_len, o0, ob);
 }
 
 // AVX-512F tile: 4 output channels x 32 positions on zmm pairs.
