@@ -831,6 +831,8 @@ static bool fe_profile_on() { static const bool on = std::getenv("FE_PROFILE") !
 // to the AVX2 kernels.
 bool binop_axis_rows(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* as, const int64_t* bs,
                      const int64_t* ys, int r, const int64_t* oshape) {
+    static const bool disabled = std::getenv("POTATO_NO_AXIS") != nullptr;
+    if (disabled) return false;
     int d = -1;
     for (int i = 0; i < r; i++)
         if (ys[i] == 1 && oshape[i] >= 2 && (d < 0 || oshape[i] > oshape[d])) d = i;
