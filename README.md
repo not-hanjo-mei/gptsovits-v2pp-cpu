@@ -40,10 +40,11 @@ seed 42. RTF is wall time divided by audio duration; lower is better.
 
 | Configuration | RTF | Peak RSS |
 |---|---|---|
-| This engine, W4 tier, all dispatch tiers | 0.67–0.81 | 256 MB |
-| This engine, W4 tier, AVX2 only | 0.61–0.84 | 256 MB |
-| This engine, fp32 | ~1.4–1.5 | 2,586 MB |
-| Genie-TTS (ONNX Runtime, same machine) | 0.55 | 5,485 MB |
+| Genie-TTS (ONNX Runtime, fp16) | 0.49 | 5,395 MB |
+| This engine, W4 tier, all dispatch tiers | 0.56 | 256 MB |
+| This engine, W4 tier, AVX2 only | 0.63 | 256 MB |
+| This engine, fp32 | 0.84 | 2,621 MB |
+| Upstream GPT-SoVITS (PyTorch 2.7 CPU, eager) | 0.97–0.99 | 5,056 MB |
 
 Notes on these numbers:
 
@@ -52,11 +53,18 @@ Notes on these numbers:
   profile-based where wall clock is not trustworthy.
 - Genie-TTS is faster per sentence on this machine and ~21× heavier in
   memory. Its speed comes from ONNX Runtime's graph fusion and MLAS
-  kernels; DESIGN.md records a dissection of where the remaining gap
-  sits (mostly VITS convolution rate).
-- The final comparison table also includes upstream GPT-SoVITS
-  (PyTorch CPU) on the same machine; that leg is still pending, so the
-  table above is partial.
+  kernels on a full-width AVX-512 datapath; DESIGN.md records a
+  dissection of where the remaining gap sits (mostly VITS convolution
+  rate).
+- The upstream row is the stock v2ProPlus pipeline (PyTorch eager
+  mode, which includes oneDNN's own weight prepacking), 4 torch
+  threads, steady state with its in-process prompt cache warm; its
+  first request in a fresh process took 25 s including lazy model
+  init and reference feature extraction. This engine instead reads
+  pre-extracted reference packs, so its per-request cost never
+  includes feature extraction.
+- Same-session medians behind the table (2026-11-26): W4 all tiers
+  1,805 ms, W4 AVX2-only 2,029 ms, fp32 2,709 ms per sentence.
 
 Where the speed comes from:
 

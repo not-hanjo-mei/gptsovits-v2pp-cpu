@@ -714,3 +714,36 @@ totals 1,962-2,184 ms across the evening's sessions (RTF
 0.61-0.68) for the standard sentence, against ~3,180 ms before
 the evening campaign -- about 40% of the sentence time removed
 in a day. The documented pool is now empty.
+
+## Final comparison and persistence (2026-11-26, closing)
+
+Four-way table, same box, sentence, and seed as the README table:
+Genie-TTS 0.49 (5,395 MB), this engine W4 all tiers 0.56, W4
+AVX2-only 0.63, fp32 0.84 (2,621 MB), upstream GPT-SoVITS on
+PyTorch 2.7 CPU 0.97-0.99 steady state (5,056 MB; first request
+25.2 s including lazy init and reference extraction). The fp32
+row improved from the ~1.4-1.5 recorded earlier in the campaign:
+the fp32 path inherits the executor-level wins (fusion, pool,
+indexed bind). The stock pipeline was installed from the
+upstream repo at /data/home/stock on the box with a CPU-only
+torch 2.7.1 venv (torchaudio 2.7 for its soundfile backend;
+2.9+ routes audio loading through torchcodec, which needs
+system FFmpeg libraries the box lacks).
+
+Persistence: one host process served 60 consecutive requests
+(mixed lengths, one 3,839-character text) with no crash, no
+error growth, and no timing degradation (first-10 median
+2,161 ms vs last-10 2,095 ms). RSS returned to ~471 MB after
+the run; the transient 5 GB peak belongs to the long text's
+first-stage arena, a pre-existing profile for extreme inputs.
+Outputs vary between requests inside one process, but the
+variation is a pre-existing, build-independent property of
+the host's sampling history: the pre-KV build, the copy
+protocol, and the KV cache produce identical token sequences
+given identical request history (verified on a 6-request
+controlled run and on the 501-token long request, fresh
+process, cache on vs off). Five "empty semantic sequence"
+errors on two-word texts mid-soak are the same history effect
+(first-token EOS), not a cache fault. The KV growth path was
+additionally verified with POTATO_KV_INIT_CAP=64 forcing
+repeated doubling: token-identical to the copy protocol.
