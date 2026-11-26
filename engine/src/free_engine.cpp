@@ -27,10 +27,20 @@ namespace freeeng {
 
 struct KvCache {
     struct Slot {
-        std::vector<float> buf;          // capacity rows * row floats
+        // Uninitialized allocation: capacity is headroom, and
+        // zero-filling it at copy-in cost real bind time.
+        std::unique_ptr<float[]> buf;
         std::vector<int64_t> shape;      // shape template from copy-in
         int64_t len = -1;                // rows held, -1 = empty
         int64_t cap_rows = 0;
+        void reserve(int64_t rows, int64_t rowf) {
+            if (rows <= cap_rows) return;
+            auto nb = std::make_unique<float[]>((size_t)rows * (size_t)rowf);
+            if (buf && len > 0)
+                std::memcpy(nb.get(), buf.get(), (size_t)len * (size_t)rowf * sizeof(float));
+            buf = std::move(nb);
+            cap_rows = rows;
+        }
     };
     std::vector<Slot> slots;             // indexed by pair order (step order)
 };
@@ -3991,7 +4001,7 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
                 RT in = sc.contig_of(ins[1]);
                 int64_t rows = in.shape.empty() ? 0 : in.shape[0];
                 size_t rowf = rows > 0 ? (size_t)in.numel() / (size_t)rows : 0;
-                std::memcpy(slot.buf.data() + (size_t)slot.len * rowf, in.p,
+                std::memcpy(slot.buf.get() + (size_t)slot.len * rowf, in.p,
                             (size_t)rows * rowf * sizeof(float));
                 slot.len += rows;
                 break;
@@ -4726,26 +4736,37 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
                 int64_t rows = t.shape.empty() ? 0 : t.shape[0];
                 int64_t rowf = rows > 0 ? t.numel() / rows : 0;
                 if (slot.len < 0 || slot.len != rows) {
-                    int64_t cap = std::max<int64_t>(rows * 2, 1024);
-                    if (slot.cap_rows < cap) {
-                        slot.buf.resize((size_t)cap * (size_t)rowf);
-                        slot.cap_rows = cap;
-                    }
+                    slot.reserve(std::max<int64_t>(rows * 2, 1024), rowf);
                     // The source may be a strided view (the first
                     // plan's presents are row-strided slices of the
-                    // QKV projection); copy elementwise into the
-                    // packed buffer.
-                    RT src;
-                    src.dtype = t.dtype;
-                    src.p = const_cast<uint8_t*>(t.data);
-                    src.shape = t.shape;
-                    src.strides = t.strides.empty() ? rowmajor(t.shape) : t.strides;
-                    RT dst;
-                    dst.dtype = 1;
-                    dst.p = (uint8_t*)slot.buf.data();
-                    dst.shape = t.shape;
-                    dst.strides = rowmajor(t.shape);
-                    copy_tensor(dst, src);
+                    // QKV projection). Rows are contiguous blocks:
+                    // copy row by row when the inner layout is
+                    // packed, else fall back to the generic copy.
+                    std::vector<int64_t> sstr = t.strides.empty() ? rowmajor(t.shape) : t.strides;
+                    std::vector<int64_t> rm = rowmajor(t.shape);
+                    bool rows_packed = sstr.size() == t.shape.size();
+                    for (size_t d = 1; d < sstr.size() && rows_packed; d++)
+                        rows_packed = sstr[d] == rm[d];
+                    if (rows_packed) {
+                        const float* sp = (const float*)t.data;
+                        int64_t sstride = sstr.empty() ? rowf : sstr[0];
+                        for (int64_t r = 0; r < rows; r++)
+                            std::memcpy(slot.buf.get() + (size_t)r * (size_t)rowf,
+                                        sp + (size_t)r * (size_t)sstride,
+                                        (size_t)rowf * sizeof(float));
+                    } else {
+                        RT src;
+                        src.dtype = t.dtype;
+                        src.p = const_cast<uint8_t*>(t.data);
+                        src.shape = t.shape;
+                        src.strides = sstr;
+                        RT dst;
+                        dst.dtype = 1;
+                        dst.p = (uint8_t*)slot.buf.get();
+                        dst.shape = t.shape;
+                        dst.strides = rm;
+                        copy_tensor(dst, src);
+                    }
                     slot.len = rows;
                     slot.shape = t.shape;
                 }
@@ -4753,14 +4774,11 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
             if (slot.len < 0) fail("kv: past input missing and cache empty");
             int64_t rowf = 1;
             for (size_t d = 1; d < slot.shape.size(); d++) rowf *= slot.shape[d];
-            if (slot.cap_rows < slot.len + 16) {
-                int64_t cap = std::max<int64_t>(slot.cap_rows * 2, slot.len + 1024);
-                slot.buf.resize((size_t)cap * (size_t)rowf);
-                slot.cap_rows = cap;
-            }
+            if (slot.cap_rows < slot.len + 16)
+                slot.reserve(std::max<int64_t>(slot.cap_rows * 2, slot.len + 1024), rowf);
             RT r;
             r.dtype = 1;
-            r.p = (uint8_t*)slot.buf.data();
+            r.p = (uint8_t*)slot.buf.get();
             r.shape = slot.shape;
             r.shape[0] = slot.len;
             r.strides = rowmajor(r.shape);
@@ -4908,7 +4926,7 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
             KvCache::Slot& slot = im.kv->slots[pi];
             RT r;
             r.dtype = 1;
-            r.p = (uint8_t*)slot.buf.data();
+            r.p = (uint8_t*)slot.buf.get();
             r.shape = cshape[ov];
             r.strides = rowmajor(r.shape);
             res[ov] = r;
