@@ -3983,7 +3983,25 @@ static bool resolve_scalar(Impl& im, int v, float* out, int depth = 0) {
         }
         return false;
     }
-    if (val.kind != Value::RT || val.view_kind != 0) return false;
+    // A 1-element SYMVAL whose element is a constant expression
+    // (the attention scale bottoms out at Sqrt(Shape(..)[-1])).
+    if (val.kind == Value::SYMVAL) {
+        int64_t c;
+        if (val.selems.size() == 1 && econst(val.selems[0], c)) {
+            *out = (float)c;
+            return true;
+        }
+        return false;
+    }
+    if (val.kind != Value::RT) return false;
+    // Views of a scalar (Reshape/Unsqueeze/Transpose of a 1-element
+    // value) carry the same scalar; resolving through them is safe
+    // because the base only resolves when it is itself a numel-1
+    // constant expression (a Slice out of a big tensor never does).
+    if (val.view_kind != 0) {
+        if (val.base < 0) return false;
+        return resolve_scalar(im, val.base, out, depth + 1);
+    }
     int si = val.def_step;
     if (si < 0 || si >= (int)im.steps.size()) return false;
     const Step& st = im.steps[si];
@@ -4013,6 +4031,14 @@ static bool resolve_scalar(Impl& im, int v, float* out, int depth = 0) {
         }
         if (st.bop == BinOp::MUL) {
             *out = a * b;
+            return true;
+        }
+        if (st.bop == BinOp::ADD) {
+            *out = a + b;
+            return true;
+        }
+        if (st.bop == BinOp::SUB) {
+            *out = a - b;
             return true;
         }
         return false;
