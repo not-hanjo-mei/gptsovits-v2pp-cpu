@@ -819,23 +819,29 @@ static BinopPathStat g_binop_paths[6];
 static const char* g_binop_path_names[6] = {"f32_fast", "rows", "walk_par", "serial_odom", "generic_odom", "axis_rows"};
 static bool fe_profile_on() { static const bool on = std::getenv("FE_PROFILE") != nullptr; return on; }
 
-// Generalized rows: pick any axis where at least one operand is
-// unit-stride and both are unit-or-broadcast, and walk the remaining
-// axes as an outer odometer. Covers the attention score layout
-// [heads, pos, kv] stored pos-major: the output's last axis is the
-// operand's strided axis, so neither the flat nor the last-axis
-// rows path applies, but the pos axis is unit in the operand and a
-// constant stride in the output. The inner loop is odometer-free;
-// with a unit output stride it delegates to the AVX2 kernels.
+// Generalized rows: walk all but one axis as an outer odometer and
+// run a flat inner loop on the chosen axis. Axis choice, in order:
+// a unit-stride output axis (streaming stores; operand strides on
+// it may be any constant — the attention score scale [heads, pos,
+// kv] with pos-major operand storage is this case, a strided read
+// against a unit store), else a unit-stride operand axis with
+// strided stores (measured slower: scattered stores cost more than
+// scattered reads, kept only as a fallback). With unit output
+// stride and unit-or-broadcast operands the inner loop delegates
+// to the AVX2 kernels.
 bool binop_axis_rows(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* as, const int64_t* bs,
                      const int64_t* ys, int r, const int64_t* oshape) {
     int d = -1;
-    for (int i = 0; i < r; i++) {
-        if (ys[i] < 1) continue;
-        bool au = as[i] == 1, bu = bs[i] == 1;
-        if (!au && !bu) continue;
-        if (!(as[i] == 0 || au) || !(bs[i] == 0 || bu)) continue;
-        if (d < 0 || oshape[i] > oshape[d]) d = i;
+    for (int i = 0; i < r; i++)
+        if (ys[i] == 1 && oshape[i] >= 2 && (d < 0 || oshape[i] > oshape[d])) d = i;
+    if (d < 0) {
+        for (int i = 0; i < r; i++) {
+            if (ys[i] < 1) continue;
+            bool au = as[i] == 1, bu = bs[i] == 1;
+            if (!au && !bu) continue;
+            if (!(as[i] == 0 || au) || !(bs[i] == 0 || bu)) continue;
+            if (d < 0 || oshape[i] > oshape[d]) d = i;
+        }
     }
     if (d < 0 || oshape[d] < 2) return false;
     const int64_t D = oshape[d];
@@ -866,7 +872,8 @@ bool binop_axis_rows(BinOp op, const RT& A, const RT& B, RT& Y, const int64_t* a
                 const float* ap = a + ao;
                 const float* bp = b + bo;
                 float* yp = y + yo;
-                if (sy == 1 && cpu::features().avx2 && cpu::features().fma &&
+                if (sy == 1 && (sa == 0 || sa == 1) && (sb == 0 || sb == 1) &&
+                    cpu::features().avx2 && cpu::features().fma &&
                     avx2k::binop_f32((int)op, ap, bp, yp, D, sa == 0, sb == 0))
                     continue;
                 for (int64_t i = 0; i < D; i++) yp[i * sy] = binop_apply_f(op, ap[i * sa], bp[i * sb]);
