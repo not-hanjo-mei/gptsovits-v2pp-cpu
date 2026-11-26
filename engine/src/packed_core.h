@@ -994,6 +994,26 @@ inline void gemv_b_w4_avx2(const float* X, int64_t K, int64_t D,
                            const float* bias, float* Y) {
     const int64_t ng = K / 64;
     const bool s512 = gemv_avx512_ok();
+    // AVX2 path: fold scale/zero out of the inner dot (see
+    // avx2k::w4b_dotraw64). sx[g] is the sum of X over group g,
+    // computed once here instead of once per row.
+    float sx_stack[64];
+    std::vector<float> sx_heap;
+    const float* sx = nullptr;
+    if (!s512) {
+        float* buf = sx_stack;
+        if (ng > 64) {
+            sx_heap.resize(ng);
+            buf = sx_heap.data();
+        }
+        for (int64_t g = 0; g < ng; g++) {
+            const float* xg = X + g * 64;
+            float s = 0.0f;
+            for (int i = 0; i < 64; i++) s += xg[i];
+            buf[g] = s;
+        }
+        sx = buf;
+    }
     pool_run(K * D, [&](int idx, int nt) {
         chunk(idx, nt, D, [&](int64_t j0, int64_t j1) {
             for (int64_t j = j0; j < j1; j++) {
@@ -1001,11 +1021,16 @@ inline void gemv_b_w4_avx2(const float* X, int64_t K, int64_t D,
                 const float* srow = sc + (size_t)j * ng;
                 const uint8_t* zrow = ze + (size_t)j * ng;
                 float a = bias ? bias[j] : 0.0f;
-                for (int64_t g = 0; g < ng; g++)
-                    a += s512 ? avx2k::w4b_dot64_512(prow + g * 32, srow[g], (float)zrow[g],
-                                                     X + g * 64)
-                              : avx2k::w4b_dot64(prow + g * 32, srow[g], (float)zrow[g],
-                                                 X + g * 64);
+                if (s512) {
+                    for (int64_t g = 0; g < ng; g++)
+                        a += avx2k::w4b_dot64_512(prow + g * 32, srow[g], (float)zrow[g],
+                                                  X + g * 64);
+                } else {
+                    for (int64_t g = 0; g < ng; g++) {
+                        float raw = avx2k::w4b_dotraw64(prow + g * 32, X + g * 64);
+                        a += srow[g] * raw - srow[g] * (float)zrow[g] * sx[g];
+                    }
+                }
                 Y[j] = a;
             }
         });

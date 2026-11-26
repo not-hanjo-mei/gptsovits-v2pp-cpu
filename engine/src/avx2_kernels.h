@@ -30,6 +30,13 @@ void w4a_saxpy64(float f, const uint8_t* prow, float* acc);
 // Returns sum over k in [0, 64) of (nib(k) - ze) * sc * x[k]. Mode B
 // inner loop: one k-group of one output row.
 float w4b_dot64(const uint8_t* prow, float sc, float ze, const float* x);
+// Raw nibble dot: sum of unpacked weights times x, with no scale or
+// zero-point applied. Callers fold those in algebraically --
+// sum((w - ze) * sc * x) == sc * dotraw - sc * ze * sum(x) -- which
+// drops the per-vector sub+mul from the inner loop; the group sums
+// of x are computed once per GEMV, not once per row. The result
+// differs from w4b_dot64's accumulation at the ulp level.
+float w4b_dotraw64(const uint8_t* prow, const float* x);
 
 #if defined(__x86_64__)
 // AVX-512F versions of the two group kernels (target-attributed in

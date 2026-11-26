@@ -101,6 +101,27 @@ float w4b_dot64(const uint8_t* prow, float sc, float ze, const float* x) {
 #endif
 }
 
+float w4b_dotraw64(const uint8_t* prow, const float* x) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 w[8];
+    w4_unpack64(prow, w);
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < 8; i++) acc = _mm256_fmadd_ps(w[i], _mm256_loadu_ps(x + 8 * i), acc);
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    return _mm_cvtss_f32(s);
+#else
+    float a = 0.0f;
+    for (int b = 0; b < 32; b++) {
+        uint8_t byte = prow[b];
+        a += (float)(byte >> 4) * x[2 * b];
+        a += (float)(byte & 0xF) * x[2 * b + 1];
+    }
+    return a;
+#endif
+}
+
 #if defined(__x86_64__)
 namespace {
 // AVX-512 unpack of the same 32 packed bytes into 4 zmm, values in
