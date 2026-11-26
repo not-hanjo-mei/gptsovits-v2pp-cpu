@@ -1017,7 +1017,18 @@ inline void gemv_a_w4_avx2(const float* X, int64_t K, int64_t D,
                 float corr = 0.0f;
                 float* __restrict__ acc = Y + g * 64;
                 for (int64_t jb = 0; jb < 64; jb++) acc[jb] = bias ? bias[g * 64 + jb] : 0.0f;
-                for (int64_t i = 0; i < K; i++) {
+                int64_t i = 0;
+                if (!s512) {
+                    for (; i + 1 < K; i += 2) {
+                        float f0 = X[i] * sc[(size_t)i * ng + g];
+                        corr += f0 * (float)ze[(size_t)i * ng + g];
+                        float f1 = X[i + 1] * sc[(size_t)(i + 1) * ng + g];
+                        corr += f1 * (float)ze[(size_t)(i + 1) * ng + g];
+                        avx2k::w4a_saxpy64_x2(f0, pk + (size_t)i * (D / 2) + g * 32,
+                                              f1, pk + (size_t)(i + 1) * (D / 2) + g * 32, acc);
+                    }
+                }
+                for (; i < K; i++) {
                     float f = X[i] * sc[(size_t)i * ng + g];
                     corr += f * (float)ze[(size_t)i * ng + g];
                     if (s512)

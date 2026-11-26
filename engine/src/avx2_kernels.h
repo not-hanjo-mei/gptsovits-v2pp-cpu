@@ -26,6 +26,12 @@ void saxpy(float a, const float* x, float* y, int64_t n);
 // carries the group scale (f = x_i * sc), the zero-point correction
 // is the caller's scalar term, exactly as in gemv_a_w4_scalar.
 void w4a_saxpy64(float f, const uint8_t* prow, float* acc);
+// Two input rows against the same accumulator block: acc is loaded
+// and stored once for both. Per-output accumulation order over i
+// is unchanged (f0's group first), so results are bit-identical
+// to two w4a_saxpy64 calls.
+void w4a_saxpy64_x2(float f0, const uint8_t* prow0, float f1, const uint8_t* prow1,
+                    float* acc);
 
 // Returns sum over k in [0, 64) of (nib(k) - ze) * sc * x[k]. Mode B
 // inner loop: one k-group of one output row.

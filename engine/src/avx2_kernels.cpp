@@ -57,6 +57,24 @@ inline void w4_unpack64(const uint8_t* prow, __m256* out) {
 }  // namespace
 #endif
 
+void w4a_saxpy64_x2(float f0, const uint8_t* prow0, float f1, const uint8_t* prow1,
+                    float* acc) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 a[8], w[8];
+    for (int i = 0; i < 8; i++) a[i] = _mm256_loadu_ps(acc + 8 * i);
+    w4_unpack64(prow0, w);
+    const __m256 v0 = _mm256_set1_ps(f0);
+    for (int i = 0; i < 8; i++) a[i] = _mm256_fmadd_ps(v0, w[i], a[i]);
+    w4_unpack64(prow1, w);
+    const __m256 v1 = _mm256_set1_ps(f1);
+    for (int i = 0; i < 8; i++) a[i] = _mm256_fmadd_ps(v1, w[i], a[i]);
+    for (int i = 0; i < 8; i++) _mm256_storeu_ps(acc + 8 * i, a[i]);
+#else
+    w4a_saxpy64(f0, prow0, acc);
+    w4a_saxpy64(f1, prow1, acc);
+#endif
+}
+
 void w4a_saxpy64(float f, const uint8_t* prow, float* acc) {
 #if defined(__AVX2__) && defined(__FMA__)
     __m256 w[8];
