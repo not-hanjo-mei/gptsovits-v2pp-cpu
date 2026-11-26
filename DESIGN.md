@@ -404,3 +404,13 @@ fp32 361/361, vits packed 0.959881, vits fp32 corr 1.000000
 relrms 1.3e-05 (maxerr 4.46e-05 under the box's g++ 14.2 vs
 4.34e-05 under the dev VM's 13.3 -- a compiler-version ulp
 artifact in auto-vectorized scalar code, corr/relrms exact).
+
+## Scope ruling (2026-11-26)
+
+The product baseline is AVX/AVX2, as chartered. The AVX-512
+tier (conv tile, GEMV kernels) stays in the tree as a runtime-
+dispatched bonus for CPUs that report it -- it never executes
+on AVX2-only machines and POTATO_NO_AVX512 disables it -- but
+it is frozen: no further AVX-512 optimization work. Optimization
+effort returns to the AVX2 tier, including a newer-clang check
+and hand-written assembly where they measurably pay.
