@@ -260,3 +260,20 @@ to only ~600 ms (PACKED ~450, MATMUL ~85, SOFTMAX ~30). The rest
 is executor and pool-sync overhead across 668-step plans invoked
 per token. Closing that gap is an executor change, not a kernel
 change.
+
+## Decode pool-gate round (2026-11-26, later)
+
+Taken. A sampling profile first cleared the executor itself
+(Plan::run self-time 0.32%); the cost was the pool: every decode
+GEMV, however small, paid a full condvar barrier (~8,000 per
+request across the stage plans). All GEMV/GEMM and packed-conv
+pool dispatches now go through a work-size gate
+(POTATO_POOL_MIN_MAC, MACs): below it the body runs serially on
+the calling thread, bit-identical by chunk construction (gates
+unchanged: 361/361, 299/361, 1.000000, 0.959881). Interleaved
+A/B on the EPYC box picked 2^19 as the default: decode medians
+1,400 ms at 2^19 vs 1,530 at 2^18 and 1,841 at 2^20. Final
+shipped-default samples (W4, 4 threads): 3,192-3,694 ms per
+sentence, **RTF 1.00-1.15**, decode 1,189-1,486 ms, RSS 256 MB.
+Across both optimization rounds the sentence went from
+4,026-4,426 ms (RTF 1.26-1.38, Genie session) to 3,192-3,694 ms.
