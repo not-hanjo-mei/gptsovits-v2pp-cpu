@@ -1888,6 +1888,10 @@ struct Step {
     int64_t topk = 0;
     int reduction = 0;
     float alpha = 1, beta = 1, eps = 0;
+    // Fused epilogue (set by fuse_one_leaky): 1 = LeakyReLU with
+    // epi_alpha, applied to this step's output before the step ends.
+    int epi_act = 0;
+    float epi_alpha = 0;
     int transA = 0, transB = 0;
     std::vector<int64_t> axes;
     std::vector<int64_t> c_strides{1}, c_pads{0}, c_dil{1};
@@ -3673,6 +3677,24 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
 
 
 // ------------------------------------------------------ step execute ---
+// Fused LeakyReLU epilogue: applied in place over a step's
+// just-written output buffer, split over the pool for large
+// tensors. The values are the same stored fp32 the standalone
+// UNOP step would have read, so the result is bit-identical.
+static void apply_epi_leaky(float* y, int64_t n, float alpha) {
+    auto body = [&](int idx, int nt) {
+        packed::chunk(idx, nt, n, [&](int64_t i0, int64_t i1) {
+            float* p = y + i0;
+            int64_t m = i1 - i0;
+            if (!(cpu::features().avx2 && cpu::features().fma &&
+                  avx2k::unop_f32((int)UnOp::LEAKY, p, p, m, alpha))) {
+                for (int64_t i = 0; i < m; i++) p[i] = p[i] > 0 ? p[i] : alpha * p[i];
+            }
+        });
+    };
+    packed::pool_run(n, body);
+}
+
 void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector<RT>& outs, Scratch& sc) {
     switch (st.k) {
         case SK::MATMUL: {
@@ -3745,8 +3767,8 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
             }
             break;
         }
-        case SK::CONV: k_conv(ins[0], ins[1], ins.size() > 2 ? &ins[2] : nullptr, outs[0], st.c_strides, st.c_pads, st.c_dil, st.c_group, sc); break;
-        case SK::CONVT: k_convtranspose(ins[0], ins[1], ins.size() > 2 ? &ins[2] : nullptr, outs[0], st.c_strides, st.c_pads, st.c_dil, sc); break;
+        case SK::CONV: k_conv(ins[0], ins[1], ins.size() > 2 ? &ins[2] : nullptr, outs[0], st.c_strides, st.c_pads, st.c_dil, st.c_group, sc); if (st.epi_act == 1) apply_epi_leaky((float*)outs[0].p, outs[0].numel(), st.epi_alpha); break;
+        case SK::CONVT: k_convtranspose(ins[0], ins[1], ins.size() > 2 ? &ins[2] : nullptr, outs[0], st.c_strides, st.c_pads, st.c_dil, sc); if (st.epi_act == 1) apply_epi_leaky((float*)outs[0].p, outs[0].numel(), st.epi_alpha); break;
         case SK::PCONV: {
             RT X = sc.contig_of(ins[0]);
             if (X.shape.size() != 3) fail("PackedConv: X must be (N, C, L)");
@@ -3768,12 +3790,14 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
                 packed::conv1d_fast((const float*)X.p, N, Ci, L, pb.pk, pb.sc, ze, st.pm_mode,
                                     st.pm_rows, st.pc_k, st.pc_stride, st.pc_pad_l, st.pc_dil,
                                     outs[0].shape[2], bias, Y);
+                if (st.epi_act == 1) apply_epi_leaky(Y, outs[0].numel(), st.epi_alpha);
             } else {
                 if (Ci != st.pm_rows) fail("PackedConvTranspose: Ci != w_rows");
                 int64_t O = st.pm_cols / st.pc_k;
                 packed::conv_transpose1d_fast((const float*)X.p, N, Ci, L, pb.pk, pb.sc, ze,
                                               st.pm_mode, O, st.pc_k, st.pc_stride, st.pc_pad_l,
                                               st.pc_dil, outs[0].shape[2], bias, Y);
+                if (st.epi_act == 1) apply_epi_leaky(Y, outs[0].numel(), st.epi_alpha);
             }
             break;
         }
@@ -3856,7 +3880,7 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
             for (int64_t i = 0; i < Y.numel(); i++) write_d(Y, i, nd(rng));
             break;
         }
-        case SK::BINOP: k_binop(st.bop, ins[0], ins[1], outs[0]); break;
+        case SK::BINOP: k_binop(st.bop, ins[0], ins[1], outs[0]); if (st.epi_act == 1) apply_epi_leaky((float*)outs[0].p, outs[0].numel(), st.epi_alpha); break;
         case SK::UNOP: k_unop(st.uop, ins[0], outs[0], st.alpha); break;
         case SK::CAST: k_cast(ins[0], outs[0]); break;
         case SK::WHERE: k_where(ins[0], ins[1], ins[2], outs[0]); break;
@@ -4160,6 +4184,54 @@ static bool fold_one_scalar_mul_pre(Impl& im) {
     return false;
 }
 
+// LeakyReLU epilogue fusion: a LeakyRelu whose input is the sole
+// output of a Conv / ConvTranspose / packed-conv / residual-Add
+// step, with no other consumer, no view children and no meta
+// reference, moves into the producer as an epilogue (the ORT
+// FusedConv pattern). The standalone step is erased with the same
+// bookkeeping the scalar folds use.
+static bool fuse_one_leaky(Impl& im) {
+    auto& steps = im.steps;
+    auto& vals = im.vals;
+    std::vector<int> uses(vals.size(), 0), view_kids(vals.size(), 0);
+    for (auto& s : steps)
+        for (int v : s.in) uses[v]++;
+    for (auto& v : vals) {
+        if (v.kind == Value::RT && v.view_kind != 0 && v.base >= 0) view_kids[v.base]++;
+        for (int m : {v.meta0, v.meta1, v.meta2, v.meta3})
+            if (m >= 0) uses[m]++;
+    }
+    for (size_t ui = 0; ui < steps.size(); ui++) {
+        Step& u = steps[ui];
+        if (u.k != SK::UNOP || u.uop != UnOp::LEAKY || u.in.size() != 1 || u.out.size() != 1) continue;
+        int vx = u.in[0], vy = u.out[0];
+        if (vals[vx].kind != Value::RT || vals[vx].view_kind != 0 || vals[vx].is_output) continue;
+        if (uses[vx] != 1 || view_kids[vx] != 0) continue;
+        int pi = vals[vx].def_step;
+        if (pi < 0 || pi >= (int)steps.size()) continue;
+        Step& p = steps[pi];
+        if (p.out.size() != 1 || p.out[0] != vx || p.epi_act != 0) continue;
+        bool ok = p.k == SK::PCONV || p.k == SK::CONV || p.k == SK::CONVT ||
+                  (p.k == SK::BINOP && p.bop == BinOp::ADD);
+        if (!ok) continue;
+        p.epi_act = 1;
+        p.epi_alpha = u.alpha;
+        for (auto& s : steps)
+            for (int& v : s.in)
+                if (v == vy) v = vx;
+        for (int& v : im.out_vals)
+            if (v == vy) v = vx;
+        if (vals[vy].is_output) vals[vx].is_output = true;
+        vals[vy].is_output = false;
+        vals[vy].def_step = -2;
+        steps.erase(steps.begin() + ui);
+        for (auto& v : vals)
+            if (v.def_step > (int)ui) v.def_step--;
+        return true;
+    }
+    return false;
+}
+
 // Dead-step elimination, run after the scalar folds: the folds
 // rewire the scale chains' consumers onto the pre-Mul values and
 // leave the chains' own steps (Shape, Cast, Sqrt, Div, ...) behind
@@ -4274,6 +4346,8 @@ std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bo
     while (fold_one_scalar_mul(*im)) {
     }
     while (fold_one_scalar_mul_pre(*im)) {
+    }
+    while (fuse_one_leaky(*im)) {
     }
     dce_pure_steps(*im);
     // Liveness: last use over steps, then propagate through views
