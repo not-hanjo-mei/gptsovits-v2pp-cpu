@@ -744,7 +744,16 @@ void conv1d_fast_impl(const float* X, int64_t N, int64_t Ci, int64_t L,
                       int64_t O, int64_t K, int64_t stride, int64_t pad_l, int64_t dil,
                       int64_t Lout, const float* bias, float* Y,
                       const float* w_override, int64_t w_cols_override) {
-    const int64_t OB4 = 4, LT = 1024;
+    const int64_t OB4 = 4;
+    // Position-tile width per pool task. 1024 is the long-standing
+    // default; POTATO_PCONV_LT overrides it for tuning (the tile
+    // streams its X slice from L2, so the best width is an L2-size
+    // question, answered empirically per machine class).
+    static const int64_t LT = [] {
+        const char* e = std::getenv("POTATO_PCONV_LT");
+        int64_t v = e ? std::atoll(e) : 1024;
+        return v >= 64 ? v : 1024;
+    }();
     const int64_t C = w_override ? w_cols_override : Ci * K;
     // Dequantize the whole weight ONCE per node into wbuf (rows = output
     // channels); the compute tiles over output positions (see header).
