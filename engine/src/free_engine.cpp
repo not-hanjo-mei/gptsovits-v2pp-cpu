@@ -3839,8 +3839,14 @@ static const char* g_prof_names[26] = {"MATMUL", "GEMM", "PACKED", "CONV", "LN",
                                        "GATHER_EL", "SCATTER_EL", "CONCAT", "CONSTSHAPE",
                                        "RANDNORM", "BINOP", "UNOP", "CAST", "WHERE", "COPY",
                                        "PCONV", "PGATHER", "CONVT", "PAD", "EXPAND"};
+static std::map<std::string, double> g_prof_bind, g_prof_exec;
+static std::map<std::string, long> g_prof_runs;
 static void prof_print() {
     for (auto& kv : g_prof) {
+        auto b = g_prof_bind.find(kv.first), e = g_prof_exec.find(kv.first);
+        if (b != g_prof_bind.end())
+            std::fprintf(stderr, "[FE_PROFILE] plan=%s runs=%ld bind %.1f ms exec %.1f ms\n", kv.first.c_str(),
+                         g_prof_runs[kv.first], b->second / 1000.0, e->second / 1000.0);
         std::fprintf(stderr, "[FE_PROFILE] per-kind totals, plan=%s:\n", kv.first.c_str());
         for (int i = 0; i < 26; i++)
             if (kv.second.n[i]) std::fprintf(stderr, "  %-10s %8ld calls %12.1f ms\n", g_prof_names[i], kv.second.n[i], kv.second.us[i] / 1000.0);
@@ -3868,6 +3874,8 @@ void Plan::release_arena() {
 std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inputs) {
     Impl& im = *std::static_pointer_cast<Impl>(impl_);
     im.lookup = lookup_;
+    static const bool prof_run = std::getenv("FE_PROFILE") != nullptr;
+    auto run_t0 = std::chrono::steady_clock::now();
     int nv = (int)im.vals.size();
     // Symbol values from the caller's input shapes.
     std::vector<int64_t> sv(im.nsyms, 0);
@@ -4081,7 +4089,13 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
     }
     // Execute steps. FE_PROFILE=1 accumulates wall time per step kind
     // across all plans in the process and prints a table at exit.
-    static const bool profile = std::getenv("FE_PROFILE") != nullptr;
+    static const bool profile = prof_run;
+    if (profile) {
+        g_prof_bind[im.label] +=
+            std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - run_t0).count();
+        g_prof_runs[im.label]++;
+    }
+    auto exec_t0 = std::chrono::steady_clock::now();
     Scratch sc;
     std::vector<RT> sin, sout;
     for (auto& st : im.steps) {
@@ -4100,6 +4114,9 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
         }
         sc.reset(mk);
     }
+    if (profile)
+        g_prof_exec[im.label] +=
+            std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - exec_t0).count();
     // Outputs.
     std::map<std::string, Tensor> out;
     for (size_t i = 0; i < im.out_vals.size(); i++) {
