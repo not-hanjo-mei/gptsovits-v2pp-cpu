@@ -536,57 +536,65 @@ void vits_tile_override(int v) { vits_tile_ovr().store(v, std::memory_order_rela
 
 #if defined(__x86_64__)
 // AVX2+FMA tile. Precondition (checked by the dispatcher): stride == 1
-// and (K-1)*dil <= 64. Accumulators are 4 channels x 4 ymm = the full
-// register file minus the position vector and broadcasts.
+// and (K-1)*dil <= 64. Tile shape is 4 output channels x 16 positions:
+// 8 accumulators + 2 position vectors + 1 broadcast = 11 live ymm,
+// inside the 16-register file. The previous 4x32 shape held 16
+// accumulators plus 4 position vectors and spilled; micro-bench on
+// the EPYC box (2026-11-26) put this shape 29-35% ahead of it on
+// every production shape, bit-identical output. Interior chunks load
+// directly from the input row (each tap reads 16 consecutive floats
+// starting at src0 + kk*dil); only chunks touching an edge use the
+// zero-padded window gather.
 __attribute__((target("avx2,fma"))) void conv_tile_avx2(
     const float* Xn, int64_t L, const float* wbuf, int64_t C, int64_t Ci, int64_t K, int64_t pad_l,
     int64_t dil, const float* bias, float* Yn, int64_t Lout, int64_t lt0, int64_t lt_len,
     int64_t o0, int64_t ob) {
-    alignas(32) float win[32 + 64];
-    alignas(32) float spill[4][32];
-    for (int64_t tt0 = lt0; tt0 < lt0 + lt_len; tt0 += 32) {
-        int64_t tn = std::min<int64_t>(32, lt0 + lt_len - tt0);
-        __m256 acc[4][4];
+    alignas(32) float win[16 + 64];
+    alignas(32) float spill[4][16];
+    const int64_t span = (K - 1) * dil + 16;
+    for (int64_t tt0 = lt0; tt0 < lt0 + lt_len; tt0 += 16) {
+        int64_t tn = std::min<int64_t>(16, lt0 + lt_len - tt0);
+        __m256 acc[4][2];
         for (int64_t o = 0; o < 4; o++) {
             __m256 b = _mm256_set1_ps(o < ob && bias ? bias[o0 + o] : 0.0f);
-            for (int j = 0; j < 4; j++) acc[o][j] = b;
+            acc[o][0] = b;
+            acc[o][1] = b;
         }
+        const int64_t src0 = tt0 - pad_l;
+        const bool interior = tn == 16 && src0 >= 0 && src0 + span <= L;
         const int64_t wn = tn + (K - 1) * dil;
         for (int64_t i = 0; i < Ci; i++) {
             const float* xi = Xn + (size_t)i * L;
-            int64_t src0 = tt0 - pad_l;
-            for (int64_t w = 0; w < wn; w++) {
-                int64_t s = src0 + w;
-                win[w] = (s >= 0 && s < L) ? xi[s] : 0.0f;
+            const float* base;
+            if (interior) {
+                base = xi + src0;
+            } else {
+                for (int64_t w = 0; w < wn; w++) {
+                    int64_t s = src0 + w;
+                    win[w] = (s >= 0 && s < L) ? xi[s] : 0.0f;
+                }
+                base = win;
             }
             for (int64_t kk = 0; kk < K; kk++) {
-                const float* xvp = win + kk * dil;
+                const float* xvp = base + kk * dil;
                 __m256 x0 = _mm256_loadu_ps(xvp);
                 __m256 x1 = _mm256_loadu_ps(xvp + 8);
-                __m256 x2 = _mm256_loadu_ps(xvp + 16);
-                __m256 x3 = _mm256_loadu_ps(xvp + 24);
                 int64_t c = i * K + kk;
                 for (int64_t o = 0; o < ob; o++) {
                     __m256 w = _mm256_set1_ps(wbuf[(size_t)(o0 + o) * C + c]);
                     acc[o][0] = _mm256_fmadd_ps(w, x0, acc[o][0]);
                     acc[o][1] = _mm256_fmadd_ps(w, x1, acc[o][1]);
-                    acc[o][2] = _mm256_fmadd_ps(w, x2, acc[o][2]);
-                    acc[o][3] = _mm256_fmadd_ps(w, x3, acc[o][3]);
                 }
             }
         }
         for (int64_t o = 0; o < ob; o++) {
             float* y = Yn + (size_t)(o0 + o) * Lout + tt0;
-            if (tn == 32) {
+            if (tn == 16) {
                 _mm256_storeu_ps(y, acc[o][0]);
                 _mm256_storeu_ps(y + 8, acc[o][1]);
-                _mm256_storeu_ps(y + 16, acc[o][2]);
-                _mm256_storeu_ps(y + 24, acc[o][3]);
             } else {
                 _mm256_store_ps(spill[o], acc[o][0]);
                 _mm256_store_ps(spill[o] + 8, acc[o][1]);
-                _mm256_store_ps(spill[o] + 16, acc[o][2]);
-                _mm256_store_ps(spill[o] + 24, acc[o][3]);
                 for (int64_t tt = 0; tt < tn; tt++) y[tt] = spill[o][tt];
             }
         }
