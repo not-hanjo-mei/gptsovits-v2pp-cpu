@@ -785,43 +785,54 @@ void conv1d_fast_impl(const float* X, int64_t N, int64_t Ci, int64_t L,
     // as slow as its most stolen worker (measured: ~3 GMAC/s in-graph
     // vs ~15 cold in isolation). With fetch-and-add, fast workers simply
     // take more units; a unit is ~0.1-1 ms of work.
+    // Block grouping: one task applies GRP consecutive 4-channel
+    // blocks to the same position tile, so the X slice (Ci x tile
+    // floats) is streamed once per group instead of once per block.
+    // POTATO_PCONV_G tunes the group size (1 = the historical
+    // one-block task); the dynamic fetch is unchanged.
+    static const int64_t GRP = [] {
+        const char* e = std::getenv("POTATO_PCONV_G");
+        int64_t v = e ? std::atoll(e) : 1;
+        return v >= 1 ? v : 1;
+    }();
+    const int64_t ngroups = (nblocks + GRP - 1) / GRP;
     std::atomic<int64_t> next_task{0};
-    const int64_t total_tasks = N * ntiles * nblocks;
+    const int64_t total_tasks = N * ntiles * ngroups;
     pool_run((int64_t)N * O * Lout * C, [&](int, int) {
         while (true) {
             int64_t task = next_task.fetch_add(1, std::memory_order_relaxed);
             if (task >= total_tasks) break;
-            {
-                int64_t blk = task % nblocks;
-                int64_t tile = (task / nblocks) % ntiles;
-                int64_t n = task / (nblocks * ntiles);
-                int64_t lt0 = tile * LT, lt_len = std::min(LT, Lout - lt0);
-                const float* Xn = X + (size_t)n * Ci * L;
-                float* Yn = Y + (size_t)n * O * Lout;
-                {
-                    int64_t o0 = blk * OB4, ob = std::min(OB4, O - o0);
+            int64_t grp = task % ngroups;
+            int64_t tile = (task / ngroups) % ntiles;
+            int64_t n = task / (ngroups * ntiles);
+            int64_t lt0 = tile * LT, lt_len = std::min(LT, Lout - lt0);
+            const float* Xn = X + (size_t)n * Ci * L;
+            float* Yn = Y + (size_t)n * O * Lout;
+            for (int64_t gb = 0; gb < GRP; gb++) {
+                int64_t blk = grp * GRP + gb;
+                if (blk >= nblocks) break;
+                int64_t o0 = blk * OB4, ob = std::min(OB4, O - o0);
 #if defined(__x86_64__)
-                    if (window_ok && conv_tile_has_avx512()) {
-                        conv_tile_avx512(Xn, L, wbuf, C, Ci, K, pad_l, dil, bias, Yn, Lout, lt0,
-                                         lt_len, o0, ob);
-                        continue;
-                    }
-                    if (window_ok && cpu::features().avx2) {
-                        conv_tile_avx2(Xn, L, wbuf, C, Ci, K, pad_l, dil, bias, Yn, Lout, lt0, lt_len,
-                                       o0, ob);
-                        continue;
-                    }
+                if (window_ok && conv_tile_has_avx512()) {
+                    conv_tile_avx512(Xn, L, wbuf, C, Ci, K, pad_l, dil, bias, Yn, Lout, lt0,
+                                     lt_len, o0, ob);
+                    continue;
+                }
+                if (window_ok && cpu::features().avx2) {
+                    conv_tile_avx2(Xn, L, wbuf, C, Ci, K, pad_l, dil, bias, Yn, Lout, lt0, lt_len,
+                                   o0, ob);
+                    continue;
+                }
 #endif
 #if defined(__aarch64__)
-                    if (window_ok && vits_tile_pick() == 1) {
-                        conv_tile_neon(Xn, L, wbuf, C, Ci, K, pad_l, dil, bias, Yn, Lout, lt0,
-                                       lt_len, o0, ob);
-                        continue;
-                    }
-#endif
-                    conv_tile_generic(Xn, L, wbuf, C, Ci, K, stride, pad_l, dil, bias, Yn, Lout, lt0,
-                                      lt_len, o0, ob);
+                if (window_ok && vits_tile_pick() == 1) {
+                    conv_tile_neon(Xn, L, wbuf, C, Ci, K, pad_l, dil, bias, Yn, Lout, lt0,
+                                   lt_len, o0, ob);
+                    continue;
                 }
+#endif
+                conv_tile_generic(Xn, L, wbuf, C, Ci, K, stride, pad_l, dil, bias, Yn, Lout, lt0,
+                                  lt_len, o0, ob);
             }
         }
     });
