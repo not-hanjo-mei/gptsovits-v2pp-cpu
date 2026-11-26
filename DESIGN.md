@@ -611,3 +611,42 @@ relrms 1.7e-05 / maxerr 6.25253e-05). AVX2-only E2E on the box:
 campaign; the interleaved profile deltas account for about
 270 ms of it directly (wide dot ~120, gemm_b ~105, bind ~22,
 Leaky ~20), the rest is second-order step-count reduction.
+
+## Continuation round (2026-11-26, late)
+
+Shipped:
+- probs*V register kernel (ad4a9bb): the decode attention
+  product (M=1, N=32, position-major V) keeps its 32
+  accumulators in registers across the K loop instead of
+  round-tripping memory in the tiled path. Same FMA order --
+  bit-identical, all gates exact. Stage exec -37 and -56 ms
+  across two interleaved pairs (~-45 ms per request).
+- Mode-A GEMV two-row SAXPY (0a3ece4): one accumulator
+  load/store round-trip serves two input rows. Bit-identical.
+  Stage exec -59 and -67 ms across two interleaved pairs;
+  gemv_bench 512x1536 43.6 -> 45.1 GMAC/s.
+- write_wav stages PCM and writes once (ee6b81c).
+
+Evaluated, not promoted:
+- i8 GEMV tier on AVX2 (4cbea93): a maddubs executor for mode B,
+  bit-equal to the portable executor (both score 300/361 under
+  POTATO_GEMV_I8, one token above the fp32 floor's 299). At host
+  level on the box it does not beat the fp32 dotraw path (two
+  interleaved pairs, both negative, mode-B-only included) --
+  per-call prelude allocations are the suspected drag. It stays
+  behind POTATO_GEMV_I8=1; the unset default on x86 is unchanged
+  (the ARM defaults rest on listening verdicts, not this).
+- Panel GEMM for the packed conv: a standalone im2col + blocked
+  GEMM harness at the leader shape (192->192 K11 L=12000) runs
+  21.9 GMAC/s against the direct tile's 42.1 -- the GEMM form
+  loses on copy traffic and register pressure. The restructure
+  project is closed; ORT's conv lead on this box is the AVX-512
+  width, already covered by the 512 tile tier.
+
+End state: gates at baselines. Box E2E at HEAD, standard
+sentence: AVX2-only 2,176-2,390 ms (RTF 0.68-0.75, decode
+779-868), all tiers 2,288-2,396 ms (RTF 0.71-0.75). Against the
+~3,180 ms AVX2-only figure before the evening campaign, the
+day's rounds removed roughly a quarter of the sentence time.
+Remaining documented pool (multi-day, unstarted): row-interleaved
+W4 repack, fused decode attention, an indexed Plan::run API.
