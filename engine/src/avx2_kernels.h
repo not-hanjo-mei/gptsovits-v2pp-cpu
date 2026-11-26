@@ -30,10 +30,6 @@ void w4a_saxpy64(float f, const uint8_t* prow, float* acc);
 // Returns sum over k in [0, 64) of (nib(k) - ze) * sc * x[k]. Mode B
 // inner loop: one k-group of one output row.
 float w4b_dot64(const uint8_t* prow, float sc, float ze, const float* x);
-// Plain fp32 dot product, AVX2 FMA with a horizontal reduction. The
-// scalar fallback accumulates in double, matching the attention
-// fast path's historical numerics on machines without AVX2.
-float dot_f32(const float* a, const float* b, int64_t n);
 // Raw nibble dot: sum of unpacked weights times x, with no scale or
 // zero-point applied. Callers fold those in algebraically --
 // sum((w - ze) * sc * x) == sc * dotraw - sc * ze * sum(x) -- which
