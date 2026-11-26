@@ -4727,7 +4727,6 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
     // Capacity grows at bind time only, before any RT of this run
     // points into the buffer.
     std::vector<char> kv_out;
-    auto kv_t0 = std::chrono::steady_clock::now();
     if (im.kv && !im.kv_pairs.empty()) {
         if (im.kv->slots.size() < im.kv_pairs.size()) im.kv->slots.resize(im.kv_pairs.size());
         kv_out.assign(nv, 0);
@@ -4790,13 +4789,6 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
             res[pr.in_vid] = r;
             done[pr.in_vid] = 1;
         }
-    }
-    if (im.kv && !im.kv_pairs.empty()) {
-        static double kv_pre_us = 0;
-        static long kv_pre_n = 0;
-        kv_pre_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - kv_t0).count();
-        if (++kv_pre_n == 84) std::fprintf(stderr, "[KV_SPLIT] nv=%d pairs=%zu\n", nv, im.kv_pairs.size()); if (kv_pre_n == 84)
-            std::fprintf(stderr, "[KV_SPLIT] pre-bind total %.1f ms over %ld runs\n", kv_pre_us / 1000.0, kv_pre_n);
     }
     // Inputs (indexed parallel to in_names; null data = missing).
     for (size_t i = 0; i < im.in_vals.size(); i++) {
