@@ -1947,6 +1947,20 @@ struct Impl {
     std::vector<std::vector<uint8_t>> view_blocks;  // reshape materializations (never moved)
     std::vector<std::vector<uint8_t>> sym_bufs;
     uint64_t rng_ctr = 0;
+    // Bind workspace, reused across runs: capacities persist, so a
+    // decode step's bind allocates almost nothing once warm. The
+    // planning algorithm and its results are unchanged.
+    struct BAlloc { int vid; int64_t size; int def, use; bool out; };
+    struct BBlock { size_t off, size; int use; };
+    std::vector<int64_t> bsv;
+    std::vector<RT> bres;
+    std::vector<char> bdone;
+    std::vector<std::vector<int64_t>> bcshape;
+    std::vector<BAlloc> ballocs, bwork, bouta;
+    std::vector<BBlock> bblocks;
+    std::vector<size_t> boff_w, boff_o;
+    std::vector<RT> bsin, bsout;
+    Scratch bsc;
     PackedLookup lookup;
     // fp16 weight storage (M2): converted copies of initializer
     // tensors used as MatMul/Gemm B operands, deduped by value id.
@@ -4438,10 +4452,21 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
     static const bool prof_run = std::getenv("FE_PROFILE") != nullptr;
     auto run_t0 = std::chrono::steady_clock::now();
     int nv = (int)im.vals.size();
+    // Bind workspace (Impl members; capacities persist across runs).
+    if ((int)im.bres.size() != nv) {
+        im.bres.assign(nv, RT{});
+        im.bdone.assign(nv, 0);
+        im.bcshape.assign(nv, {});
+        im.boff_w.assign(nv, 0);
+        im.boff_o.assign(nv, 0);
+        im.sym_bufs.assign(nv, {});
+    }
     // Symbol values from the caller's input shapes.
-    std::vector<int64_t> sv(im.nsyms, 0);
-    std::vector<RT> res(nv);
-    std::vector<char> done(nv, 0);
+    std::vector<int64_t>& sv = im.bsv;
+    sv.assign(im.nsyms, 0);
+    std::vector<RT>& res = im.bres;
+    std::vector<char>& done = im.bdone;
+    std::fill(done.begin(), done.end(), 0);
     // Inputs.
     for (size_t i = 0; i < im.in_vals.size(); i++) {
         int vid = im.in_vals[i];
@@ -4465,8 +4490,9 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
         auto [vid, dim] = im.sym_origin[s];
         sv[s] = dim < (int)res[vid].shape.size() ? res[vid].shape[dim] : 0;
     }
-    // Consts and symbolic values.
-    im.sym_bufs.assign(nv, {});
+    // Consts and symbolic values. (sym_bufs is sized by the
+    // workspace guard above; SYMVAL buffers are fully rewritten
+    // below on every run.)
     for (int i = 0; i < nv; i++) {
         Value& v = im.vals[i];
         if (v.kind == Value::CONSTV) {
@@ -4486,15 +4512,17 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
         }
     }
     // Concrete shapes for RT values (from exprs).
-    std::vector<std::vector<int64_t>> cshape(nv);
+    std::vector<std::vector<int64_t>>& cshape = im.bcshape;
     for (int i = 0; i < nv; i++) {
         Value& v = im.vals[i];
         if (v.kind != Value::RT) continue;
+        cshape[i].clear();
         for (auto& e : v.rshape) cshape[i].push_back(eeval(e, sv));
     }
     // Arena assignment for materialized RT values (not views / inputs).
-    struct Alloc { int vid; int64_t size; int def, use; bool out; };
-    std::vector<Alloc> allocs;
+    using Alloc = Impl::BAlloc;
+    std::vector<Alloc>& allocs = im.ballocs;
+    allocs.clear();
     for (int i = 0; i < nv; i++) {
         Value& v = im.vals[i];
         if (v.kind != Value::RT || v.view_kind != 0 || v.is_input) continue;
@@ -4504,11 +4532,12 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
         sz *= (int64_t)onnxm::elem_size(v.dtype);
         allocs.push_back({i, sz, std::max(v.def_step, 0), v.last_use, v.is_output});
     }
-    auto plan_arena = [](std::vector<Alloc>& as, std::vector<uint8_t>& buf,
-                         std::map<int, size_t>& offs) {
+    auto plan_arena = [&](std::vector<Alloc>& as, std::vector<uint8_t>& buf,
+                          std::vector<size_t>& offs) {
         std::stable_sort(as.begin(), as.end(), [](const Alloc& a, const Alloc& b) { return a.def < b.def; });
-        struct Block { size_t off, size; int use; };
-        std::vector<Block> blocks;
+        using Block = Impl::BBlock;
+        std::vector<Block>& blocks = im.bblocks;
+        blocks.clear();
         size_t total = 0;
         for (auto& a : as) {
             size_t need = (size_t)((a.size + 63) & ~63LL);
@@ -4539,9 +4568,13 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
         if (buf.size() < total) buf.resize(total);
         return total;
     };
-    std::vector<Alloc> work, outa;
+    std::vector<Alloc>& work = im.bwork;
+    std::vector<Alloc>& outa = im.bouta;
+    work.clear();
+    outa.clear();
     for (auto& a : allocs) (a.out ? outa : work).push_back(a);
-    std::map<int, size_t> off_w, off_o;
+    std::vector<size_t>& off_w = im.boff_w;
+    std::vector<size_t>& off_o = im.boff_o;
     size_t arena_total = plan_arena(work, im.arena, off_w);
     size_t out_total = plan_arena(outa, im.out_arena, off_o);
     arena_bytes_ = arena_total + out_total;
@@ -4657,13 +4690,14 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
         g_prof_runs[im.label]++;
     }
     auto exec_t0 = std::chrono::steady_clock::now();
-    Scratch sc;
-    std::vector<RT> sin, sout;
+    Scratch& sc = im.bsc;
+    std::vector<RT>& sin = im.bsin;
+    std::vector<RT>& sout = im.bsout;
     for (auto& st : im.steps) {
-        sin.clear();
-        sout.clear();
-        for (int v : st.in) sin.push_back(res[v]);
-        for (int v : st.out) sout.push_back(res[v]);
+        sin.resize(st.in.size());
+        sout.resize(st.out.size());
+        for (size_t j = 0; j < st.in.size(); j++) sin[j] = res[st.in[j]];
+        for (size_t j = 0; j < st.out.size(); j++) sout[j] = res[st.out[j]];
         Scratch::Mark mk = sc.mark();
         if (profile) {
             auto p0 = std::chrono::steady_clock::now();
