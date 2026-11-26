@@ -385,3 +385,22 @@ the unified build stays on GCC (the AVX2 tier is the product
 baseline and must not regress); an optional per-TU clang build of
 just the AVX-512 tile is recorded as a possible ~6% end-to-end
 gain on AVX-512 machines, not built.
+
+## AVX-512 GEMV kernels (2026-11-26, afternoon)
+
+The W4 group kernels got zmm forms (w4a_saxpy64_512,
+w4b_dot64_512 in avx2_kernels.cpp), dispatched inside the AVX2
+GEMV tiers when cpu::features().avx512 and POTATO_NO_AVX512 is
+unset. The SAXPY is elementwise and bit-identical; the dot
+reduces over 16-lane partials, changing last-ulp rounding.
+Micro-bench on the EPYC box (gemv_bench, 4 threads): mode B at
+the decode shape 512x512 +30% (14.3 vs 11.0 GMAC/s), mode A
+shapes +10 to +23%. End-to-end decode moved only ~3%, inside
+the box's noise band -- the stage plans' PACKED time is spread
+over many small GEMVs and non-GEMV ops. All four gates were run
+on the box itself (gpv-root carries every gate asset): tf
+packed holds at exactly 299/361 with the new reduction, tf
+fp32 361/361, vits packed 0.959881, vits fp32 corr 1.000000
+relrms 1.3e-05 (maxerr 4.46e-05 under the box's g++ 14.2 vs
+4.34e-05 under the dev VM's 13.3 -- a compiler-version ulp
+artifact in auto-vectorized scalar code, corr/relrms exact).

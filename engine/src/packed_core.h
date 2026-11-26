@@ -944,15 +944,27 @@ inline void gemv_a_w4_scalar(const float* X, int64_t K, int64_t D,
     });
 }
 
+// AVX-512 availability for the GEMV inner kernels (same kill
+// switch as the conv tile tier).
+inline bool gemv_avx512_ok() {
+    static const bool on = [] {
+        if (std::getenv("POTATO_NO_AVX512")) return false;
+        return cpu::features().avx512;
+    }();
+    return on;
+}
+
 // AVX2 tier (x86-64): same group structure as gemv_a_w4_scalar, with
 // the 32-byte inner SAXPY replaced by avx2k::w4a_saxpy64. The factor
 // and the zero-point correction keep the scalar form, so the only
 // numeric difference from the scalar floor is FMA contraction inside
-// the group.
+// the group. On AVX-512 machines the inner SAXPY widens to
+// w4a_saxpy64_512 (elementwise, bit-identical).
 inline void gemv_a_w4_avx2(const float* X, int64_t K, int64_t D,
                            const uint8_t* pk, const float* sc, const uint8_t* ze,
                            const float* bias, float* Y) {
     const int64_t ng = D / 64;
+    const bool s512 = gemv_avx512_ok();
     pool_run(K * D, [&](int idx, int nt) {
         chunk(idx, nt, ng, [&](int64_t g0, int64_t g1) {
             for (int64_t g = g0; g < g1; g++) {
@@ -962,7 +974,10 @@ inline void gemv_a_w4_avx2(const float* X, int64_t K, int64_t D,
                 for (int64_t i = 0; i < K; i++) {
                     float f = X[i] * sc[(size_t)i * ng + g];
                     corr += f * (float)ze[(size_t)i * ng + g];
-                    avx2k::w4a_saxpy64(f, pk + (size_t)i * (D / 2) + g * 32, acc);
+                    if (s512)
+                        avx2k::w4a_saxpy64_512(f, pk + (size_t)i * (D / 2) + g * 32, acc);
+                    else
+                        avx2k::w4a_saxpy64(f, pk + (size_t)i * (D / 2) + g * 32, acc);
                 }
                 for (int64_t jb = 0; jb < 64; jb++) acc[jb] -= corr;
             }
@@ -978,6 +993,7 @@ inline void gemv_b_w4_avx2(const float* X, int64_t K, int64_t D,
                            const uint8_t* pk, const float* sc, const uint8_t* ze,
                            const float* bias, float* Y) {
     const int64_t ng = K / 64;
+    const bool s512 = gemv_avx512_ok();
     pool_run(K * D, [&](int idx, int nt) {
         chunk(idx, nt, D, [&](int64_t j0, int64_t j1) {
             for (int64_t j = j0; j < j1; j++) {
@@ -986,7 +1002,10 @@ inline void gemv_b_w4_avx2(const float* X, int64_t K, int64_t D,
                 const uint8_t* zrow = ze + (size_t)j * ng;
                 float a = bias ? bias[j] : 0.0f;
                 for (int64_t g = 0; g < ng; g++)
-                    a += avx2k::w4b_dot64(prow + g * 32, srow[g], (float)zrow[g], X + g * 64);
+                    a += s512 ? avx2k::w4b_dot64_512(prow + g * 32, srow[g], (float)zrow[g],
+                                                     X + g * 64)
+                              : avx2k::w4b_dot64(prow + g * 32, srow[g], (float)zrow[g],
+                                                 X + g * 64);
                 Y[j] = a;
             }
         });

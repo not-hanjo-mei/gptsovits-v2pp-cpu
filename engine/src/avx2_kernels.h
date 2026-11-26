@@ -31,6 +31,18 @@ void w4a_saxpy64(float f, const uint8_t* prow, float* acc);
 // inner loop: one k-group of one output row.
 float w4b_dot64(const uint8_t* prow, float sc, float ze, const float* x);
 
+#if defined(__x86_64__)
+// AVX-512F versions of the two group kernels (target-attributed in
+// the .cpp; callers gate on cpu::features().avx512). The SAXPY is
+// elementwise and bit-identical to w4a_saxpy64; the dot reduces
+// over 16-lane partials instead of 8-lane, so its last-ulp rounding
+// differs from w4b_dot64.
+__attribute__((target("avx512f"))) void w4a_saxpy64_512(float f, const uint8_t* prow,
+                                                         float* acc);
+__attribute__((target("avx512f"))) float w4b_dot64_512(const uint8_t* prow, float sc,
+                                                       float ze, const float* x);
+#endif
+
 // Elementwise f32 kernels over contiguous ranges. op codes mirror
 // free_engine's enum orderings (BinOp: ADD SUB MUL DIV POW MAXIMUM
 // LESS GREATER EQUAL OR AND; UnOp: NEG SQRT SIN COS EXP TANH

@@ -96,6 +96,53 @@ float w4b_dot64(const uint8_t* prow, float sc, float ze, const float* x) {
 #endif
 }
 
+#if defined(__x86_64__)
+namespace {
+// AVX-512 unpack of the same 32 packed bytes into 4 zmm, values in
+// the same nibble order as w4_unpack64: out[lane*2] covers the
+// lane's values 0..15, out[lane*2+1] its values 16..31.
+__attribute__((target("avx512f"))) inline void w4_unpack64_512(const uint8_t* prow,
+                                                               __m512* out) {
+    const __m256i v = _mm256_loadu_si256((const __m256i*)prow);
+    const __m256i m0f = _mm256_set1_epi8(0x0F);
+    const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), m0f);
+    const __m256i lo = _mm256_and_si256(v, m0f);
+    for (int lane = 0; lane < 2; lane++) {
+        const __m128i h = lane ? _mm256_extracti128_si256(hi, 1) : _mm256_castsi256_si128(hi);
+        const __m128i l = lane ? _mm256_extracti128_si256(lo, 1) : _mm256_castsi256_si128(lo);
+        const __m128i u0 = _mm_unpacklo_epi8(h, l);
+        const __m128i u1 = _mm_unpackhi_epi8(h, l);
+        out[lane * 2] = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(u0));
+        out[lane * 2 + 1] = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(u1));
+    }
+}
+}  // namespace
+
+__attribute__((target("avx512f"))) void w4a_saxpy64_512(float f, const uint8_t* prow,
+                                                        float* acc) {
+    __m512 w[4];
+    w4_unpack64_512(prow, w);
+    const __m512 vf = _mm512_set1_ps(f);
+    for (int i = 0; i < 4; i++)
+        _mm512_storeu_ps(acc + 16 * i,
+                         _mm512_fmadd_ps(vf, w[i], _mm512_loadu_ps(acc + 16 * i)));
+}
+
+__attribute__((target("avx512f"))) float w4b_dot64_512(const uint8_t* prow, float sc,
+                                                       float ze, const float* x) {
+    __m512 w[4];
+    w4_unpack64_512(prow, w);
+    const __m512 vs = _mm512_set1_ps(sc);
+    const __m512 vz = _mm512_set1_ps(ze);
+    __m512 acc = _mm512_setzero_ps();
+    for (int i = 0; i < 4; i++) {
+        __m512 d = _mm512_mul_ps(_mm512_sub_ps(w[i], vz), vs);
+        acc = _mm512_fmadd_ps(d, _mm512_loadu_ps(x + 16 * i), acc);
+    }
+    return _mm512_reduce_add_ps(acc);
+}
+#endif
+
 namespace {
 // Elementwise op codes, mirroring free_engine's BinOp / UnOp order.
 enum { EB_ADD, EB_SUB, EB_MUL, EB_DIV, EB_POW, EB_MAX, EB_LESS, EB_GREATER, EB_EQUAL, EB_OR, EB_AND };
