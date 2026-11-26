@@ -4468,7 +4468,20 @@ void Plan::release_arena() {
 }
 
 std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inputs) {
+    std::vector<Tensor> ins(in_names_.size());
+    for (size_t i = 0; i < in_names_.size(); i++) {
+        auto it = inputs.find(in_names_[i]);
+        if (it != inputs.end()) ins[i] = it->second;
+    }
+    std::vector<Tensor> outs = run_vec(ins);
+    std::map<std::string, Tensor> out;
+    for (size_t i = 0; i < out_names_.size(); i++) out[out_names_[i]] = outs[i];
+    return out;
+}
+
+std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
     Impl& im = *std::static_pointer_cast<Impl>(impl_);
+    if (inputs.size() != im.in_names.size()) fail("run_vec: input count mismatch");
     im.lookup = lookup_;
     static const bool prof_run = std::getenv("FE_PROFILE") != nullptr;
     auto run_t0 = std::chrono::steady_clock::now();
@@ -4488,11 +4501,11 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
     std::vector<RT>& res = im.bres;
     std::vector<char>& done = im.bdone;
     std::fill(done.begin(), done.end(), 0);
-    // Inputs.
+    // Inputs (indexed parallel to in_names; null data = missing).
     for (size_t i = 0; i < im.in_vals.size(); i++) {
         int vid = im.in_vals[i];
-        auto it = inputs.find(im.in_names[i]);
-        if (it == inputs.end()) {
+        const Tensor& t = inputs[i];
+        if (t.data == nullptr) {
             if (im.vals[vid].last_use >= 0 || im.vals[vid].is_output)
                 fail("missing input: " + im.in_names[i]);
             res[vid] = RT{};
@@ -4500,10 +4513,10 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
             continue;
         }
         RT r;
-        r.dtype = it->second.dtype;
-        r.p = const_cast<uint8_t*>(it->second.data);
-        r.shape = it->second.shape;
-        r.strides = it->second.strides.empty() ? rowmajor(r.shape) : it->second.strides;
+        r.dtype = t.dtype;
+        r.p = const_cast<uint8_t*>(t.data);
+        r.shape = t.shape;
+        r.strides = t.strides.empty() ? rowmajor(r.shape) : t.strides;
         res[vid] = r;
         done[vid] = 1;
     }
@@ -4743,8 +4756,8 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
     if (profile)
         g_prof_exec[im.label] +=
             std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - exec_t0).count();
-    // Outputs.
-    std::map<std::string, Tensor> out;
+    // Outputs, in out_names order.
+    std::vector<Tensor> out(im.out_vals.size());
     for (size_t i = 0; i < im.out_vals.size(); i++) {
         const RT& r = res[im.out_vals[i]];
         Tensor t;
@@ -4752,7 +4765,7 @@ std::map<std::string, Tensor> Plan::run(const std::map<std::string, Tensor>& inp
         t.data = r.p;
         t.shape = r.shape;
         if (!r.contig()) t.strides = r.strides;
-        out[im.out_names[i]] = t;
+        out[i] = t;
     }
     return out;
 }

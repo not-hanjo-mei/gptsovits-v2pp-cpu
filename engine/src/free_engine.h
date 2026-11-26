@@ -70,6 +70,12 @@ class Plan {
     // caller copies what must persist, exactly like the tf_check state
     // hand-off). Throws on missing inputs or shape errors.
     std::map<std::string, Tensor> run(const std::map<std::string, Tensor>& inputs);
+    // Indexed form: inputs in input_names() order (an entry with
+    // data == nullptr counts as missing, same rule as the map
+    // form), outputs returned in output_names() order. The host's
+    // decode loop uses this to avoid rebuilding name maps and
+    // renamed key strings on every step.
+    std::vector<Tensor> run_vec(const std::vector<Tensor>& inputs);
     // Drop the run arenas (work + outputs). The next run re-plans and
     // regrows them. Callers must have copied out anything they keep:
     // outputs point into these arenas. Used by the host for plans whose

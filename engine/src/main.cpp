@@ -724,27 +724,69 @@ int main(int argc, char** argv) {
                     }
                     t0 = Clock::now();
                     std::mt19937_64 rng((uint64_t)seed);
+                    // Indexed decode: per-plan slot permutations
+                    // (built once) replace the per-step name maps.
+                    // first_out -> stage_in renames y->iy,
+                    // y_emb->iy_emb, present_*->past_*; stage outputs
+                    // feed the other stage plan the same way.
+                    auto slot_of = [](const std::vector<std::string>& names, const std::string& n) {
+                        for (size_t i = 0; i < names.size(); i++)
+                            if (names[i] == n) return (int)i;
+                        return -1;
+                    };
+                    auto feed_perm = [&](const std::vector<std::string>& src_out,
+                                         const std::vector<std::string>& dst_in) {
+                        std::vector<int> perm(dst_in.size(), -1);
+                        for (size_t i = 0; i < dst_in.size(); i++) {
+                            const std::string& dn = dst_in[i];
+                            std::string sn = dn;
+                            if (dn == "iy") sn = "y";
+                            else if (dn == "iy_emb") sn = "y_emb";
+                            else if (dn.rfind("past_k_", 0) == 0) sn = "present_k_" + dn.substr(7);
+                            else if (dn.rfind("past_v_", 0) == 0) sn = "present_v_" + dn.substr(7);
+                            perm[i] = slot_of(src_out, sn);
+                            if (perm[i] < 0) throw std::runtime_error("stage feed: no source for " + dn);
+                        }
+                        return perm;
+                    };
+                    const auto& a_in = fh.stage_a->input_names();
+                    const auto& b_in = fh.stage_b->input_names();
+                    const auto& a_out = fh.stage_a->output_names();
+                    const auto& b_out = fh.stage_b->output_names();
+                    std::vector<int> perm_first_a = feed_perm(fh.first->output_names(), a_in);
+                    std::vector<int> perm_ab = feed_perm(a_out, b_in);
+                    std::vector<int> perm_ba = feed_perm(b_out, a_in);
+                    int y_slot_a = slot_of(a_out, "y"), y_slot_b = slot_of(b_out, "y");
+                    int lg_slot_a = slot_of(a_out, "logits_penalized");
+                    int lg_slot_b = slot_of(b_out, "logits_penalized");
+                    if (y_slot_a < 0 || y_slot_b < 0 || lg_slot_a < 0 || lg_slot_b < 0)
+                        throw std::runtime_error("stage outputs missing y/logits_penalized");
+                    std::vector<freeeng::Tensor> state(a_in.size());
+                    {
+                        // fstate is in fh.first's output order.
+                        const auto& fo = fh.first->output_names();
+                        std::vector<freeeng::Tensor> fvec(fo.size());
+                        for (size_t i = 0; i < fo.size(); i++) fvec[i] = fstate.at(fo[i]);
+                        for (size_t i = 0; i < state.size(); i++) state[i] = fvec[perm_first_a[i]];
+                    }
                     bool use_a = true;
                     while (gen.back() != EOS_ID && steps < MAX_STEPS) {
-                        std::map<std::string, freeeng::Tensor> sin;
-                        sin.emplace("iy", fstate.at("y"));
-                        sin.emplace("iy_emb", fstate.at("y_emb"));
-                        for (auto& kv : fstate) {
-                            if (kv.first.rfind("present_k_", 0) == 0) sin.emplace("past_k_" + kv.first.substr(10), kv.second);
-                            else if (kv.first.rfind("present_v_", 0) == 0) sin.emplace("past_v_" + kv.first.substr(10), kv.second);
-                        }
-                        fstate = (use_a ? fh.stage_a : fh.stage_b)->run(sin);
-                        use_a = !use_a;
+                        std::vector<freeeng::Tensor> out =
+                            (use_a ? fh.stage_a : fh.stage_b)->run_vec(state);
                         steps++;
-                        auto& lg = fstate.at("logits_penalized");
+                        const auto& lg = out[use_a ? lg_slot_a : lg_slot_b];
                         const float* logits = (const float*)lg.data;
                         size_t lnum = (size_t)lg.numel();
                         const float* last_row = logits + (lnum - VOCAB);
                         int64_t nxt = sample_token(last_row, VOCAB, top_k, top_p, temperature, rng, greedy);
-                        auto& yv = fstate.at("y");
+                        auto& yv = out[use_a ? y_slot_a : y_slot_b];
                         int64_t* yd = (int64_t*)yv.data;
                         yd[yv.shape[1] - 1] = nxt;
                         gen.push_back(nxt);
+                        const std::vector<int>& perm = use_a ? perm_ab : perm_ba;
+                        state.assign(perm.size(), freeeng::Tensor{});
+                        for (size_t i = 0; i < perm.size(); i++) state[i] = out[perm[i]];
+                        use_a = !use_a;
                     }
                     t_dec = ms_since(t0);
                     fh.first->release_arena();  // stage plans own the live state now
