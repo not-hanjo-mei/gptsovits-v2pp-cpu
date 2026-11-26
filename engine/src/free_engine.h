@@ -49,6 +49,11 @@ struct PackedBinding {
 // fill the binding. Return false if the name is unknown.
 using PackedLookup = std::function<bool(const std::string& base, PackedBinding& out)>;
 
+// Shared KV cache state for stateful stage plans (see
+// Plan::set_kv_cache). Opaque; defined in free_engine.cpp.
+struct KvCache;
+std::shared_ptr<KvCache> make_kv_cache();
+
 class Plan {
   public:
     // Compile from a parsed graph. Throws std::runtime_error on any op
@@ -63,6 +68,18 @@ class Plan {
     static std::shared_ptr<Plan> compile(const onnxm::Graph& g, std::string label,
                                          bool fp16_weights = false);
     void set_packed_lookup(PackedLookup fn) { lookup_ = std::move(fn); }
+    // Attach a shared KV cache. Plans compiled from a graph with
+    // feedback pairs (Concat(graph_input, new_slice) -> graph
+    // output, axis 0 -- the GPT stage graphs' past/present) keep
+    // those tensors in the cache's padded buffers instead of
+    // re-copying the whole history every step: bind views the
+    // buffer at the current length, the concat step appends only
+    // the new slice. Two plans sharing one cache stay in sync
+    // (the stage ping-pong). The caller supplies the past tensors
+    // on the first run (copied in), then passes them as missing.
+    // A fresh cache per request resets the state. Plans without a
+    // cache attached behave exactly as before.
+    void set_kv_cache(std::shared_ptr<KvCache> c) { kv_cache_ = std::move(c); }
 
     struct Instance;
     // Bind inputs (name -> tensor) and run. Outputs reference instance
@@ -90,6 +107,7 @@ class Plan {
 
   private:
     PackedLookup lookup_;
+    std::shared_ptr<KvCache> kv_cache_;
     std::vector<std::string> in_names_, out_names_;
     size_t arena_bytes_ = 0;
     size_t n_steps_ = 0;

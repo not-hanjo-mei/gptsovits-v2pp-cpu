@@ -749,8 +749,24 @@ int main(int argc, char** argv) {
                         }
                         return perm;
                     };
+                    // Stateful KV: one shared cache for both stage
+                    // plans, fresh per request. The first stage run
+                    // receives the real past tensors (copied in);
+                    // later runs pass them as missing and the plans
+                    // read/append the cache buffers directly.
+                    auto kvc = freeeng::make_kv_cache();
+                    fh.stage_a->set_kv_cache(kvc);
+                    fh.stage_b->set_kv_cache(kvc);
+                    auto past_mask_of = [](const std::vector<std::string>& names) {
+                        std::vector<char> m(names.size(), 0);
+                        for (size_t i = 0; i < names.size(); i++)
+                            m[i] = names[i].rfind("past_", 0) == 0;
+                        return m;
+                    };
                     const auto& a_in = fh.stage_a->input_names();
                     const auto& b_in = fh.stage_b->input_names();
+                    std::vector<char> past_mask_a = past_mask_of(a_in);
+                    std::vector<char> past_mask_b = past_mask_of(b_in);
                     const auto& a_out = fh.stage_a->output_names();
                     const auto& b_out = fh.stage_b->output_names();
                     std::vector<int> perm_first_a = feed_perm(fh.first->output_names(), a_in);
@@ -784,8 +800,10 @@ int main(int argc, char** argv) {
                         yd[yv.shape[1] - 1] = nxt;
                         gen.push_back(nxt);
                         const std::vector<int>& perm = use_a ? perm_ab : perm_ba;
+                        const std::vector<char>& pmask = use_a ? past_mask_b : past_mask_a;
                         state.assign(perm.size(), freeeng::Tensor{});
-                        for (size_t i = 0; i < perm.size(); i++) state[i] = out[perm[i]];
+                        for (size_t i = 0; i < perm.size(); i++)
+                            state[i] = pmask[i] ? freeeng::Tensor{} : out[perm[i]];
                         use_a = !use_a;
                     }
                     t_dec = ms_since(t0);

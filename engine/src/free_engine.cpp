@@ -24,6 +24,19 @@
 #include "vits_kernels.h"  // phase 2: packed conv/gather kernels (ORT-free header)
 
 namespace freeeng {
+
+struct KvCache {
+    struct Slot {
+        std::vector<float> buf;          // capacity rows * row floats
+        std::vector<int64_t> shape;      // shape template from copy-in
+        int64_t len = -1;                // rows held, -1 = empty
+        int64_t cap_rows = 0;
+    };
+    std::vector<Slot> slots;             // indexed by pair order (step order)
+};
+
+std::shared_ptr<KvCache> make_kv_cache() { return std::make_shared<KvCache>(); }
+
 namespace {
 
 // ------------------------------------------------------------------ RT --
@@ -2001,6 +2014,7 @@ struct Step {
     int b_f16 = -1;           // MATMUL/GEMM: index into Impl::f16_weights, or -1
     const float* b_f16_src = nullptr;  // fp32 base pointer the runtime B must match
     float out_scale = 1;      // MATMUL: epilogue scale folded from a downstream scalar Mul
+    int kv_slot = -1;         // CONCAT: stateful KV pair index, or -1
     onnxm::Tensor fill;
     int out_dtype = 0;
 };
@@ -2024,6 +2038,13 @@ struct Value {
 
 struct Impl {
     std::string label;
+    // Stateful KV feedback pairs, in step order; the pair index
+    // is the slot in a shared KvCache. Detection is structural and
+    // runs on every plan; behavior changes only when a cache is
+    // attached (Plan::set_kv_cache).
+    struct KvPair { int in_vid, out_vid, in_idx; };
+    std::vector<KvPair> kv_pairs;
+    std::shared_ptr<KvCache> kv;
     std::vector<Value> vals;
     std::vector<Step> steps;
     std::map<std::string, int> by_name;
@@ -3962,6 +3983,19 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
         case SK::GATHER_EL: k_gather_elements(ins[0], ins[1], outs[0], st.axis); break;
         case SK::SCATTER_EL: k_scatter_elements(ins[0], ins[1], ins[2], outs[0], st.axis, st.reduction); break;
         case SK::CONCAT: {
+            if (st.kv_slot >= 0 && im.kv) {
+                // Stateful KV append: outs[0] views the cache
+                // buffer; copy only the new slice at the slot's
+                // current length and advance it.
+                KvCache::Slot& slot = im.kv->slots[st.kv_slot];
+                RT in = sc.contig_of(ins[1]);
+                int64_t rows = in.shape.empty() ? 0 : in.shape[0];
+                size_t rowf = rows > 0 ? (size_t)in.numel() / (size_t)rows : 0;
+                std::memcpy(slot.buf.data() + (size_t)slot.len * rowf, in.p,
+                            (size_t)rows * rowf * sizeof(float));
+                slot.len += rows;
+                break;
+            }
             std::vector<const RT*> ptrs;
             for (auto& t : ins) ptrs.push_back(&t);
             k_concat(ptrs, outs[0], st.axis, sc);
@@ -4391,6 +4425,30 @@ static void dce_pure_steps(Impl& im) {
 
 static bool fuse_one_attn(Impl& im);  // defined below, with the folds
 
+// Stateful KV feedback pairs: a Concat whose first input is a
+// graph input, whose second input is the new slice, and whose
+// output is a graph output (axis 0, fp32). The stage graphs have
+// 48 (24 layers x K/V). Pair order is step order, identical for
+// every plan compiled from the same graph, which is what lets
+// two plans share one KvCache by slot index.
+static void detect_kv_pairs(Impl& im) {
+    for (size_t s = 0; s < im.steps.size(); s++) {
+        Step& st = im.steps[s];
+        if (st.k != SK::CONCAT || st.in.size() != 2 || st.out.size() != 1) continue;
+        if (st.axis != 0) continue;
+        int iv = st.in[0], ov = st.out[0];
+        const Value& vin = im.vals[iv];
+        if (!vin.is_input || vin.view_kind != 0 || vin.dtype != 1) continue;
+        if (!im.vals[ov].is_output) continue;
+        int in_idx = -1;
+        for (size_t i = 0; i < im.in_vals.size(); i++)
+            if (im.in_vals[i] == iv) { in_idx = (int)i; break; }
+        if (in_idx < 0) continue;
+        st.kv_slot = (int)im.kv_pairs.size();
+        im.kv_pairs.push_back({iv, ov, in_idx});
+    }
+}
+
 std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bool fp16_weights) {
     auto plan = std::make_shared<Plan>();
     auto im = std::make_shared<Impl>();
@@ -4458,6 +4516,7 @@ std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bo
     while (fuse_one_attn(*im)) {
     }
     dce_pure_steps(*im);
+    detect_kv_pairs(*im);
     // Liveness: last use over steps, then propagate through views
     // (reverse creation order: views are created after their bases, and
     // a view's last use must extend its base's).
@@ -4629,6 +4688,7 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
     Impl& im = *std::static_pointer_cast<Impl>(impl_);
     if (inputs.size() != im.in_names.size()) fail("run_vec: input count mismatch");
     im.lookup = lookup_;
+    im.kv = kv_cache_;
     static const bool prof_run = std::getenv("FE_PROFILE") != nullptr;
     auto run_t0 = std::chrono::steady_clock::now();
     int nv = (int)im.vals.size();
@@ -4647,9 +4707,57 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
     std::vector<RT>& res = im.bres;
     std::vector<char>& done = im.bdone;
     std::fill(done.begin(), done.end(), 0);
+    // Stateful KV pasts: pre-bind from the shared cache. A supplied
+    // input is copied in when the slot is empty or its length
+    // disagrees; a missing input binds the buffer view directly.
+    // Capacity grows at bind time only, before any RT of this run
+    // points into the buffer.
+    std::vector<char> kv_out;
+    if (im.kv && !im.kv_pairs.empty()) {
+        if (im.kv->slots.size() < im.kv_pairs.size()) im.kv->slots.resize(im.kv_pairs.size());
+        kv_out.assign(nv, 0);
+        for (auto& pr : im.kv_pairs) kv_out[pr.out_vid] = 1;
+        for (size_t pi = 0; pi < im.kv_pairs.size(); pi++) {
+            const auto& pr = im.kv_pairs[pi];
+            KvCache::Slot& slot = im.kv->slots[pi];
+            const Tensor& t = inputs[pr.in_idx];
+            if (t.data != nullptr) {
+                if (!t.contiguous()) fail("kv: past input not contiguous");
+                int64_t rows = t.shape.empty() ? 0 : t.shape[0];
+                int64_t rowf = rows > 0 ? t.numel() / rows : 0;
+                if (slot.len < 0 || slot.len != rows) {
+                    int64_t cap = std::max<int64_t>(rows * 2, 1024);
+                    if (slot.cap_rows < cap) {
+                        slot.buf.resize((size_t)cap * (size_t)rowf);
+                        slot.cap_rows = cap;
+                    }
+                    std::memcpy(slot.buf.data(), t.data, (size_t)rows * (size_t)rowf * sizeof(float));
+                    slot.len = rows;
+                    slot.shape = t.shape;
+                }
+            }
+            if (slot.len < 0) fail("kv: past input missing and cache empty");
+            int64_t rowf = 1;
+            for (size_t d = 1; d < slot.shape.size(); d++) rowf *= slot.shape[d];
+            if (slot.cap_rows < slot.len + 16) {
+                int64_t cap = std::max<int64_t>(slot.cap_rows * 2, slot.len + 1024);
+                slot.buf.resize((size_t)cap * (size_t)rowf);
+                slot.cap_rows = cap;
+            }
+            RT r;
+            r.dtype = 1;
+            r.p = (uint8_t*)slot.buf.data();
+            r.shape = slot.shape;
+            r.shape[0] = slot.len;
+            r.strides = rowmajor(r.shape);
+            res[pr.in_vid] = r;
+            done[pr.in_vid] = 1;
+        }
+    }
     // Inputs (indexed parallel to in_names; null data = missing).
     for (size_t i = 0; i < im.in_vals.size(); i++) {
         int vid = im.in_vals[i];
+        if (done[vid]) continue;  // kv pre-bound above
         const Tensor& t = inputs[i];
         if (t.data == nullptr) {
             if (im.vals[vid].last_use >= 0 || im.vals[vid].is_output)
@@ -4707,6 +4815,7 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
         Value& v = im.vals[i];
         if (v.kind != Value::RT || v.view_kind != 0 || v.is_input) continue;
         if (v.def_step == -2) continue;  // degenerate LN side output
+        if (!kv_out.empty() && kv_out[i]) continue;  // stateful KV present: cache-bound below
         int64_t sz = 1;
         for (auto d : cshape[i]) sz *= d;
         sz *= (int64_t)onnxm::elem_size(v.dtype);
@@ -4776,6 +4885,21 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
         r.p = (a.out ? im.out_arena.data() + off_o[a.vid] : im.arena.data() + off_w[a.vid]);
         res[a.vid] = r;
         done[a.vid] = 1;
+    }
+    // Stateful KV presents: views into the cache buffers at the
+    // new length (cshape already resolved it from the past view).
+    if (im.kv && !im.kv_pairs.empty()) {
+        for (size_t pi = 0; pi < im.kv_pairs.size(); pi++) {
+            int ov = im.kv_pairs[pi].out_vid;
+            KvCache::Slot& slot = im.kv->slots[pi];
+            RT r;
+            r.dtype = 1;
+            r.p = (uint8_t*)slot.buf.data();
+            r.shape = cshape[ov];
+            r.strides = rowmajor(r.shape);
+            res[ov] = r;
+            done[ov] = 1;
+        }
     }
     // Degenerate unproduced values (LN side outputs): zero-size views.
     for (int i = 0; i < nv; i++) {
