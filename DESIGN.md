@@ -438,3 +438,27 @@ unreadable -- the shared box's baseline swung 2.4-4.8 s between
 runs -- so the profile accounting is the recorded evidence.
 Known rejection: a scaled tensor feeding two matmuls (encoder)
 stays unfolded; it runs once per request and is not the target.
+
+## Compiler round 2 and the assembly tile (2026-11-26)
+
+clang 21 (apt.llvm.org) was installed on the box and measured
+against GCC on the tile bench: the AVX2 tile is still ~2.4x
+slower under clang (17.3 vs ~41 GMAC/s per thread), so the
+compiler picture is unchanged -- GCC builds the product; clang's
+advantage stays confined to the frozen AVX-512 tier (112-117
+GMAC/s there). One portability fix landed on the way:
+avx2_kernels.cpp now includes immintrin.h on x86_64 generally,
+which clang requires to see the AVX-512 intrinsics at all.
+
+The AVX2 conv tile now has a hand-written assembly core
+(engine/src/conv16_asm.S) for interior 4-channel chunks with
+even Ci. It walks input channels in pairs, doubling the FMA
+dependency distance over the intrinsics tile (whose per-tap
+accumulator hits sit ~14 instructions apart against a 4-5 cycle
+FMA latency -- the cap behind its ~47% of FMA peak). Isolated
+bench: 50.4 vs 39.3 GMAC/s (+28%), maxdiff 7.6e-06 (the pair
+interleave reorders summation at the 1e-5 level). All four
+gates reproduce their canonical stats locally and on the box
+(the box packed internal maxerr moved 2.29e-06 -> 2.32e-06,
+corr/relrms unchanged). POTATO_NO_ASM=1 restores the intrinsics
+tile; edge chunks, tails and odd Ci still use it.
