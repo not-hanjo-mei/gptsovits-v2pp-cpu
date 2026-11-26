@@ -262,12 +262,25 @@ void k_matmul(const RT& A0, const RT& B0, RT& C, Scratch& sc, const uint16_t* Bf
     // sweep, re-reading the whole K cache once per k (stride-K gathers);
     // the dot form reads it exactly once, sequentially. Accumulation is
     // double, in k order, as in the original single-batch fast path.
+    // The wide variant (row stride S > K, AVX2 only) covers the
+    // position-major KV layout and any M, with a float dot kernel.
     if (Bf16 == nullptr && A0.dtype == 1 && B0.dtype == 1 && C.contig()) {
         int ra0 = (int)A0.shape.size(), rb0 = (int)B0.shape.size();
         if (ra0 >= 2 && rb0 >= 2) {
             int64_t M = A0.shape[ra0 - 2], K = A0.shape[ra0 - 1], N = B0.shape[rb0 - 1];
-            if (M == 1 && A0.strides[ra0 - 1] == 1 && B0.strides[rb0 - 2] == 1 && B0.strides[rb0 - 1] == K) {
-                int batch = (int)(C.numel() / N);
+            // B's rows are K contiguous floats at stride S. S == K is
+            // the packed case (the original fast path, double
+            // accumulation, any M == 1). S > K is the position-major
+            // KV layout of the GPT attention scores (rows live 512
+            // floats apart in a [L, heads*dim] buffer): the general
+            // path reads those as stride-S scalar gathers, so on
+            // AVX2 machines a float dot kernel takes any M here.
+            const int64_t S = B0.strides[rb0 - 1];
+            const bool classic = M == 1 && B0.strides[rb0 - 2] == 1 && S == K;
+            const bool wide = cpu::features().avx2 && cpu::features().fma &&
+                              B0.strides[rb0 - 2] == 1 && S >= K;
+            if ((classic || wide) && A0.strides[ra0 - 1] == 1) {
+                int batch = (int)(C.numel() / (M * N));
                 auto bst = [](const RT& t, const std::vector<int64_t>& cshape) {
                     std::vector<int64_t> st;
                     int rank = (int)t.shape.size();
@@ -296,14 +309,20 @@ void k_matmul(const RT& A0, const RT& B0, RT& C, Scratch& sc, const uint16_t* Bf
                 const float* ap0 = (const float*)A0.p;
                 const float* bp0 = (const float*)B0.p;
                 float* cp0 = (float*)C.p;
-                int64_t work = (int64_t)batch * N;
+                const int64_t arow = A0.strides[ra0 - 2];
+                int64_t work = (int64_t)batch * M * N;
                 auto body = [&](int idx, int nt) {
                     packed::chunk(idx, nt, work, [&](int64_t w0, int64_t w1) {
                         for (int64_t w = w0; w < w1; w++) {
-                            int b = (int)(w / N);
-                            int64_t j = w % N;
-                            const float* a = ap0 + aoff[b];
-                            const float* row = bp0 + boff[b] + j * K;
+                            int b = (int)(w / (M * N));
+                            int64_t rem = w % (M * N);
+                            int64_t m = rem / N, j = rem % N;
+                            const float* a = ap0 + aoff[b] + m * arow;
+                            const float* row = bp0 + boff[b] + j * S;
+                            if (wide) {
+                                cp0[w] = avx2k::dot_f32(a, row, K);
+                                continue;
+                            }
                             double s = 0;
                             for (int64_t k = 0; k < K; k++) s += (double)a[k] * row[k];
                             cp0[w] = (float)s;

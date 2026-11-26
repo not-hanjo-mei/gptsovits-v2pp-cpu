@@ -101,6 +101,30 @@ float w4b_dot64(const uint8_t* prow, float sc, float ze, const float* x) {
 #endif
 }
 
+float dot_f32(const float* a, const float* b, int64_t n) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
+        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), s1);
+    }
+    for (; i + 8 <= n; i += 8)
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
+    __m256 s = _mm256_add_ps(s0, s1);
+    __m128 sh = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+    sh = _mm_add_ps(sh, _mm_movehl_ps(sh, sh));
+    sh = _mm_add_ss(sh, _mm_shuffle_ps(sh, sh, 1));
+    float acc = _mm_cvtss_f32(sh);
+    for (; i < n; i++) acc += a[i] * b[i];
+    return acc;
+#else
+    double s = 0;
+    for (int64_t i = 0; i < n; i++) s += (double)a[i] * b[i];
+    return (float)s;
+#endif
+}
+
 float w4b_dotraw64(const uint8_t* prow, const float* x) {
 #if defined(__AVX2__) && defined(__FMA__)
     __m256 w[8];
