@@ -3953,6 +3953,168 @@ static bool fold_one_scalar_mul(Impl& im) {
     return false;
 }
 
+// Compile-time scalar resolution for small constant expressions:
+// CONSTV leaves, Cast, Sqrt, Neg, Mul, Div over resolvable operands.
+// Returns false when any part is runtime. The float arithmetic
+// mirrors the runtime's fp32 ops (sqrt is correctly rounded, and
+// double rounding through 53 bits is innocuous for sqrt at 24-bit
+// precision), so a resolved value is bit-identical to the runtime
+// one.
+static bool resolve_scalar(Impl& im, int v, float* out, int depth = 0) {
+    if (depth > 8 || v < 0) return false;
+    const Value& val = im.vals[v];
+    if (val.kind == Value::CONSTV) {
+        if (val.ct.numel() != 1) return false;
+        if (val.ct.data_type == 1 && val.ct.data.size() >= 4) {
+            *out = *(const float*)val.ct.data.data();
+            return true;
+        }
+        if (val.ct.data_type == 11 && val.ct.data.size() >= 8) {
+            *out = (float)*(const double*)val.ct.data.data();
+            return true;
+        }
+        if (val.ct.data_type == 7 && val.ct.data.size() >= 8) {
+            *out = (float)*(const int64_t*)val.ct.data.data();
+            return true;
+        }
+        if (val.ct.data_type == 6 && val.ct.data.size() >= 4) {
+            *out = (float)*(const int32_t*)val.ct.data.data();
+            return true;
+        }
+        return false;
+    }
+    if (val.kind != Value::RT || val.view_kind != 0) return false;
+    int si = val.def_step;
+    if (si < 0 || si >= (int)im.steps.size()) return false;
+    const Step& st = im.steps[si];
+    if (st.out.size() != 1 || st.out[0] != v) return false;
+    float a, b;
+    if (st.k == SK::CAST && st.in.size() == 1)
+        return resolve_scalar(im, st.in[0], out, depth + 1);
+    if (st.k == SK::UNOP && st.in.size() == 1) {
+        if (!resolve_scalar(im, st.in[0], &a, depth + 1)) return false;
+        if (st.uop == UnOp::SQRT) {
+            *out = std::sqrt(a);
+            return true;
+        }
+        if (st.uop == UnOp::NEG) {
+            *out = -a;
+            return true;
+        }
+        return false;
+    }
+    if (st.k == SK::BINOP && st.in.size() == 2) {
+        if (!resolve_scalar(im, st.in[0], &a, depth + 1) ||
+            !resolve_scalar(im, st.in[1], &b, depth + 1))
+            return false;
+        if (st.bop == BinOp::DIV) {
+            *out = a / b;
+            return true;
+        }
+        if (st.bop == BinOp::MUL) {
+            *out = a * b;
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+// Mirror fold: "MatMul(Mul(x, scalar-const-expr), ..)" -- the
+// scale moves into the matmul's epilogue (out_scale, or the Gemm
+// alpha when it has no C input) and the Mul step is erased. This
+// is the attention Q/K scaling shape in the GPT stage plans: the
+// scalar arrives as Sqrt(Cast(Constant)), and the standalone Mul
+// walks the [1, heads, L, dim] tensor in a gathered layout. The
+// consumer path from the Mul output to the matmul input slot
+// (through views) must be unique; the first view on that path is
+// re-based onto the Mul's tensor input (same shape).
+static bool fold_one_scalar_mul_pre(Impl& im) {
+    auto& vals = im.vals;
+    auto& steps = im.steps;
+    std::vector<int> view_kids(vals.size(), 0);
+    std::vector<std::vector<int>> kids(vals.size());
+    for (size_t i = 0; i < vals.size(); i++) {
+        const Value& v = vals[i];
+        if (v.kind == Value::RT && v.view_kind != 0 && v.base >= 0) {
+            view_kids[v.base]++;
+            kids[v.base].push_back((int)i);
+        }
+    }
+    for (int s2i = 0; s2i < (int)steps.size(); s2i++) {
+        Step& s2 = steps[s2i];
+        if (s2.k != SK::BINOP || s2.bop != BinOp::MUL || s2.in.size() != 2 ||
+            s2.out.size() != 1)
+            continue;
+        int vx = -1;
+        float scale = 0;
+        for (int t = 0; t < 2; t++) {
+            float sc;
+            if (resolve_scalar(im, s2.in[t], &sc)) {
+                scale = sc;
+                vx = s2.in[1 - t];
+            }
+        }
+        if (vx < 0) continue;
+        if (vals[vx].kind != Value::RT) continue;
+        int vy = s2.out[0];
+        if (vals[vy].kind != Value::RT || vals[vy].view_kind != 0 || vals[vy].is_output)
+            continue;
+        bool meta_ref = false;
+        for (auto& v : vals)
+            for (int m : {v.meta0, v.meta1, v.meta2, v.meta3})
+                if (m == vy) meta_ref = true;
+        if (meta_ref) continue;
+        // Walk the unique consumer path from vy: at each value,
+        // exactly one continuation (one view child XOR one step
+        // input slot) is allowed.
+        int cur = vy, first_view = -1, cons_step = -1, cons_slot = -1;
+        bool bad = false;
+        for (int hops = 0; hops < 16 && cons_step < 0 && !bad; hops++) {
+            int slot_hits = 0, fs = -1, fl = -1;
+            for (int s = 0; s < (int)steps.size(); s++) {
+                if (s == s2i) continue;
+                for (int l = 0; l < (int)steps[s].in.size(); l++)
+                    if (steps[s].in[l] == cur) {
+                        slot_hits++;
+                        fs = s;
+                        fl = l;
+                    }
+            }
+            int nk = view_kids[cur];
+            if (nk == 1 && slot_hits == 0) {
+                if (first_view < 0) first_view = kids[cur][0];
+                cur = kids[cur][0];
+            } else if (nk == 0 && slot_hits == 1) {
+                cons_step = fs;
+                cons_slot = fl;
+            } else {
+                bad = true;
+            }
+        }
+        if (bad || cons_step < 0) continue;
+        Step& s3 = steps[cons_step];
+        if (s3.k == SK::MATMUL) {
+            s3.out_scale *= scale;
+        } else if (s3.k == SK::GEMM && s3.in.size() == 2) {
+            s3.alpha *= scale;
+        } else {
+            continue;
+        }
+        if (first_view < 0) {
+            s3.in[cons_slot] = vx;
+        } else {
+            vals[first_view].base = vx;
+        }
+        vals[vy].def_step = -2;
+        steps.erase(steps.begin() + s2i);
+        for (auto& v : vals)
+            if (v.def_step > s2i) v.def_step--;
+        return true;
+    }
+    return false;
+}
+
 std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bool fp16_weights) {
     auto plan = std::make_shared<Plan>();
     auto im = std::make_shared<Impl>();
@@ -4012,6 +4174,8 @@ std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bo
         im->out_vals.push_back(id);
     }
     while (fold_one_scalar_mul(*im)) {
+    }
+    while (fold_one_scalar_mul_pre(*im)) {
     }
     // Liveness: last use over steps, then propagate through views
     // (reverse creation order: views are created after their bases, and
