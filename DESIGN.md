@@ -334,3 +334,31 @@ wait predicate; a temporary watchdog build caught the exact
 state). The increment stays inside the mutex; the spin reads are
 lock-free. All four gates reproduce exactly (299/361, 361/361,
 0.959881, 1.000000).
+
+## Genie conv dissection (2026-11-26, midday)
+
+Per-node profile of Genie's vits (steady run, 2,007 nodes, 573 ms
+total): Conv 234 + FusedConv 218 + ConvTranspose 78 = 530 ms of
+conv; 94% of it is the decoder. Same 223 conv calls as our packed
+path; our PCONV was 1,332 ms. The difference is per-call rate, and
+the rate difference is instruction width: this EPYC's AVX-512
+datapath is full-width (single-thread FMA peak measured 176.2
+GMAC/s AVX-512 vs 88.0 AVX2), and ORT's MLAS conv hits 113.5
+GMAC/s per thread on the 192x192 K11 leader shape -- above the
+AVX2 ceiling. (This corrects the morning's read, which generalized
+the GPT stage profile, where the AVX-512 kernel is ~13% of CPU, to
+the whole engine; for vits conv it is the main term.)
+
+Transferred as a runtime-dispatched AVX-512F conv tile tier
+(AVX2 remains the baseline; POTATO_NO_AVX512=1 forces it off).
+First port at 16 positions wide measured 41.9 GMAC/s per thread,
+no better than the AVX2 tile's 40.7 -- four accumulator chains
+cannot hide FMA latency. Widened to 32 positions (eight chains,
+one weight broadcast per two FMAs): 101.4 GMAC/s per thread,
+bit-identical (maxdiff 0). End to end on the EPYC box, interleaved
+A/B medians: total 3,173 -> 2,432 ms (**RTF ~0.76**, range
+0.75-0.84), vits 1,535 -> 938 ms, PCONV 1,332 -> 857 ms. All four
+gates reproduce exactly. Remaining vits gap to Genie (~380 ms of
+node time): production-vs-isolation rate loss, the transposed
+convs, and ~45 ms of elementwise; the kernel-rate remainder is
+MLAS's GEMM panel packing.
