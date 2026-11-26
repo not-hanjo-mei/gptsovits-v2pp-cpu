@@ -4724,7 +4724,13 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
             if (t.data != nullptr) {
                 bool contig = t.contiguous() ||
                               (t.strides.size() == t.shape.size() && t.strides == rowmajor(t.shape));
-                if (!contig) fail("kv: past input not contiguous");
+                if (!contig) {
+                    std::string msg = "kv: past input not contiguous: " + im.in_names[pr.in_idx] + " shape";
+                    for (auto d : t.shape) msg += " " + std::to_string(d);
+                    msg += " strides";
+                    for (auto d : t.strides) msg += " " + std::to_string(d);
+                    fail(msg);
+                }
                 int64_t rows = t.shape.empty() ? 0 : t.shape[0];
                 int64_t rowf = rows > 0 ? t.numel() / rows : 0;
                 if (slot.len < 0 || slot.len != rows) {
