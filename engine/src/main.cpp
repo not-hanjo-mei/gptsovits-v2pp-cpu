@@ -151,8 +151,22 @@ struct FreeHost {
     std::shared_ptr<packed::BlobStore> store;
     std::unique_ptr<FreePool> pool_f, pool_s, pool_v;
     std::shared_ptr<freeeng::Plan> enc, first, stage_a, stage_b, vits;
+    // Streaming (packed path only): split vits plans, compiled
+    // lazily on the first stream request. vits_split marks that the
+    // split graphs belong to this host's vits path.
+    std::shared_ptr<freeeng::Plan> vits_front, vits_dec;
     bool vits_baked = false;
+    bool vits_split = false;
 };
+
+static std::shared_ptr<freeeng::Plan> compile_plan_file(const std::string& path, const char* label) {
+    auto t0 = Clock::now();
+    onnxm::Graph g = onnxm::load_model(path);
+    auto p = freeeng::Plan::compile(g, label);
+    std::cerr << "[load] free plan " << label << " compiled in " << (int)ms_since(t0)
+              << " ms, " << p->step_count() << " steps; rss " << rss_kb() / 1024 << " MB\n";
+    return p;
+}
 
 static void patch_graph_inplace(onnxm::Graph& g, const std::string& root, const std::string& pack_path,
                                 const Json& manifest_sec) {
@@ -518,6 +532,7 @@ int main(int argc, char** argv) {
                 } else {
                     fh.vits = compile(root + "/host/packed_graphs/vits_wnfold.onnx", "vits");
                     fh.vits->set_packed_lookup(fh.pool_v->lookup());
+                    fh.vits_split = true;  // split graphs live next to the packed graph
                 }
             }  // fp32_graphs / packed load paths
         }
@@ -910,23 +925,27 @@ int main(int argc, char** argv) {
                 for (auto tk : gen) { if (tk >= EOS_ID) break; pred.push_back(tk); }
                 if (pred.empty()) throw std::runtime_error("empty semantic sequence");
 
-                // Streaming (free engine): "stream": true splits the
-                // semantic sequence into chunks synthesized one by
-                // one, each appended to reqNNN.pcm (s16le raw vits
-                // output, pre output-chain) as it lands, with one
-                // JSON line per chunk on stdout. A slice of n tokens
-                // yields exactly 1280*n samples (measured), and each
-                // chunk runs with chunk_ctx tokens of context on both
-                // sides whose audio is trimmed off, so the chunks
-                // concatenate seamlessly. The final WAV still goes
-                // through the normal output chain, built from the
-                // concatenated chunk audio.
+                // Streaming (free engine, packed vits only):
+                // "stream": true runs the vits front once for the
+                // latent z, then synthesizes the purely convolutional
+                // decoder (split graphs, tools/split_vits.py) in
+                // chunks of chunk_tokens tokens, each chunk appended
+                // to reqNNN.pcm (s16le raw vits output, pre
+                // output-chain) as it lands, with one JSON line per
+                // chunk on stdout. Slicing the semantic input itself
+                // is unsound (the front aligns text and semantic
+                // globally), but the decoder is exactly local:
+                // chunk_ctx tokens of latent context on both sides
+                // (16 frames at the default) reproduce the one-shot
+                // audio bit-exactly (vits_slice_check). The final WAV
+                // still goes through the normal output chain, built
+                // from the concatenated chunk audio.
                 const Json* stj = r.find("stream");
                 bool want_stream = stj && stj->type == Json::Bool && stj->b;
                 const Json* ctj = r.find("chunk_tokens");
                 int64_t chunk_tokens = ctj ? (int64_t)ctj->as_num(25) : 25;
                 const Json* ccj = r.find("chunk_ctx");
-                int64_t chunk_ctx = ccj ? (int64_t)ccj->as_num(5) : 5;
+                int64_t chunk_ctx = ccj ? (int64_t)ccj->as_num(8) : 8;
                 if (chunk_tokens < 1) chunk_tokens = 25;
                 if (chunk_ctx < 0) chunk_ctx = 0;
                 bool streamed = false;
@@ -948,55 +967,102 @@ int main(int argc, char** argv) {
                 const float* audio = nullptr;
                 size_t n_audio = 0;
                 if (engine_free) {
-                    auto run_vits_range = [&](int64_t a, int64_t b) {
+                    auto make_vits_feed = [&]() {
                         std::map<std::string, freeeng::Tensor> vin;
                         freeeng::Tensor vt; vt.dtype = 7; vt.data = (const uint8_t*)text_ids.data(); vt.shape = {1, L};
                         vin.emplace("text_seq", vt);
-                        freeeng::Tensor vp; vp.dtype = 7; vp.data = (const uint8_t*)(pred.data() + a); vp.shape = {1, 1, b - a};
+                        freeeng::Tensor vp; vp.dtype = 7; vp.data = (const uint8_t*)pred.data(); vp.shape = {1, 1, (int64_t)pred.size()};
                         vin.emplace("pred_semantic", vp);
                         vin.emplace("ge", ft_from_rpk(ref.at("ge")));
                         vin.emplace("ge_advanced", ft_from_rpk(ref.at("ge_advanced")));
-                        auto vout_f = fh.vits->run(vin);
+                        return vin;
+                    };
+                    auto run_vits_full = [&]() {
+                        auto vout_f = fh.vits->run(make_vits_feed());
                         std::vector<float> out = ft_to_vec(vout_f.at("audio"));
                         fh.vits->release_arena();  // audio is copied out; drop the vits peak
                         return out;
                     };
                     const int64_t T = (int64_t)pred.size();
-                    if (want_stream && T > chunk_tokens) {
-                        char pcmname[64];
-                        snprintf(pcmname, 64, "req%03ld.pcm", req_no);
-                        std::string pcmpath = outdir + "/" + pcmname;
-                        std::ofstream pcm(pcmpath, std::ios::binary);
-                        if (!pcm) throw std::runtime_error("cannot open stream file " + pcmpath);
-                        audio_free.reserve((size_t)T * 1280);
-                        std::vector<int16_t> s16;
-                        for (int64_t s = 0; s < T; s += chunk_tokens) {
-                            int64_t e = std::min(T, s + chunk_tokens);
-                            int64_t cs = std::max<int64_t>(0, s - chunk_ctx);
-                            int64_t ce = std::min(T, e + chunk_ctx);
-                            std::vector<float> raw = run_vits_range(cs, ce);
-                            size_t off = (size_t)(s - cs) * 1280;
-                            size_t len = (size_t)(e - s) * 1280;
-                            if (off + len > raw.size()) throw std::runtime_error("vits chunk shorter than 1280/token mapping");
-                            s16.resize(len);
-                            for (size_t i = 0; i < len; i++) {
-                                double v = raw[off + i];
-                                if (v > 1.0) v = 1.0; else if (v < -1.0) v = -1.0;
-                                s16[i] = (int16_t)std::lrint(v * 32767.0);
+                    if (want_stream && fh.vits_split && T > chunk_tokens) {
+                        try {
+                            if (!fh.vits_front) {
+                                fh.vits_front = compile_plan_file(root + "/host/packed_graphs/vits_front.onnx", "vits_front");
+                                fh.vits_front->set_packed_lookup(fh.pool_v->lookup());
+                                fh.vits_dec = compile_plan_file(root + "/host/packed_graphs/vits_dec.onnx", "vits_dec");
+                                fh.vits_dec->set_packed_lookup(fh.pool_v->lookup());
                             }
-                            pcm.write((const char*)s16.data(), (std::streamsize)(len * 2));
-                            pcm.flush();
-                            audio_free.insert(audio_free.end(), raw.begin() + off, raw.begin() + off + len);
-                            n_chunks++;
-                            if (first_audio_ms < 0) first_audio_ms = ms_since(t_req);
-                            std::cout << "{\"chunk\": " << (n_chunks - 1) << ", \"file\": \"" << pcmpath
-                                      << "\", \"samples_total\": " << audio_free.size()
-                                      << ", \"elapsed_ms\": " << (long long)ms_since(t_req) << "}" << std::endl;
+                            const std::string ZN = "/vq_model/Mul_2_output_0";
+                            auto fout = fh.vits_front->run(make_vits_feed());
+                            const freeeng::Tensor& zt = fout.at(ZN);
+                            if (zt.dtype != 1 || zt.shape.size() != 3)
+                                throw std::runtime_error("vits front: unexpected latent shape");
+                            const int64_t C = zt.shape[1], F = zt.shape[2];
+                            std::vector<float> z = ft_to_vec(zt);
+                            fh.vits_front->release_arena();
+                            if (F % T) throw std::runtime_error("vits front: latent frames not a multiple of tokens");
+                            const int64_t fpt = F / T;              // latent frames per token (2)
+                            const int64_t spf = 1280 / fpt;         // samples per latent frame (640)
+                            const int64_t chunk_f = chunk_tokens * fpt;
+                            const int64_t ctx_f = chunk_ctx * fpt;
+                            char pcmname[64];
+                            snprintf(pcmname, 64, "req%03ld.pcm", req_no);
+                            std::string pcmpath = outdir + "/" + pcmname;
+                            std::ofstream pcm(pcmpath, std::ios::binary);
+                            if (!pcm) throw std::runtime_error("cannot open stream file " + pcmpath);
+                            audio_free.reserve((size_t)T * 1280);
+                            std::vector<int16_t> s16;
+                            std::vector<float> zslice;
+                            for (int64_t s = 0; s < F; s += chunk_f) {
+                                int64_t e = std::min(F, s + chunk_f);
+                                int64_t cs = std::max<int64_t>(0, s - ctx_f);
+                                int64_t ce = std::min(F, e + ctx_f);
+                                // z is [1, C, F] channel-major: a frame
+                                // slice is a per-channel row copy.
+                                zslice.assign((size_t)(ce - cs) * C, 0);
+                                for (int64_t c = 0; c < C; c++)
+                                    std::copy(z.begin() + (size_t)c * F + cs, z.begin() + (size_t)c * F + ce,
+                                              zslice.begin() + (size_t)c * (ce - cs));
+                                std::map<std::string, freeeng::Tensor> din;
+                                freeeng::Tensor zv; zv.dtype = 1; zv.data = (const uint8_t*)zslice.data(); zv.shape = {1, C, ce - cs};
+                                din.emplace(ZN, zv);
+                                din.emplace("ge", ft_from_rpk(ref.at("ge")));
+                                auto dout = fh.vits_dec->run(din);
+                                std::vector<float> raw = ft_to_vec(dout.at("audio"));
+                                fh.vits_dec->release_arena();
+                                size_t off = (size_t)(s - cs) * spf;
+                                size_t len = (size_t)(e - s) * spf;
+                                if (raw.size() != (size_t)(ce - cs) * spf)
+                                    throw std::runtime_error("vits dec chunk length off the spf mapping");
+                                s16.resize(len);
+                                for (size_t i = 0; i < len; i++) {
+                                    double v = raw[off + i];
+                                    if (v > 1.0) v = 1.0; else if (v < -1.0) v = -1.0;
+                                    s16[i] = (int16_t)std::lrint(v * 32767.0);
+                                }
+                                pcm.write((const char*)s16.data(), (std::streamsize)(len * 2));
+                                pcm.flush();
+                                audio_free.insert(audio_free.end(), raw.begin() + off, raw.begin() + off + len);
+                                n_chunks++;
+                                if (first_audio_ms < 0) first_audio_ms = ms_since(t_req);
+                                std::cout << "{\"chunk\": " << (n_chunks - 1) << ", \"file\": \"" << pcmpath
+                                          << "\", \"samples_total\": " << audio_free.size()
+                                          << ", \"elapsed_ms\": " << (long long)ms_since(t_req) << "}" << std::endl;
+                            }
+                            streamed = true;
+                        } catch (const std::exception& e) {
+                            notes.push_back(std::string("stream failed, one-shot used: ") + e.what());
+                            audio_free.clear();
+                            n_chunks = 0;
+                            first_audio_ms = -1;
                         }
-                        streamed = true;
-                    } else {
-                        if (want_stream) notes.push_back("stream not used: sequence fits one chunk or engine is not free");
-                        audio_free = run_vits_range(0, T);
+                    }
+                    if (!streamed) {
+                        if (want_stream && !fh.vits_split)
+                            notes.push_back("stream not used: split vits graphs only exist on the packed free path");
+                        else if (want_stream && T <= chunk_tokens)
+                            notes.push_back("stream not used: sequence fits one chunk");
+                        audio_free = run_vits_full();
                     }
                     audio = audio_free.data();
                     n_audio = audio_free.size();

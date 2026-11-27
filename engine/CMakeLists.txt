@@ -93,6 +93,12 @@ add_executable(vits_check_free src/vits_check_free.cpp src/free_engine.cpp src/v
 target_link_libraries(vits_check_free PRIVATE pthread)
 target_include_directories(vits_check_free PRIVATE src)
 
+# Streaming validation: chunked VITS slicing vs one-shot on the
+# noiseless fp32 graph (see src/vits_slice_check.cpp).
+add_executable(vits_slice_check src/vits_slice_check.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
+target_link_libraries(vits_slice_check PRIVATE pthread)
+target_include_directories(vits_slice_check PRIVATE src)
+
 add_executable(test_softclip src/test_softclip.cpp)
 if(NOT POTATO_FREE_ONLY)
   set_target_properties(tf_check PROPERTIES
