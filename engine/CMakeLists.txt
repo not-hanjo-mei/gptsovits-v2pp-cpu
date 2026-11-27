@@ -113,6 +113,10 @@ target_include_directories(graph_check PRIVATE src)
 add_executable(resample_check src/resample_check.cpp)
 target_include_directories(resample_check PRIVATE src)
 
+# WordPiece tokenizer check vs the tokenizers library.
+add_executable(tokenizer_check src/tokenizer_check.cpp)
+target_include_directories(tokenizer_check PRIVATE src)
+
 # Compile-only probe for surveying new graphs (reference
 # extraction models) against the engine's op coverage.
 add_executable(plan_probe src/plan_probe.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
