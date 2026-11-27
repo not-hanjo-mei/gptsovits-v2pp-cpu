@@ -100,6 +100,14 @@ add_executable(hubert_check src/hubert_check.cpp src/free_engine.cpp src/vits_ke
 target_link_libraries(hubert_check PRIVATE pthread)
 target_include_directories(hubert_check PRIVATE src)
 
+add_executable(roberta_check src/roberta_check.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
+target_link_libraries(roberta_check PRIVATE pthread)
+target_include_directories(roberta_check PRIVATE src)
+
+add_executable(graph_check src/graph_check.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
+target_link_libraries(graph_check PRIVATE pthread)
+target_include_directories(graph_check PRIVATE src)
+
 # Compile-only probe for surveying new graphs (reference
 # extraction models) against the engine's op coverage.
 add_executable(plan_probe src/plan_probe.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})

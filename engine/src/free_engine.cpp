@@ -713,7 +713,7 @@ void k_softmax(const RT& X0, RT& Y, int64_t axis, Scratch& sc) {
 
 // Elementwise binary op codes, shared by compiler + kernels.
 enum class BinOp { ADD, SUB, MUL, DIV, POW, MAXIMUM, LESS, GREATER, EQUAL, OR, AND };
-enum class UnOp { NEG, SQRT, SIN, COS, EXP, TANH, SIGMOID, RELU, ABS, LEAKY, ERF };
+enum class UnOp { NEG, SQRT, SIN, COS, EXP, TANH, SIGMOID, RELU, ABS, LEAKY, ERF, GELU, GELUT };
 
 double binop_apply(BinOp op, double a, double b) {
     switch (op) {
@@ -744,6 +744,8 @@ double unop_apply(UnOp op, double a, double alpha = 0.0) {
         case UnOp::ABS: return std::fabs(a);
         case UnOp::LEAKY: return a > 0 ? a : alpha * a;
         case UnOp::ERF: return std::erf(a);
+        case UnOp::GELU: return 0.5 * a * (1.0 + std::erf(a * 0.70710678118654752440));
+        case UnOp::GELUT: return 0.5 * a * (1.0 + std::tanh(0.79788456080286535588 * (a + 0.044715 * a * a * a)));
     }
     return 0;
 }
@@ -876,6 +878,8 @@ float unop_apply_f(UnOp op, float a, double alpha) {
         case UnOp::ABS: return std::fabs(a);
         case UnOp::LEAKY: return a > 0 ? a : (float)(alpha * a);
         case UnOp::ERF: return std::erf(a);
+        case UnOp::GELU: return 0.5f * a * (1.0f + std::erf(a * 0.70710678118654752440f));
+        case UnOp::GELUT: return 0.5f * a * (1.0f + std::tanh(0.79788456080286535588f * (a + 0.044715f * a * a * a)));
     }
     return 0;
 }
@@ -1970,10 +1974,10 @@ void k_expand(const RT& X, RT& Y) {
 // runtime dim symbols. Everything evaluates numerically at bind time;
 // compile time only needs construction, constant folding, and equality.
 struct Expr {
-    enum K { C, S, ADD, SUB, MUL, DIV, SLEN, MAXK, MINK } k = C;
+    enum K { C, S, ADD, SUB, MUL, DIV, SLEN, MAXK, MINK, EQK, ITE } k = C;
     int64_t c = 0;
     int sym = -1;
-    std::shared_ptr<Expr> a, b;
+    std::shared_ptr<Expr> a, b, d;  // ITE: a = cond, b = then, d = else
     int64_t step = 1;  // SLEN: slice length from (a=start, b=end, step, d handled via a/b only)
 };
 using EP = std::shared_ptr<Expr>;
@@ -2001,6 +2005,8 @@ int64_t eeval(const EP& e, const std::vector<int64_t>& sv) {
         case Expr::SLEN: return e->c;  // resolved to a constant at bind-precompute; see compiler note
         case Expr::MAXK: return std::max(eeval(e->a, sv), eeval(e->b, sv));
         case Expr::MINK: return std::min(eeval(e->a, sv), eeval(e->b, sv));
+        case Expr::EQK: return eeval(e->a, sv) == eeval(e->b, sv) ? 1 : 0;
+        case Expr::ITE: return eeval(e->a, sv) != 0 ? eeval(e->b, sv) : eeval(e->d, sv);
     }
     return 0;
 }
@@ -2009,7 +2015,7 @@ bool eseq(const EP& x, const EP& y) {
     if (!x || !y || x->k != y->k) return false;
     if (x->k == Expr::C) return x->c == y->c;
     if (x->k == Expr::S) return x->sym == y->sym;
-    return eseq(x->a, y->a) && eseq(x->b, y->b);
+    return eseq(x->a, y->a) && eseq(x->b, y->b) && eseq(x->d, y->d);
 }
 EP ebin(Expr::K k, const EP& a, const EP& b) {
     int64_t ca, cb;
@@ -2050,6 +2056,27 @@ EP ebin(Expr::K k, const EP& a, const EP& b) {
     e->b = b;
     return e;
 }
+EP eeq(const EP& a, const EP& b) {
+    int64_t ca, cb;
+    if (econst(a, ca) && econst(b, cb)) return ec(ca == cb ? 1 : 0);
+    if (eseq(a, b)) return ec(1);
+    auto e = std::make_shared<Expr>();
+    e->k = Expr::EQK;
+    e->a = a;
+    e->b = b;
+    return e;
+}
+EP eite(const EP& c, const EP& x, const EP& y) {
+    int64_t cc;
+    if (econst(c, cc)) return cc != 0 ? x : y;
+    if (eseq(x, y)) return x;
+    auto e = std::make_shared<Expr>();
+    e->k = Expr::ITE;
+    e->a = c;
+    e->b = x;
+    e->d = y;
+    return e;
+}
 EP eadd(const EP& a, const EP& b) { return ebin(Expr::ADD, a, b); }
 EP esub(const EP& a, const EP& b) { return ebin(Expr::SUB, a, b); }
 EP emul(const EP& a, const EP& b) { return ebin(Expr::MUL, a, b); }
@@ -2067,7 +2094,8 @@ enum class SK { MATMUL, GEMM, PACKED, CONV, LN, SOFTMAX, REDUCESUM, ARGMAX, TOPK
                 // Phase 2 (vits): packed conv family, fp32 ConvTranspose,
                 // Pad, Expand. PCONV also carries PackedConvTranspose
                 // (pc_transpose), PGATHER is PackedGather.
-                PCONV, PGATHER, CONVT, PAD, EXPAND, ATTN, INSTNORM };
+                PCONV, PGATHER, CONVT, PAD, EXPAND, ATTN, INSTNORM,
+                SEQ_EMPTY, SEQ_SPLIT, SEQ_AT, SEQ_INSERT, SEQ_CONCAT, LOOP };
 struct Step {
     SK k = SK::COPY;
     std::vector<int> in, out;
@@ -2105,6 +2133,15 @@ struct Step {
     int kv_slot = -1;         // CONCAT: stateful KV pair index, or -1
     onnxm::Tensor fill;
     int out_dtype = 0;
+    bool keep = false;        // fusion/DCE passes must not rewrite or erase
+    int uid = -1;             // stable id across pass rewrites (add_step)
+    // LOOP: body step range by uid (fixed up to indices after the
+    // passes), body input slot value ids [iter, cond, carried...],
+    // body output value ids [cond_out, carried_out...], and the
+    // value-id range the body compilation created.
+    int lp_u0 = -1, lp_u1 = -1, lp_b0 = -1, lp_b1 = -1;
+    std::vector<int> lp_slots, lp_body_outs;
+    int lp_v0 = -1, lp_v1 = -1;
 };
 
 struct Value {
@@ -2115,6 +2152,9 @@ struct Value {
     std::vector<EP> selems;              // SYMVAL
     int dtype = 0;                       // RT
     std::vector<EP> rshape;              // RT
+    bool is_seq = false;                 // RT: a sequence of tensors (bseqs at run)
+    bool dyn = false;                    // RT: shape/buffer resolved at execution
+    std::vector<EP> eshape;              // is_seq: element shape exprs
     int view_kind = 0;                   // RT: 0 materialized/input, 1 transpose, 2 reshape,
                                          // 3 unsqueeze, 4 squeeze, 5 slice, 6 identity
     int base = -1;
@@ -2160,6 +2200,36 @@ struct Impl {
     std::vector<RT> bsin, bsout;
     Scratch bsc;
     PackedLookup lookup;
+    int next_uid = 0;
+    // Sequence values at run time, parallel to bres.
+    std::vector<std::vector<RT>> bseqs;
+    // Execution-allocated buffers for dyn values (loop-carried and
+    // data-shaped outputs). Chunked like Scratch so pointers never
+    // move; reset at the start of each run. Buffers handed to an
+    // accumulator sequence must outlive later iterations, so this
+    // arena is append-only within a run.
+    std::vector<std::vector<uint8_t>> dyn_blocks;
+    size_t dyn_bi = 0, dyn_top = 0;
+    uint8_t* dyn_alloc(size_t bytes) {
+        if (dyn_blocks.empty()) dyn_blocks.emplace_back(1 << 20);
+        size_t at = (dyn_top + 63) & ~(size_t)63;
+        if (at + bytes > dyn_blocks[dyn_bi].size()) {
+            size_t want = std::max<size_t>(bytes + 4096, 1 << 20);
+            if (dyn_bi + 1 < dyn_blocks.size() && dyn_blocks[dyn_bi + 1].size() >= want) {
+                dyn_bi++;
+            } else if (dyn_bi + 1 < dyn_blocks.size()) {
+                dyn_blocks[dyn_bi + 1].resize(want);
+                dyn_bi++;
+            } else {
+                dyn_blocks.emplace_back(want);
+                dyn_bi = dyn_blocks.size() - 1;
+            }
+            at = 0;
+        }
+        dyn_top = at + bytes;
+        return dyn_blocks[dyn_bi].data() + at;
+    }
+    void dyn_reset() { dyn_bi = 0; dyn_top = 0; }
     // fp16 weight storage (M2): converted copies of initializer
     // tensors used as MatMul/Gemm B operands, deduped by value id.
     bool want_f16 = false;
@@ -2390,6 +2460,49 @@ RT tensor_of_const(const onnxm::Tensor& t) {
 }
 
 // ---------------------------------------------------------- compiler ---
+// fp16-stored graphs (Genie's RoBERTa export keeps every weight
+// fp16 with fp32 compute, the same distribution trick as its
+// HuBERT bin): decode fp16 constant tensors to fp32 when they
+// enter the compiler, so every kernel sees the fp32 layout it
+// already handles. Exact conversion (round-to-nearest values in
+// fp16 are all representable in fp32).
+static float f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t exp = (h >> 10) & 0x1f;
+    uint32_t mant = h & 0x3ff;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            int e = 1;
+            while (!(mant & 0x400)) { mant <<= 1; e--; }
+            mant &= 0x3ff;
+            bits = sign | ((uint32_t)(e + 112) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | (0xffu << 23) | (mant << 13);
+    } else {
+        bits = sign | ((exp + 112) << 23) | (mant << 13);
+    }
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+static onnxm::Tensor decode_f16_const(onnxm::Tensor t) {
+    if (t.data_type != 10) return t;
+    onnxm::Tensor r;
+    r.data_type = 1;
+    r.dims = t.dims;
+    int64_t n = t.numel();
+    r.data.resize((size_t)n * 4);
+    const uint16_t* h = (const uint16_t*)t.data.data();
+    float* f = (float*)r.data.data();
+    for (int64_t i = 0; i < n; i++) f[i] = f16_to_f32(h[i]);
+    return r;
+}
+
 struct Compiler {
     Impl& im;
     const onnxm::Graph& g;
@@ -2415,7 +2528,7 @@ struct Compiler {
     int new_const(onnxm::Tensor t) {
         Value v;
         v.kind = Value::CONSTV;
-        v.ct = std::move(t);
+        v.ct = decode_f16_const(std::move(t));
         im.vals.push_back(std::move(v));
         return (int)im.vals.size() - 1;
     }
@@ -2423,6 +2536,7 @@ struct Compiler {
         int idx = (int)im.steps.size();
         for (int o : outs) im.vals[o].def_step = idx;
         st.out = outs;
+        st.uid = im.next_uid++;
         im.steps.push_back(std::move(st));
     }
     bool all_const(const std::vector<int>& ins) const {
@@ -2472,6 +2586,94 @@ std::vector<int> fold_node(Compiler& C, const onnxm::Node& n, const std::vector<
 }
 
 // Symbolic structural ops on SYMVAL element lists (small int tensors).
+// Broadcast two concrete shapes (numpy rules); false if they
+// cannot broadcast.
+static bool sym_bcast_shape(const std::vector<int64_t>& a, const std::vector<int64_t>& b,
+                            std::vector<int64_t>& so) {
+    size_t r = std::max(a.size(), b.size());
+    so.assign(r, 1);
+    for (size_t i = 0; i < r; i++) {
+        int64_t da = i < r - a.size() ? 1 : a[i - (r - a.size())];
+        int64_t db = i < r - b.size() ? 1 : b[i - (r - b.size())];
+        if (da == db) so[i] = da;
+        else if (da == 1) so[i] = db;
+        else if (db == 1) so[i] = da;
+        else return false;
+    }
+    return true;
+}
+
+// Expand a symbolic element list from shape s to the (already
+// broadcast-compatible) concrete target shape so.
+static void sym_align(const std::vector<EP>& e, const std::vector<int64_t>& s,
+                      const std::vector<int64_t>& so, std::vector<EP>& out) {
+    int64_t n = numel_of(so);
+    out.assign((size_t)n, ec(0));
+    int r = (int)so.size();
+    std::vector<int64_t> coord(r, 0);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t off = 0, stride = 1;
+        for (int d = (int)s.size() - 1; d >= 0; d--) {
+            int64_t c = s[d] == 1 ? 0 : coord[d + (r - (int)s.size())];
+            off += c * stride;
+            stride *= s[d];
+        }
+        out[(size_t)i] = e[(size_t)off];
+        for (int d = r - 1; d >= 0; d--) {
+            if (++coord[d] < so[d]) break;
+            coord[d] = 0;
+        }
+    }
+}
+
+static std::vector<int64_t> sym_shape_of(Impl& im, int vid) {
+    Value& v = im.vals[vid];
+    return v.kind == Value::SYMVAL ? v.sshape : v.ct.dims;
+}
+
+// Symbolic Equal over sym-or-const operands (RoBERTa's reshape
+// spec resolution compares a shape vector against a constant).
+int sym_equal(Impl& im, int va, int vb) {
+    std::vector<EP> ea, eb;
+    if (!value_sym_elems(im, va, ea) || !value_sym_elems(im, vb, eb)) return -1;
+    std::vector<int64_t> so;
+    if (!sym_bcast_shape(sym_shape_of(im, va), sym_shape_of(im, vb), so)) return -1;
+    std::vector<EP> aa, ab;
+    sym_align(ea, sym_shape_of(im, va), so, aa);
+    sym_align(eb, sym_shape_of(im, vb), so, ab);
+    Value v;
+    v.kind = Value::SYMVAL;
+    v.sshape = so;
+    v.sdt = 9;
+    for (size_t i = 0; i < aa.size(); i++) v.selems.push_back(eeq(aa[i], ab[i]));
+    im.vals.push_back(std::move(v));
+    return (int)im.vals.size() - 1;
+}
+
+// Symbolic Where over sym-or-const operands: elements become
+// ITE expressions, evaluated at bind like every other EP.
+int sym_where(Impl& im, int vc, int vx, int vy) {
+    std::vector<EP> ec_, ex, ey;
+    if (!value_sym_elems(im, vc, ec_) || !value_sym_elems(im, vx, ex) ||
+        !value_sym_elems(im, vy, ey))
+        return -1;
+    std::vector<int64_t> s1, so;
+    if (!sym_bcast_shape(sym_shape_of(im, vc), sym_shape_of(im, vx), s1)) return -1;
+    if (!sym_bcast_shape(s1, sym_shape_of(im, vy), so)) return -1;
+    std::vector<EP> ac, ax, ay;
+    sym_align(ec_, sym_shape_of(im, vc), so, ac);
+    sym_align(ex, sym_shape_of(im, vx), so, ax);
+    sym_align(ey, sym_shape_of(im, vy), so, ay);
+    Value& X = im.vals[vx];
+    Value v;
+    v.kind = Value::SYMVAL;
+    v.sshape = so;
+    v.sdt = X.kind == Value::SYMVAL ? X.sdt : X.ct.data_type;
+    for (size_t i = 0; i < ac.size(); i++) v.selems.push_back(eite(ac[i], ax[i], ay[i]));
+    im.vals.push_back(std::move(v));
+    return (int)im.vals.size() - 1;
+}
+
 int sym_structural(Compiler& C, const onnxm::Node& n, const std::vector<int>& ins) {
     Impl& im = C.im;
     const std::string& op = n.op;
@@ -2756,6 +2958,96 @@ void mark_b_f16(Compiler& C, Step& st) {
     st.b_f16_src = (const float*)ct.data.data();
 }
 
+void lower_node(Compiler& C, const onnxm::Node& n);
+
+// Loop lowering: the body compiles into the same Impl, appended
+// after the values/steps that exist so far. Body inputs become
+// fresh slot values ([iter, cond, carried...]); outer names stay
+// visible as captures through the shared by_name map, which is
+// snapshot-restored afterwards so body-local names do not leak.
+// The LOOP step records the body step range by uid (pass rewrites
+// shift indices; a fixup after the passes resolves uids back to
+// indices) and the body value range (bind skips its views; the
+// runner resolves them per iteration). Scan outputs (body
+// outputs beyond cond + carried) are not supported.
+void lower_loop(Compiler& C, const onnxm::Node& n, const std::vector<int>& ins) {
+    Impl& im = C.im;
+    auto* body_attr = n.attr("body");
+    if (!body_attr || !body_attr->g) fail("Loop (" + n.name + "): no body graph");
+    const onnxm::Graph& body = *body_attr->g;
+    if (ins.size() < 2) fail("Loop (" + n.name + "): fewer than 2 inputs");
+    int ncarried = (int)ins.size() - 2;
+    if ((int)body.inputs.size() != ncarried + 2)
+        fail("Loop (" + n.name + "): body input count mismatch");
+    auto saved_names = im.by_name;
+    Compiler BC(im, body, C.label + ":loop");
+    int v_begin = (int)im.vals.size();
+    for (auto& t : body.initializers) {
+        Value v;
+        v.kind = Value::CONSTV;
+        v.ct = decode_f16_const(t);
+        im.vals.push_back(std::move(v));
+        BC.reg(t.name, (int)im.vals.size() - 1);
+    }
+    std::vector<int> slots;
+    for (size_t i = 0; i < body.inputs.size(); i++) {
+        Value v;
+        v.kind = Value::RT;
+        if (i == 0) v.dtype = 7;       // iteration count (i64 scalar)
+        else if (i == 1) v.dtype = 9;  // condition (bool scalar)
+        else {
+            int src = ins[i];
+            if (src < 0) fail("Loop (" + n.name + "): carried input omitted");
+            const Value& sv = im.vals[src];
+            v.dtype = sv.dtype;
+            v.is_seq = sv.is_seq;
+            v.eshape = sv.eshape;
+            v.rshape = sv.rshape;
+            v.dyn = sv.dyn;
+        }
+        im.vals.push_back(std::move(v));
+        slots.push_back((int)im.vals.size() - 1);
+        BC.reg(body.inputs[i].name, slots.back());
+    }
+    int u_begin = im.next_uid;
+    for (auto& bn : body.nodes) lower_node(BC, bn);
+    std::vector<int> body_outs;
+    for (auto& vo : body.outputs) body_outs.push_back(BC.vid(vo.name));
+    if ((int)body_outs.size() < 1 + ncarried)
+        fail("Loop (" + n.name + "): body outputs fewer than cond + carried");
+    if ((int)body_outs.size() > 1 + ncarried)
+        fail("Loop (" + n.name + "): scan outputs not supported");
+    int v_end = (int)im.vals.size();
+    std::vector<int> outs;
+    for (int j = 0; j < ncarried; j++) {
+        const Value& bv = im.vals[body_outs[1 + j]];
+        Value v;
+        v.kind = Value::RT;
+        v.dtype = bv.dtype;
+        v.is_seq = bv.is_seq;
+        v.eshape = bv.eshape;
+        v.rshape = bv.rshape;
+        v.dyn = bv.dyn;
+        im.vals.push_back(std::move(v));
+        outs.push_back((int)im.vals.size() - 1);
+    }
+    Step st;
+    st.k = SK::LOOP;
+    st.keep = true;
+    st.in = ins;
+    st.lp_u0 = u_begin;
+    st.lp_u1 = im.next_uid;
+    st.lp_slots = slots;
+    st.lp_body_outs = body_outs;
+    st.lp_v0 = v_begin;
+    st.lp_v1 = v_end;
+    C.add_step(st, outs);
+    for (auto& s : im.steps)
+        if (s.uid >= st.lp_u0 && s.uid < st.lp_u1) s.keep = true;
+    im.by_name = saved_names;
+    for (size_t i = 0; i < outs.size(); i++) C.reg(n.outputs[i], outs[i]);
+}
+
 void lower_node(Compiler& C, const onnxm::Node& n) {
     Impl& im = C.im;
     const std::string& op = n.op;
@@ -2918,6 +3210,13 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
                 return;
             }
         }
+        if (op == "Equal" && C.all_sym_or_const(ins)) {
+            int r = sym_equal(im, ins[0], ins[1]);
+            if (r >= 0) {
+                reg_out(0, maybe_const_collapse(im, r));
+                return;
+            }
+        }
         auto os = broadcast_shape(shape_exprs(im, im.vals[ins[0]]), shape_exprs(im, im.vals[ins[1]]));
         int odt = cmp ? 9 : promoted_dtype(dtype_of(im, ins[0]), dtype_of(im, ins[1]));
         Step st;
@@ -2952,6 +3251,25 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
         st.k = SK::UNOP;
         st.uop = unops.at(op);
         if (op == "LeakyRelu") st.alpha = n.attr_f("alpha", 0.01f);
+        st.in = ins;
+        auto os = shape_exprs(im, im.vals[ins[0]]);
+        int odt = dtype_of(im, ins[0]);
+        if (C.all_const(ins)) {
+            auto outs = fold_node(C, n, ins, st, {{odt, os}}, {});
+            reg_out(0, outs[0]);
+            return;
+        }
+        int o = C.new_rt(odt, os);
+        C.add_step(st, {o});
+        reg_out(0, o);
+        return;
+    }
+    if (op == "Gelu") {
+        Step st;
+        st.k = SK::UNOP;
+        std::string approx = "none";
+        if (auto* at = n.attr("approximate")) approx = at->s;
+        st.uop = approx == "tanh" ? UnOp::GELUT : UnOp::GELU;
         st.in = ins;
         auto os = shape_exprs(im, im.vals[ins[0]]);
         int odt = dtype_of(im, ins[0]);
@@ -3500,6 +3818,13 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
 
     // ---- Where ----
     if (op == "Where") {
+        if (C.all_sym_or_const(ins)) {
+            int r = sym_where(im, ins[0], ins[1], ins[2]);
+            if (r >= 0) {
+                reg_out(0, maybe_const_collapse(im, r));
+                return;
+            }
+        }
         auto os = broadcast_shape(shape_exprs(im, im.vals[ins[1]]), shape_exprs(im, im.vals[ins[2]]));
         os = broadcast_shape(shape_exprs(im, im.vals[ins[0]]), os);
         Step st;
@@ -3732,7 +4057,16 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
             if (step > 0) os[ax] = ediv(eadd(esub(eE, sE), ec(step - 1)), ec(step));
             else os[ax] = ediv(eadd(esub(sE, eE), ec(-step - 1)), ec(-step));
         }
-        if (im.vals[ins[0]].kind == Value::CONSTV) {
+        // A const base with all-const bounds folds at compile time.
+        // A const base with a symbolic bound (RoBERTa slices a
+        // constant by a runtime length) falls through to the view
+        // path: consts are materialized as RTs at bind, so the
+        // view resolves against the const buffer like any base.
+        bool bounds_const = true;
+        for (auto& e : sev) { int64_t c; if (!econst(e, c)) bounds_const = false; }
+        for (auto& e : eev) { int64_t c; if (!econst(e, c)) bounds_const = false; }
+        for (auto& e : pev) { int64_t c; if (!econst(e, c)) bounds_const = false; }
+        if (im.vals[ins[0]].kind == Value::CONSTV && bounds_const) {
             // Materialize via a view resolution on the const buffer.
             RT base = tensor_of_const(im.vals[ins[0]].ct);
             std::vector<int64_t> s_ints, e_ints, p_ints(axes.size(), 1);
@@ -3883,7 +4217,38 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
     // ---- Expand (phase 2): broadcast copy to the target shape ----
     if (op == "Expand") {
         std::vector<EP> target;
-        if (!value_sym_elems(im, ins[1], target)) fail_op("Expand target not symbolic/const");
+        if (!value_sym_elems(im, ins[1], target)) {
+            // Runtime target (a Loop body computing its expand
+            // shape from a SequenceAt value): the output is dyn;
+            // its rank is the target tensor's static numel, and
+            // exec sizes the buffer from the target's values.
+            const Value& tv = im.vals[ins[1]];
+            int64_t rank = 1;
+            bool ok = tv.kind == Value::RT;
+            if (ok)
+                for (auto& e : tv.rshape) {
+                    int64_t c;
+                    if (!econst(e, c)) { ok = false; break; }
+                    rank *= c;
+                }
+            if (!ok) fail_op("Expand target not symbolic/const");
+            Value v;
+            v.kind = Value::RT;
+            v.dtype = dtype_of(im, ins[0]);
+            v.dyn = true;
+            for (int64_t i = 0; i < rank; i++) {
+                v.rshape.push_back(esym(im.nsyms++));
+                im.sym_origin.push_back({-1, -1});
+            }
+            im.vals.push_back(std::move(v));
+            int o = (int)im.vals.size() - 1;
+            Step st;
+            st.k = SK::EXPAND;
+            st.in = {ins[0], ins[1]};
+            C.add_step(st, {o});
+            reg_out(0, o);
+            return;
+        }
         auto os = broadcast_shape(shape_exprs(im, im.vals[ins[0]]), target);
         Step st;
         st.k = SK::EXPAND;
@@ -3897,6 +4262,135 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
         int o = C.new_rt(odt, os);
         C.add_step(st, {o});
         reg_out(0, o);
+        return;
+    }
+
+    // ---- sequences and Loop (runtime reference extraction) ----
+    if (op == "SequenceEmpty") {
+        Value v;
+        v.kind = Value::RT;
+        v.is_seq = true;
+        v.dtype = (int)n.attr_i("dtype", 1);
+        im.vals.push_back(std::move(v));
+        int o = (int)im.vals.size() - 1;
+        Step st;
+        st.k = SK::SEQ_EMPTY;
+        C.add_step(st, {o});
+        reg_out(0, o);
+        return;
+    }
+    if (op == "SplitToSequence") {
+        if (ins.size() < 2 || ins[1] < 0) fail_op("SplitToSequence without split input");
+        auto is = shape_exprs(im, im.vals[ins[0]]);
+        int64_t ax = norm_axis(n.attr_i("axis", 0), (int64_t)is.size());
+        bool keepdims = n.attr_i("keepdims", 1) != 0;
+        Value v;
+        v.kind = Value::RT;
+        v.is_seq = true;
+        v.dtype = dtype_of(im, ins[0]);
+        v.eshape = is;
+        // Splits built by a ConstantOfShape of 1s (the
+        // split-into-singles idiom in the BERT tail and the SV
+        // frame batching) give every element an exact axis length
+        // of 1, keeping downstream shapes static. Any other split
+        // source leaves the axis dim a placeholder that evaluates
+        // to 0; tensors read back out are dyn and get their true
+        // shapes at execution.
+        bool ones = false;
+        {
+            auto elem0 = [](const onnxm::Tensor& t) {
+                double d = 0;
+                if (t.data_type == 7) { int64_t x; memcpy(&x, t.data.data(), 8); d = (double)x; }
+                else if (t.data_type == 6) { int32_t x; memcpy(&x, t.data.data(), 4); d = (double)x; }
+                else if (t.data_type == 1) { float x; memcpy(&x, t.data.data(), 4); d = (double)x; }
+                else if (t.data_type == 11) { memcpy(&d, t.data.data(), 8); }
+                return d;
+            };
+            const Value& sv = im.vals[ins[1]];
+            if (sv.kind == Value::CONSTV && sv.ct.numel() > 0) {
+                ones = true;
+                for (int64_t i = 0; i < sv.ct.numel(); i++) {
+                    onnxm::Tensor one;
+                    one.data_type = sv.ct.data_type;
+                    one.data.assign(sv.ct.data.begin() + i * (int64_t)onnxm::elem_size(sv.ct.data_type),
+                                    sv.ct.data.begin() + (i + 1) * (int64_t)onnxm::elem_size(sv.ct.data_type));
+                    if (elem0(one) != 1.0) { ones = false; break; }
+                }
+            } else if (sv.kind == Value::RT && sv.def_step >= 0) {
+                const Step& ds = im.steps[sv.def_step];
+                if (ds.k == SK::CONSTSHAPE && ds.fill.numel() == 1 && elem0(ds.fill) == 1.0) ones = true;
+            }
+        }
+        if (ones) v.eshape[ax] = ec(1);
+        else {
+            v.eshape[ax] = esym(im.nsyms++);
+            im.sym_origin.push_back({-1, -1});
+        }
+        if (!keepdims) v.eshape.erase(v.eshape.begin() + ax);
+        im.vals.push_back(std::move(v));
+        int o = (int)im.vals.size() - 1;
+        Step st;
+        st.k = SK::SEQ_SPLIT;
+        st.axis = ax;
+        st.in = ins;
+        C.add_step(st, {o});
+        reg_out(0, o);
+        return;
+    }
+    if (op == "SequenceAt") {
+        Value& S = im.vals[ins[0]];
+        if (!S.is_seq) fail_op("SequenceAt on a non-sequence");
+        Value v;
+        v.kind = Value::RT;
+        v.dtype = S.dtype;
+        v.dyn = true;
+        v.rshape = S.eshape;
+        im.vals.push_back(std::move(v));
+        int o = (int)im.vals.size() - 1;
+        Step st;
+        st.k = SK::SEQ_AT;
+        st.in = ins;
+        C.add_step(st, {o});
+        reg_out(0, o);
+        return;
+    }
+    if (op == "SequenceInsert") {
+        Value& S = im.vals[ins[0]];
+        if (!S.is_seq) fail_op("SequenceInsert on a non-sequence");
+        Value v;
+        v.kind = Value::RT;
+        v.is_seq = true;
+        v.dtype = S.dtype;
+        v.eshape = shape_exprs(im, im.vals[ins[1]]);
+        im.vals.push_back(std::move(v));
+        int o = (int)im.vals.size() - 1;
+        Step st;
+        st.k = SK::SEQ_INSERT;
+        st.in = ins;
+        C.add_step(st, {o});
+        reg_out(0, o);
+        return;
+    }
+    if (op == "ConcatFromSequence") {
+        Value& S = im.vals[ins[0]];
+        if (!S.is_seq) fail_op("ConcatFromSequence on a non-sequence");
+        Value v;
+        v.kind = Value::RT;
+        v.dtype = S.dtype;
+        v.dyn = true;
+        v.rshape = S.eshape;
+        im.vals.push_back(std::move(v));
+        int o = (int)im.vals.size() - 1;
+        Step st;
+        st.k = SK::SEQ_CONCAT;
+        st.axis = n.attr_i("axis", 0);
+        st.in = ins;
+        C.add_step(st, {o});
+        reg_out(0, o);
+        return;
+    }
+    if (op == "Loop") {
+        lower_loop(C, n, ins);
         return;
     }
 
@@ -4057,7 +4551,112 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
             k_pad(ins[0], outs[0], pads, st.pad_mode, fillv);
             break;
         }
-        case SK::EXPAND: k_expand(ins[0], outs[0]); break;
+        case SK::SEQ_EMPTY: im.bseqs[st.out[0]].clear(); break;
+        case SK::SEQ_SPLIT: {
+            const RT& X = ins[0];
+            const RT& sp = ins[1];
+            std::vector<int64_t> splits;
+            for (int64_t i = 0; i < sp.numel(); i++) {
+                int64_t v = 0;
+                if (sp.dtype == 7) memcpy(&v, sp.p + i * 8, 8);
+                else if (sp.dtype == 6) { int32_t x; memcpy(&x, sp.p + i * 4, 4); v = x; }
+                else v = (int64_t)read_d(sp, i);
+                splits.push_back(v);
+            }
+            int64_t ax = norm_axis(st.axis, (int64_t)X.shape.size());
+            auto& seq = im.bseqs[st.out[0]];
+            seq.clear();
+            int64_t cum = 0;
+            for (int64_t s : splits) {
+                RT e = X;
+                e.shape[ax] = s;
+                e.p = X.p + cum * X.strides[ax] * (int64_t)onnxm::elem_size(X.dtype);
+                seq.push_back(e);
+                cum += s;
+            }
+            break;
+        }
+        case SK::SEQ_AT: {
+            const RT& ix = ins[1];
+            int64_t idx = 0;
+            if (ix.dtype == 7) memcpy(&idx, ix.p, 8);
+            else if (ix.dtype == 6) { int32_t x; memcpy(&x, ix.p, 4); idx = x; }
+            else idx = (int64_t)read_d(ix, 0);
+            const auto& seq = im.bseqs[st.in[0]];
+            if (idx < 0) idx += (int64_t)seq.size();
+            if (idx < 0 || idx >= (int64_t)seq.size()) fail("SequenceAt: index out of range");
+            outs[0] = seq[(size_t)idx];
+            break;
+        }
+        case SK::SEQ_INSERT: {
+            im.bseqs[st.out[0]] = im.bseqs[st.in[0]];
+            im.bseqs[st.out[0]].push_back(ins[1]);
+            break;
+        }
+        case SK::SEQ_CONCAT: {
+            const auto& seq = im.bseqs[st.in[0]];
+            RT Y;
+            // outs[0] is the unbound placeholder for a dyn value
+            // (dtype 0, no buffer); the true dtype lives on the
+            // value / the sequence elements.
+            Y.dtype = seq.empty() ? im.vals[st.out[0]].dtype : seq[0].dtype;
+            if (seq.empty()) {
+                Y.shape = outs[0].shape;
+                if (!Y.shape.empty()) Y.shape[norm_axis(st.axis, (int64_t)Y.shape.size())] = 0;
+                Y.strides = rowmajor(Y.shape);
+                Y.p = im.dyn_alloc(0);
+                outs[0] = Y;
+                break;
+            }
+            int64_t ax = norm_axis(st.axis, (int64_t)seq[0].shape.size());
+            Y.shape = seq[0].shape;
+            int64_t total = 0;
+            for (auto& e : seq) total += e.shape[ax];
+            Y.shape[ax] = total;
+            Y.strides = rowmajor(Y.shape);
+            Y.p = im.dyn_alloc((size_t)Y.numel() * onnxm::elem_size(Y.dtype));
+            int64_t cum = 0;
+            for (auto& e : seq) {
+                RT sub = Y;
+                sub.shape = e.shape;
+                sub.p = Y.p + cum * Y.strides[ax] * (int64_t)onnxm::elem_size(Y.dtype);
+                copy_tensor(sub, e);
+                cum += e.shape[ax];
+            }
+            outs[0] = Y;
+            break;
+        }
+        case SK::EXPAND: {
+            if (im.vals[st.out[0]].dyn) {
+                // Dyn output (loop body): the target shape is a
+                // runtime tensor; size a fresh buffer from it on
+                // every execution (the descriptor written back by
+                // the previous iteration must not suppress this).
+                const RT& tp = ins[1];
+                std::vector<int64_t> tgt;
+                for (int64_t i = 0; i < tp.numel(); i++) {
+                    int64_t v = 0;
+                    if (tp.dtype == 7) memcpy(&v, tp.p + i * 8, 8);
+                    else if (tp.dtype == 6) { int32_t x; memcpy(&x, tp.p + i * 4, 4); v = x; }
+                    else v = (int64_t)read_d(tp, i);
+                    tgt.push_back(v);
+                }
+                const RT& X = ins[0];
+                std::vector<int64_t> os = tgt;
+                for (size_t i = 0; i < os.size(); i++) {
+                    if (os[i] < 0) {
+                        int64_t sd = (int64_t)i - ((int64_t)os.size() - (int64_t)X.shape.size());
+                        os[i] = sd >= 0 ? X.shape[sd] : 1;
+                    }
+                }
+                outs[0].shape = os;
+                outs[0].strides = rowmajor(os);
+                outs[0].dtype = X.dtype;
+                outs[0].p = im.dyn_alloc((size_t)outs[0].numel() * onnxm::elem_size(outs[0].dtype));
+            }
+            k_expand(ins[0], outs[0]);
+            break;
+        }
         case SK::LN: k_layernorm(ins[0], ins.size() > 1 ? &ins[1] : nullptr, ins.size() > 2 ? &ins[2] : nullptr, outs[0], st.axis, st.eps, sc); break;
         case SK::INSTNORM: k_instancenorm(ins[0], ins.size() > 1 ? &ins[1] : nullptr, ins.size() > 2 ? &ins[2] : nullptr, outs[0], st.eps, sc); break;
         case SK::SOFTMAX: k_softmax(ins[0], outs[0], st.axis, sc); break;
@@ -4169,6 +4768,7 @@ static bool fold_one_scalar_mul(Impl& im) {
     for (int v : im.out_vals) uses[v]++;
     for (int s2i = 0; s2i < (int)steps.size(); s2i++) {
         Step& s2 = steps[s2i];
+        if (s2.keep) continue;
         if (s2.k != SK::BINOP || s2.bop != BinOp::MUL || s2.in.size() != 2 ||
             s2.out.size() != 1)
             continue;
@@ -4356,6 +4956,7 @@ static bool fold_one_scalar_mul_pre(Impl& im) {
     }
     for (int s2i = 0; s2i < (int)steps.size(); s2i++) {
         Step& s2 = steps[s2i];
+        if (s2.keep) continue;
         if (s2.k != SK::BINOP || s2.bop != BinOp::MUL || s2.in.size() != 2 ||
             s2.out.size() != 1)
             continue;
@@ -4447,6 +5048,7 @@ static bool fuse_one_leaky(Impl& im) {
     }
     for (size_t ui = 0; ui < steps.size(); ui++) {
         Step& u = steps[ui];
+        if (u.keep) continue;
         if (u.k != SK::UNOP || u.uop != UnOp::LEAKY || u.in.size() != 1 || u.out.size() != 1) continue;
         int vx = u.in[0], vy = u.out[0];
         if (vals[vx].kind != Value::RT || vals[vx].view_kind != 0 || vals[vx].is_output) continue;
@@ -4454,6 +5056,7 @@ static bool fuse_one_leaky(Impl& im) {
         int pi = vals[vx].def_step;
         if (pi < 0 || pi >= (int)steps.size()) continue;
         Step& p = steps[pi];
+        if (p.keep) continue;
         if (p.out.size() != 1 || p.out[0] != vx || p.epi_act != 0) continue;
         bool ok = p.k == SK::PCONV || p.k == SK::CONV || p.k == SK::CONVT ||
                   (p.k == SK::BINOP && p.bop == BinOp::ADD);
@@ -4514,6 +5117,7 @@ static void dce_pure_steps(Impl& im) {
                 used[vals[i].base] = 1;
         for (int s = (int)steps.size() - 1; s >= 0; s--) {
             Step& st = steps[s];
+            if (st.keep) continue;
             if (!pure(st.k)) continue;
             bool dead = true;
             for (int v : st.out)
@@ -4567,7 +5171,7 @@ std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bo
     for (auto& t : g.initializers) {
         Value v;
         v.kind = Value::CONSTV;
-        v.ct = t;
+        v.ct = decode_f16_const(t);
         im->vals.push_back(std::move(v));
         C.reg(t.name, (int)im->vals.size() - 1);
     }
@@ -4622,6 +5226,31 @@ std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bo
     while (fuse_one_attn(*im)) {
     }
     dce_pure_steps(*im);
+    // Dyn propagation: a view of a dyn base is itself dyn (its
+    // bind-time shape/buffer cannot be trusted; the loop runner
+    // resolves it per iteration).
+    for (auto& v : im->vals)
+        if (v.kind == Value::RT && v.view_kind != 0 && v.base >= 0 && im->vals[v.base].dyn)
+            v.dyn = true;
+    // Resolve LOOP body ranges from uids to step indices (the
+    // passes above may have erased or rewritten steps around the
+    // bodies; body steps are keep-flagged and survive).
+    {
+        std::map<int, int> by_uid;
+        for (int i = 0; i < (int)im->steps.size(); i++) by_uid[im->steps[i].uid] = i;
+        for (auto& s : im->steps) {
+            if (s.k != SK::LOOP) continue;
+            if (s.lp_u0 == s.lp_u1) {
+                auto it = by_uid.find(s.uid);
+                s.lp_b0 = s.lp_b1 = it == by_uid.end() ? 0 : it->second;
+                continue;
+            }
+            auto a = by_uid.find(s.lp_u0), b = by_uid.find(s.lp_u1 - 1);
+            if (a == by_uid.end() || b == by_uid.end()) fail("loop body steps lost in passes");
+            s.lp_b0 = a->second;
+            s.lp_b1 = b->second + 1;
+        }
+    }
     detect_kv_pairs(*im);
     // Liveness: last use over steps, then propagate through views
     // (reverse creation order: views are created after their bases, and
@@ -4635,6 +5264,15 @@ std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bo
         Value& v = im->vals[i];
         if (v.kind == Value::RT && v.view_kind != 0 && v.base >= 0)
             im->vals[v.base].last_use = std::max(im->vals[v.base].last_use, v.last_use);
+    }
+    // Loop slots and body outputs are read/written by the runner
+    // itself, outside the step list: keep their arena blocks live
+    // until the LOOP step.
+    for (int si = 0; si < nsteps; si++) {
+        const Step& s = im->steps[si];
+        if (s.k != SK::LOOP) continue;
+        for (int v : s.lp_slots) im->vals[v].last_use = std::max(im->vals[v].last_use, si);
+        for (int v : s.lp_body_outs) im->vals[v].last_use = std::max(im->vals[v].last_use, si);
     }
     plan->in_names_ = im->in_names;
     plan->out_names_ = im->out_names;
@@ -4666,14 +5304,15 @@ std::vector<int64_t> read_meta_ints(const RT& t) {
 // FE_PROFILE accumulators (see Plan::run). Kind order matches enum SK.
 // Totals are kept per plan label so a decode step (stage plans) can be
 // read separately from prefill (first) and the encoder.
-struct ProfAcc { double us[28] = {}; long n[28] = {}; };
+struct ProfAcc { double us[34] = {}; long n[34] = {}; };
 static std::map<std::string, ProfAcc> g_prof;
-static const char* g_prof_names[28] = {"MATMUL", "GEMM", "PACKED", "CONV", "LN", "SOFTMAX",
+static const char* g_prof_names[34] = {"MATMUL", "GEMM", "PACKED", "CONV", "LN", "SOFTMAX",
                                        "REDUCESUM", "ARGMAX", "TOPK", "CUMSUM", "GATHER",
                                        "GATHER_EL", "SCATTER_EL", "CONCAT", "CONSTSHAPE",
                                        "RANDNORM", "BINOP", "UNOP", "CAST", "WHERE", "COPY",
                                        "PCONV", "PGATHER", "CONVT", "PAD", "EXPAND", "ATTN",
-                                       "INSTNORM"};
+                                       "INSTNORM", "SEQ_EMPTY", "SEQ_SPLIT", "SEQ_AT",
+                                       "SEQ_INSERT", "SEQ_CONCAT", "LOOP"};
 static std::map<std::string, double> g_prof_bind, g_prof_exec;
 static std::map<std::string, long> g_prof_runs;
 static void prof_print() {
@@ -4725,6 +5364,7 @@ static bool fuse_one_attn(Impl& im) {
     }
     for (size_t i = 0; i < steps.size(); i++) {
         Step& s0 = steps[i];
+        if (s0.keep) continue;
         if (s0.k != SK::MATMUL || s0.in.size() != 2 || s0.out.size() != 1) continue;
         // s0.out_scale (the attention score scale, folded into the
         // scores matmul by the pre-fold) stays on the ATTN step;
@@ -4740,6 +5380,7 @@ static bool fuse_one_attn(Impl& im) {
                 break;
             }
         if (js < 0) continue;
+        if (steps[js].keep) continue;
         if (!(steps[js].axis == -1 || steps[js].axis == 3)) continue;
         int vprobs = steps[js].out[0];
         if (vals[vprobs].is_output || uses[vprobs] != 1 || view_kids[vprobs] != 0) continue;
@@ -4751,6 +5392,7 @@ static bool fuse_one_attn(Impl& im) {
                 break;
             }
         if (ms < 0) continue;
+        if (steps[ms].keep) continue;
         Step& s2 = steps[ms];
         if (s2.out_scale != 1.0f) continue;
         int vctx = s2.out[0];
@@ -4820,7 +5462,10 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
         im.boff_w.assign(nv, 0);
         im.boff_o.assign(nv, 0);
         im.sym_bufs.assign(nv, {});
+        im.bseqs.assign(nv, {});
     }
+    for (auto& s : im.bseqs) s.clear();
+    im.dyn_reset();
     // Symbol values from the caller's input shapes.
     std::vector<int64_t>& sv = im.bsv;
     sv.assign(im.nsyms, 0);
@@ -4925,7 +5570,11 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
     }
     for (int s = 0; s < im.nsyms; s++) {
         auto [vid, dim] = im.sym_origin[s];
-        sv[s] = dim < (int)res[vid].shape.size() ? res[vid].shape[dim] : 0;
+        // Placeholder symbols (origin -1: split sizes, dyn expand
+        // dims) evaluate to 0; their true values only exist at
+        // execution time inside loop bodies.
+        sv[s] = (vid < 0 || dim < 0) ? 0
+                : (dim < (int)res[vid].shape.size() ? res[vid].shape[dim] : 0);
     }
     // Consts and symbolic values. (sym_bufs is sized by the
     // workspace guard above; SYMVAL buffers are fully rewritten
@@ -4952,10 +5601,16 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
     std::vector<std::vector<int64_t>>& cshape = im.bcshape;
     for (int i = 0; i < nv; i++) {
         Value& v = im.vals[i];
-        if (v.kind != Value::RT) continue;
+        if (v.kind != Value::RT || v.is_seq) continue;
         cshape[i].clear();
         for (auto& e : v.rshape) cshape[i].push_back(eeval(e, sv));
     }
+    // Values created inside Loop bodies: their views are resolved
+    // per iteration by the runner, not here.
+    std::vector<char> in_body(nv, 0);
+    for (auto& s : im.steps)
+        if (s.k == SK::LOOP)
+            for (int i = s.lp_v0; i < s.lp_v1 && i < nv; i++) in_body[i] = 1;
     // Arena assignment for materialized RT values (not views / inputs).
     using Alloc = Impl::BAlloc;
     std::vector<Alloc>& allocs = im.ballocs;
@@ -4963,6 +5618,7 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
     for (int i = 0; i < nv; i++) {
         Value& v = im.vals[i];
         if (v.kind != Value::RT || v.view_kind != 0 || v.is_input) continue;
+        if (v.is_seq || v.dyn) continue;  // sequences live in bseqs; dyn buffers are execution-allocated
         if (v.def_step == -2) continue;  // degenerate LN side output
         if (!kv_out.empty() && kv_out[i]) continue;  // stateful KV present: cache-bound below
         int64_t sz = 1;
@@ -5064,10 +5720,11 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
         }
     }
     // Views, in creation order (bases always precede their views).
+    // Factored into a lambda: the loop runner re-resolves body
+    // views per iteration through the same code.
     im.view_blocks.clear();
-    for (int i = 0; i < nv; i++) {
+    auto resolve_view = [&](int i) {
         Value& v = im.vals[i];
-        if (v.kind != Value::RT || v.view_kind == 0 || done[i]) continue;
         const RT& B = res[v.base];
         RT r;
         r.dtype = v.dtype;
@@ -5085,7 +5742,24 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
                 src = materialize(B, im.view_blocks.back().data());
             }
             r.p = src.p;
-            r.shape = cshape[i];
+            if (v.dyn && v.meta0 >= 0) {
+                // Dyn reshape (loop body): the compile-time shape
+                // exprs contain placeholders; recompute from the
+                // target tensor's runtime values and the base's
+                // true numel.
+                std::vector<int64_t> tgt = read_meta_ints(res[v.meta0]);
+                std::vector<int64_t> os;
+                int64_t known = 1, infer = -1;
+                for (size_t d = 0; d < tgt.size(); d++) {
+                    if (tgt[d] == -1) { infer = (int64_t)d; os.push_back(-1); }
+                    else if (tgt[d] == 0) { os.push_back(B.shape[d]); known *= B.shape[d]; }
+                    else { os.push_back(tgt[d]); known *= tgt[d]; }
+                }
+                if (infer >= 0) os[(size_t)infer] = known > 0 ? B.numel() / known : 0;
+                r.shape = os;
+            } else {
+                r.shape = cshape[i];
+            }
             r.strides = rowmajor(r.shape);
         } else if (v.view_kind == 3) {  // unsqueeze
             r.p = B.p;
@@ -5140,9 +5814,15 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
             r.p = B.p + (int64_t)v.meta1 * B.strides[ax] * (int64_t)onnxm::elem_size(B.dtype);
         }
         // Validate compile-time shape exprs against the resolved view.
-        if (r.shape != cshape[i]) fail("view shape mismatch at bind (slice/reshape exprs)");
+        if (!v.dyn && r.shape != cshape[i]) fail("view shape mismatch at bind (slice/reshape exprs)");
         res[i] = r;
         done[i] = 1;
+    };
+    for (int i = 0; i < nv; i++) {
+        Value& v = im.vals[i];
+        if (v.kind != Value::RT || v.view_kind == 0 || done[i]) continue;
+        if (in_body[i]) continue;  // resolved per iteration by the runner
+        resolve_view(i);
     }
     // Execute steps. FE_PROFILE=1 accumulates wall time per step kind
     // across all plans in the process and prints a table at exit.
@@ -5156,22 +5836,117 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
     Scratch& sc = im.bsc;
     std::vector<RT>& sin = im.bsin;
     std::vector<RT>& sout = im.bsout;
-    for (auto& st : im.steps) {
-        sin.resize(st.in.size());
-        sout.resize(st.out.size());
-        for (size_t j = 0; j < st.in.size(); j++) sin[j] = res[st.in[j]];
-        for (size_t j = 0; j < st.out.size(); j++) sout[j] = res[st.out[j]];
-        Scratch::Mark mk = sc.mark();
-        if (profile) {
-            auto p0 = std::chrono::steady_clock::now();
-            exec_step(im, st, sin, sout, sc);
-            double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - p0).count();
-            prof_add(im.label, (int)st.k, us);
-        } else {
-            exec_step(im, st, sin, sout, sc);
+    // View staleness for loop bodies: bind resolved every view
+    // outside a body; body views start stale and are re-resolved
+    // on demand whenever their base is (re)written.
+    std::vector<std::vector<int>> view_kids(nv);
+    for (int i = 0; i < nv; i++)
+        if (im.vals[i].kind == Value::RT && im.vals[i].view_kind != 0 && im.vals[i].base >= 0)
+            view_kids[im.vals[i].base].push_back(i);
+    std::vector<char> view_stale(nv, 0);
+    for (int i = 0; i < nv; i++)
+        if (in_body[i] && im.vals[i].view_kind != 0) view_stale[i] = 1;
+    std::function<void(int)> resolve_stale = [&](int i) {
+        if (!view_stale[i]) return;
+        int b = im.vals[i].base;
+        if (b >= 0 && im.vals[b].view_kind != 0) resolve_stale(b);
+        resolve_view(i);
+        view_stale[i] = 0;
+    };
+    auto mark_kids_stale = [&](int v) {
+        for (int k : view_kids[v]) view_stale[k] = 1;
+    };
+    // Step ownership: a step inside a Loop body runs only when
+    // that Loop dispatches its body range, never when an outer
+    // range walks past it. Owner = array index of the innermost
+    // LOOP step whose body range contains the step; -1 = top
+    // level. (Body steps sit inline in the steps array, between
+    // the steps of the nodes lowered before and after the Loop.)
+    int nsteps = (int)im.steps.size();
+    std::vector<int> step_owner(nsteps, -1);
+    for (int li = 0; li < nsteps; li++) {
+        const Step& ls = im.steps[li];
+        if (ls.k != SK::LOOP || ls.lp_b0 < 0) continue;
+        for (int i = ls.lp_b0; i < ls.lp_b1 && i < nsteps; i++) {
+            int cur = step_owner[i];
+            if (cur < 0 || (ls.lp_b1 - ls.lp_b0) < (im.steps[cur].lp_b1 - im.steps[cur].lp_b0))
+                step_owner[i] = li;
         }
-        sc.reset(mk);
     }
+    std::function<void(int, int, int)> run_steps = [&](int b0, int b1, int owner) {
+        for (int si = b0; si < b1; si++) {
+            if (step_owner[si] != owner) continue;
+            const Step& st = im.steps[si];
+            if (st.k == SK::LOOP) {
+                auto lp0 = std::chrono::steady_clock::now();
+                // ---- Loop execution ----
+                int ncarried = (int)st.out.size();
+                int64_t max_iter = INT64_MAX;
+                if (st.in[0] >= 0) max_iter = (int64_t)read_d(res[st.in[0]], 0);
+                bool cond = true;
+                if (st.in[1] >= 0) cond = read_d(res[st.in[1]], 0) != 0;
+                int iter_slot = st.lp_slots[0], cond_slot = st.lp_slots[1];
+                for (int j = 0; j < ncarried; j++) {
+                    int slot = st.lp_slots[2 + j], src = st.in[2 + j];
+                    if (im.vals[slot].is_seq) im.bseqs[slot] = im.bseqs[src];
+                    else res[slot] = res[src];
+                }
+                size_t vb_mark = im.view_blocks.size();
+                for (int i = st.lp_v0; i < st.lp_v1; i++)
+                    if (im.vals[i].view_kind != 0) view_stale[i] = 1;
+                int64_t iter = 0;
+                while (iter < max_iter && cond) {
+                    if (iter >= 10000000) fail("Loop: iteration cap");
+                    int64_t iv = iter;
+                    memcpy(res[iter_slot].p, &iv, 8);
+                    uint8_t cv = cond ? 1 : 0;
+                    memcpy(res[cond_slot].p, &cv, 1);
+                    run_steps(st.lp_b0, st.lp_b1, si);
+                    cond = read_d(res[st.lp_body_outs[0]], 0) != 0;
+                    for (int j = 0; j < ncarried; j++) {
+                        int slot = st.lp_slots[2 + j], bo = st.lp_body_outs[1 + j];
+                        if (im.vals[slot].is_seq) im.bseqs[slot] = im.bseqs[bo];
+                        else res[slot] = res[bo];
+                    }
+                    for (int i = st.lp_v0; i < st.lp_v1; i++)
+                        if (im.vals[i].view_kind != 0) view_stale[i] = 1;
+                    if (im.view_blocks.size() > vb_mark) im.view_blocks.resize(vb_mark);
+                    iter++;
+                }
+                for (int j = 0; j < ncarried; j++) {
+                    int bo = st.lp_body_outs[1 + j], ov = st.out[j];
+                    if (im.vals[ov].is_seq) im.bseqs[ov] = im.bseqs[bo];
+                    else res[ov] = res[bo];
+                    mark_kids_stale(ov);
+                }
+                if (profile)
+                    prof_add(im.label, (int)SK::LOOP,
+                             std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lp0).count());
+                continue;
+            }
+            for (int v : st.in)
+                if (v >= 0 && im.vals[v].view_kind != 0 && view_stale[v]) resolve_stale(v);
+            sin.resize(st.in.size());
+            sout.resize(st.out.size());
+            for (size_t j = 0; j < st.in.size(); j++) sin[j] = st.in[j] >= 0 ? res[st.in[j]] : RT{};
+            for (size_t j = 0; j < st.out.size(); j++) sout[j] = res[st.out[j]];
+            Scratch::Mark mk = sc.mark();
+            if (profile) {
+                auto p0 = std::chrono::steady_clock::now();
+                exec_step(im, st, sin, sout, sc);
+                double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - p0).count();
+                prof_add(im.label, (int)st.k, us);
+            } else {
+                exec_step(im, st, sin, sout, sc);
+            }
+            sc.reset(mk);
+            for (size_t j = 0; j < st.out.size(); j++) {
+                res[st.out[j]] = sout[j];
+                mark_kids_stale(st.out[j]);
+            }
+        }
+    };
+    run_steps(0, (int)im.steps.size(), -1);
     if (profile)
         g_prof_exec[im.label] +=
             std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - exec_t0).count();

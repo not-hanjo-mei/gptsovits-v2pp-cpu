@@ -96,13 +96,16 @@ struct Tensor {
     }
 };
 
+struct Graph;
+
 struct Attr {
     std::string name;
-    int type = 0;  // 1 f, 2 i, 3 s, 4 tensor, 6 floats, 7 ints, 8 strings
+    int type = 0;  // 1 f, 2 i, 3 s, 4 tensor, 5 graph, 6 floats, 7 ints, 8 strings
     float f = 0;
     int64_t i = 0;
     std::string s;
     std::shared_ptr<Tensor> t;
+    std::shared_ptr<Graph> g;  // control-flow subgraph (Loop body, If branches)
     std::vector<float> floats;
     std::vector<int64_t> ints;
     std::vector<std::string> strings;
@@ -254,18 +257,21 @@ inline Tensor parse_tensor(Reader r) {
     return t;
 }
 
+inline Graph parse_graph(Reader r);
+
 inline Attr parse_attr(Reader r) {
     Attr a;
     while (!r.empty()) {
         auto [field, wire] = r.tag();
         // AttributeProto field numbers: name 1, f 2, i 3, s 4, t 5,
-        // floats 7, ints 8, strings 9, type 20.
+        // g 6, floats 7, ints 8, strings 9, graphs 10, type 20.
         switch (field) {
             case 1: a.name = r.bytes(); break;
             case 2: a.f = r.f32(); break;
             case 3: a.i = (int64_t)r.varint(); break;
             case 4: a.s = r.bytes(); break;
             case 5: a.t = std::make_shared<Tensor>(parse_tensor(r.sub())); break;
+            case 6: a.g = std::make_shared<Graph>(parse_graph(r.sub())); break;
             case 7:
                 if (wire == 2) {
                     Reader s = r.sub();

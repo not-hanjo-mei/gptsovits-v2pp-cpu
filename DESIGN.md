@@ -905,3 +905,86 @@ as flat memory and reported corr 0 for a correct engine.
 Checkpoints inside the graph (feature extractor, encoder
 input, encoder layer 0) all agreed with ORT at corr 1.0
 before the full run did.
+
+## Runtime reference extraction: RoBERTa stage (2026-11-27, M3)
+
+The RoBERTa graph now runs on the free engine end to end.
+roberta_check feeds Genie's frontend inputs for the neutral1
+prompt (input_ids, attention_mask, word2ph repeats) and
+compares phone_features [39, 1024] against the ORT run and
+the shipped refpack tensor: corr 1.000000 against both,
+maxerr 0.0219 (ORT) and 0.0184 (pack). The two oracles
+disagree with each other by up to 0.03125 -- ORT computes
+this graph with fp16 activations -- so the engine's fp32
+result sits inside the oracles' own spread. A truncated
+graph bisect (new generic tool: graph_check, arbitrary
+graph + .npy inputs + .npy refs) confirms the encoder
+output, the per-word Slice and the counts Where each agree
+with ORT at corr 1.0 before the tail runs.
+
+What the graph needed, all general:
+
+- fp16-stored weights: all 357 initializers are dtype 10
+  with fp32 compute, the same distribution trick as
+  HuBERT's external bin but inline. The compiler decodes
+  fp16 constant tensors to fp32 as they enter (graph
+  initializers, Constant nodes, Loop body initializers);
+  every kernel then sees the fp32 layout it already
+  handles. The conversion is exact.
+- Symbolic Equal and Where in the shape layer, so the
+  exporter's Expand-target chain (Where over Equal over
+  Reshape/Concat/Shape/ConstantOfShape) resolves at
+  compile time. A runtime fallback sizes dyn Expand
+  outputs from the target tensor at exec time.
+- Gelu, exact erf form and tanh approximation.
+- Slice with a const base and symbolic bounds no longer
+  demands const bounds at lowering; it falls through to
+  the view path (consts are materialized at bind).
+- Sequence and Loop machinery: SequenceEmpty,
+  SplitToSequence, SequenceAt, SequenceInsert,
+  ConcatFromSequence, and Loop with a recursively
+  compiled body sharing the outer value space (subgraph
+  attributes in the ONNX parser). Shapes that depend on
+  Loop-carried data live in an append-only dyn arena and
+  are re-resolved per iteration; body views go stale on
+  every write to their base and re-resolve on demand.
+- SplitToSequence element shapes stay exact when the
+  split tensor is provably all ones; RoBERTa's split is a
+  runtime ConstantOfShape with fill 1, which the lowering
+  now recognizes, keeping downstream shapes static.
+
+Three bugs worth recording:
+
+- Loop body steps sit inline in the steps array, between
+  the steps lowered before and after the Loop node. The
+  top-level walk executed the body once standalone --
+  with a zeroed iteration slot -- before the Loop step
+  ran, corrupting the sequence accumulator. Steps now
+  carry an owner (the innermost Loop whose body range
+  contains them) and execute only under that owner.
+- Dyn outputs bind as placeholder descriptors with dtype
+  0. Expand and ConcatFromSequence sized their arena
+  allocations from that dtype (elem_size 1 instead of 4)
+  and under-allocated 4x, each write clobbering its
+  neighbour. Both now take the dtype from the input /
+  the sequence elements. The under-allocation was inside
+  one arena block, so ASAN could not see it; the shape
+  was right and the data was zeros, which is what gave
+  it away.
+- The first segfault of this stage was not in the tail
+  at all: k_layernorm read a 512-float buffer as 1024
+  floats because the fp16 LayerNorm weight was handed
+  to it undecoded. ASAN found it in one run once the
+  build was configured with the free-only flag.
+
+The ASAN build runs roberta_check clean. The four gates
+re-run at their baselines after these changes (packed tf
+299/361, fp32 tf 361/361, vits packed corr 0.959881 with
+packed-vs-baked maxerr 1.66893e-06, vits fp32 corr
+1.000000), and the fused ATTN still fires (4,344 calls
+on the packed gate run).
+
+Next stages: prompt_encoder (If x2) against ge /
+ge_advanced with the SV embedding from an ORT run, then
+the speaker encoder (SequenceEmpty + Loop, the machinery
+above was built for it), then host integration.
