@@ -99,6 +99,14 @@ reference packs today; runtime extraction (wav in, features computed
 on the spot, optionally written back as a pack) is the settled
 dual-mode design in DESIGN.md and is not implemented yet.
 
+Streaming: add `"stream": true` to a request (packed path) and the
+host runs the vits front once, then emits the vocoder decoder's
+output in chunks of 25 tokens — one JSON line per chunk plus the
+raw s16le audio appended to `reqNNN.pcm` as each chunk lands. With
+the default context the streamed audio is bit-exact against the
+one-shot result; the final WAV is unchanged. The split graphs come
+from `tools/split_vits.py` (see DESIGN.md, "Streaming output").
+
 ## What this is not
 
 - No model weights are distributed here, ever. Bring your own.

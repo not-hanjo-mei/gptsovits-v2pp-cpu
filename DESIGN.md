@@ -747,3 +747,49 @@ errors on two-word texts mid-soak are the same history effect
 (first-token EOS), not a cache fault. The KV growth path was
 additionally verified with POTATO_KV_INIT_CAP=64 forcing
 repeated doubling: token-identical to the copy protocol.
+
+## Streaming output (2026-11-27, M3)
+
+Request field `"stream": true` (packed free path) emits audio in
+chunks: one JSON line per chunk on stdout and the raw chunk audio
+(s16le, pre output-chain) appended to reqNNN.pcm as it lands. The
+summary gains `streamed`, `first_audio_ms`, and `chunks`. Two
+designs were tried and measured on the noiseless fp32 graph
+(vits_slice_check):
+
+- Slicing the semantic input is unsound. The vits front aligns
+  text and semantic globally (the MRTE cross-attention), so a
+  token slice changes the output everywhere: chunked vs one-shot
+  corr 0.157, interiors included. Dead end, do not retry.
+- The shipped design splits the graph at the vocoder decoder
+  (tools/split_vits.py): the front runs once on the full input
+  and produces the latent z (/vq_model/Mul_2_output_0,
+  [1, 192, 2T], 640 samples per frame); the decoder
+  (/vq_model/dec/, 254 packed nodes, inputs z + ge) is purely
+  convolutional and exactly local. Decoder chunks of 25 tokens
+  with 16 latent frames of context per side reproduce the
+  one-shot audio bit-exactly (ctx 8 frames: max err 5.9e-04;
+  ctx 0: boundary damage, corr 0.968). z is channel-major: a
+  frame slice is a per-channel row copy. An early cut of this
+  check sliced z as a flat buffer and reported global coupling;
+  that was the check's own layout bug, found by a tail-zeroing
+  probe once the indexing was fixed per channel.
+
+Split mechanics: ancestors of z vs ancestors of audio; the one
+Constant feeding both sides (gather indices) is duplicated into
+the decoder graph; the boundary tensor is redeclared with fresh
+shape symbols (the exporter's inferred symbol names do not
+rebind as a graph input, and a shapeless declaration leaves
+rank 0, which the first decoder Conv cannot lower). The packed
+split graphs sit next to vits_wnfold.onnx (front 1.7 MB, dec
+156 KB; weights stay in the pool) and compile lazily on the
+first stream request; any failure falls back to one-shot with
+the reason in the summary's notes.
+
+Box numbers (EPYC, 4 threads, AVX2-only): standard sentence
+first audio 1.50 s of a 2.75 s total (the front must finish
+before any audio exists, so the win is the decoder tail); a
+201-token text: first audio 2.87 s of 6.40 s. Streamed vs plain
+final WAV: corr 1.0, max diff 1 LSB. Streaming costs extra
+decoder work proportional to the context margins (about +0.6 s
+of vits time on the standard sentence at the defaults).
