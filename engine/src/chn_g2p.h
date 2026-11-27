@@ -27,6 +27,7 @@
 #include "g2pm.h"
 #include "jieba.h"
 #include "pypinyin_mini.h"
+#include "textnorm.h"
 
 namespace chng2p {
 
@@ -458,7 +459,8 @@ class ChineseG2P {
   public:
     bool load(const std::string& g2pm_bin, const std::string& dict_txt, const std::string& posseg_bin,
               const std::string& finalseg_bin, const std::string& pypinyin_bin, const std::string& sandhi_bin,
-              const std::string& polyphonic_bin, const std::string& opencpop_txt, const std::string& symbols_txt) {
+              const std::string& polyphonic_bin, const std::string& opencpop_txt, const std::string& symbols_txt,
+              const std::string& t2s_bin) {
         if (!g2pm_.load(g2pm_bin)) return false;
         if (!jieba_.load_dict(dict_txt) || !jieba_.load_posseg(posseg_bin) || !jieba_.load_finalseg(finalseg_bin))
             return false;
@@ -467,6 +469,7 @@ class ChineseG2P {
         if (!load_polyphonic(polyphonic_bin)) return false;
         if (!load_opencpop(opencpop_txt)) return false;
         if (!load_symbols(symbols_txt)) return false;
+        if (!norm_.load_t2s(t2s_bin)) return false;
         sandhi_.init(&sets_, &jieba_, &pinyin_);
         erhua_.init(&sets_);
         return true;
@@ -530,6 +533,44 @@ class ChineseG2P {
 
     const std::unordered_map<std::string, int>& symbol_ids() const { return symbol_id_; }
 
+    // ChineseG2P.normalize_text: TextNormalizer sentences,
+    // _replace_punctuation each, join, collapse runs of the
+    // same punctuation character.
+    std::string normalize_text(const std::string& text) const {
+        std::string joined;
+        for (auto& s : norm_.normalize(text)) joined += replace_punctuation(s);
+        auto cps = wptok::utf8_decode(joined);
+        std::string out;
+        for (size_t i = 0; i < cps.size(); i++) {
+            if (i && cps[i] == cps[i - 1] && is_punct_cp(cps[i])) continue;
+            wptok::utf8_encode(cps[i], out);
+        }
+        return out;
+    }
+
+    struct Processed {
+        std::string clean;
+        std::vector<std::string> phones;
+        std::vector<int64_t> ids;
+        std::vector<int> word2ph;
+    };
+    // processor.process: normalize, g2p, keep phones present
+    // in symbols_v2 (word2ph NOT adjusted, as upstream).
+    Processed process(const std::string& text) const {
+        Processed r;
+        r.clean = normalize_text(text);
+        auto pr = g2p(r.clean);
+        r.word2ph = pr.second;
+        for (auto& p : pr.first) {
+            auto it = symbol_id_.find(p);
+            if (it != symbol_id_.end()) {
+                r.phones.push_back(p);
+                r.ids.push_back(it->second);
+            }
+        }
+        return r;
+    }
+
   private:
     static std::vector<std::string> split_sentences(const std::string& text) {
         // pattern_split: (?<=[!?\…,\.-])\s* ; keep pieces
@@ -562,6 +603,25 @@ class ChineseG2P {
             }
         }
         push(start, N);
+        return out;
+    }
+    static bool is_punct_cp(int32_t cp) {
+        return cp == '!' || cp == '?' || cp == 0x2026 || cp == ',' || cp == '.' || cp == '-';
+    }
+    // ChineseG2P._replace_punctuation.
+    static std::string replace_punctuation(const std::string& text) {
+        if (text.empty()) return text;
+        std::string t = detail::replace_all(text, "...", "…");
+        static const std::pair<const char*, const char*> kMap[] = {
+            {"：", ","}, {"；", ","}, {"，", ","}, {"。", "."}, {"！", "!"}, {"？", "?"},
+            {"\n", "."}, {"·", ","}, {"、", ","}, {"$", "."},  {"/", ","},
+            {"—", "-"},  {"~", "…"},  {"～", "…"},
+        };
+        for (auto& kv : kMap) t = detail::replace_all(t, kv.first, kv.second);
+        std::string out;
+        for (int32_t cp : wptok::utf8_decode(t)) {
+            if ((cp >= 0x4E00 && cp <= 0x9FA5) || is_punct_cp(cp)) wptok::utf8_encode(cp, out);
+        }
         return out;
     }
     static std::string remove_eng(const std::string& seg) {
@@ -711,6 +771,7 @@ class ChineseG2P {
     std::unordered_map<std::string, std::vector<std::string>> pp_;
     std::unordered_map<std::string, std::string> opencpop_;
     std::unordered_map<std::string, int> symbol_id_;
+    textnorm::TextNormalizer norm_;
 };
 
 }  // namespace chng2p
