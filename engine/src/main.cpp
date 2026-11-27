@@ -5,7 +5,9 @@
 // from offline .rpk packs. A request may instead carry
 // "ref_wav" + "ref_text": the five tensors are then extracted
 // at runtime (refextract.h, free engine only) and cached by
-// content hash for the life of the process. With
+// content hash for the life of the process. "ref_lang" picks
+// the prompt language ("zh" default, "en" for English: the
+// English G2P port and a zero ref_bert, as upstream). With
 // "ref_save": true the tensors are also written to
 // host/refpacks/<hash>.rpk and registered in the sidecar
 // rt_index.json, so later processes can use them as
@@ -710,7 +712,8 @@ int main(int argc, char** argv) {
         RefExtractor rt_ext;
         bool rt_ext_ready = false, rt_ext_failed = false;
         std::set<std::string> rt_saved;
-        auto get_ref_rt = [&](const std::string& wav, const std::string& ptext, bool save)
+        auto get_ref_rt = [&](const std::string& wav, const std::string& ptext, bool save,
+                              const std::string& lang)
             -> const std::map<std::string, RpkTensor>& {
             auto wb = read_file(wav);
             uint64_t h = 1469598103934665603ULL;
@@ -719,6 +722,7 @@ int main(int argc, char** argv) {
             };
             mix(wb.data(), wb.size());
             mix((const uint8_t*)ptext.data(), ptext.size());
+            mix((const uint8_t*)lang.data(), lang.size());
             char key[40];
             snprintf(key, sizeof key, "rt:%016llx", (unsigned long long)h);
             auto it = refcache.find(key);
@@ -734,7 +738,7 @@ int main(int argc, char** argv) {
                     rt_ext_ready = true;
                 }
                 auto t0 = Clock::now();
-                auto tensors = rt_ext.extract(wav, ptext);
+                auto tensors = rt_ext.extract(wav, ptext, lang);
                 std::cerr << "[ref] runtime reference " << key << " extracted in " << (int)ms_since(t0)
                           << " ms; rss " << rss_kb() / 1024 << " MB\n";
                 refcache[key] = std::move(tensors);
@@ -785,7 +789,12 @@ int main(int argc, char** argv) {
                 const std::map<std::string, RpkTensor>* refp = nullptr;
                 std::string tag_used = tag;
                 if (!ref_wav.empty()) {
-                    refp = &get_ref_rt(ref_wav, ref_text, ref_save);
+                    std::string ref_lang = getstr("ref_lang", "zh");
+                    if (ref_lang == "english") ref_lang = "en";
+                    else if (ref_lang == "chinese") ref_lang = "zh";
+                    if (ref_lang != "zh" && ref_lang != "en")
+                        throw std::runtime_error("unsupported ref_lang: " + ref_lang);
+                    refp = &get_ref_rt(ref_wav, ref_text, ref_save, ref_lang);
                     tag_used = "(runtime)";
                     notes.push_back("runtime-extracted reference from " + ref_wav +
                                     (ref_save ? ", saved as a pack" : ""));

@@ -15,6 +15,9 @@ host/refextract/
     g2pm.bin  jieba_posseg.bin  finalseg.bin  pypinyin.bin
     sandhi.bin  polyphonic.bin  t2s.bin  symbols_v2.txt
     dict.txt  opencpop-strict.txt
+  eng/                                  (only for ref_lang "en")
+    eng.bin  tagger.bin
+    wordsegment/{unigrams,bigrams,words}.txt
 ```
 
 None of this is distributed with the repo (model weights and
@@ -62,10 +65,26 @@ are documented in the scripts and their C++ loaders).
 `export_g2pm.py --emotions EMOTIONS.json` additionally
 writes the g2pM oracle used by `g2pm_check`.
 
+## English G2P data
+
+```
+python3 tools/export_eng_g2p.py GENIE host/refextract/eng
+cp -r GENIE/G2P/EnglishG2P/wordsegment host/refextract/eng/
+```
+
+`eng.bin` holds the merged CMU dictionary (the cache
+pickle updated by `engdict-hot.rep`, first pronunciation
+per word -- the only one upstream uses), the name
+dictionary, and the OOV GRU weights. `tagger.bin` is the
+perceptron tagger flattened from its JSON files. The
+wordsegment tables are already plain text and are copied
+verbatim.
+
 ## Verifying
 
-`refextract_check ASSETDIR WAV PROMPT_TEXT PACK.rpk`
+`refextract_check ASSETDIR WAV PROMPT_TEXT PACK.rpk [LANG]`
 compares a runtime extraction against an offline pack for
 the same reference; `chn_g2p_check`, `g2pm_check`,
-`jieba_check`, `pypinyin_check` and `tokenizer_check`
-verify the individual stages against Python oracles.
+`jieba_check`, `pypinyin_check`, `tokenizer_check` and
+`eng_g2p_check` verify the individual stages against
+Python oracles.

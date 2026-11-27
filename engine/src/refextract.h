@@ -10,9 +10,13 @@
 //   text -> normalize + Chinese g2p -> ref_seq [1, L] (ids),
 //           word2ph -> RoBERTa (WordPiece ids/mask + repeats)
 //           -> ref_bert [n_phones, 1024]
-// All four model stages run on the free engine; each output
-// is copied out of the plan arena immediately. Extraction is
-// once per new reference, so stage speed is secondary.
+// With lang "en" the text side is the English G2P port
+// (eng_g2p.h) and ref_bert is zeros, exactly as Genie's
+// get_phones_and_bert('english') does; the audio side is
+// unchanged. All four model stages run on the free engine;
+// each output is copied out of the plan arena immediately.
+// Extraction is once per new reference, so stage speed is
+// secondary.
 //
 // Asset directory layout (host/refextract/):
 //   hubert/chinese-hubert-base.onnx (+ converted fp32 bin)
@@ -21,10 +25,13 @@
 //   g2p/{g2pm.bin, dict.txt, jieba_posseg.bin, finalseg.bin,
 //        pypinyin.bin, sandhi.bin, polyphonic.bin,
 //        opencpop-strict.txt, symbols_v2.txt, t2s.bin}
+//   eng/{eng.bin, taggers/..., wordsegment/...} (English only,
+//        loaded lazily on the first English request)
 #pragma once
 
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -32,6 +39,7 @@
 #include <vector>
 
 #include "chn_g2p.h"
+#include "eng_g2p.h"
 #include "free_engine.h"
 #include "npz.h"  // rd16/rd32 for rpk.h
 #include "resample.h"
@@ -42,6 +50,7 @@
 class RefExtractor {
    public:
     bool init(const std::string& dir, std::string& err) {
+        dir_ = dir;
         try {
             hubert_ = compile(dir + "/hubert/chinese-hubert-base.onnx", "ref_hubert");
             roberta_ = compile(dir + "/RoBERTa.onnx", "ref_roberta");
@@ -67,8 +76,33 @@ class RefExtractor {
     }
     bool ready() const { return ready_; }
 
-    std::map<std::string, RpkTensor> extract(const std::string& wav_path, const std::string& prompt_text) {
+    bool ensure_eng(std::string& err) {
+        if (eng_ready_) return true;
+        if (eng_failed_) { err = "english g2p assets unavailable"; return false; }
+        std::vector<std::string> symbols;
+        {
+            std::ifstream f(dir_ + "/g2p/symbols_v2.txt");
+            if (!f) { eng_failed_ = true; err = "cannot open symbols_v2.txt"; return false; }
+            std::string line;
+            while (std::getline(f, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                symbols.push_back(line);
+            }
+            while (!symbols.empty() && symbols.back().empty()) symbols.pop_back();
+        }
+        if (!eng_.load(dir_ + "/eng", symbols, err)) { eng_failed_ = true; return false; }
+        eng_ready_ = true;
+        return true;
+    }
+
+    std::map<std::string, RpkTensor> extract(const std::string& wav_path, const std::string& prompt_text,
+                                             const std::string& lang = "zh") {
         if (!ready_) throw std::runtime_error("refextract: not initialized");
+        const bool en = (lang == "en");
+        if (en) {
+            std::string err;
+            if (!ensure_eng(err)) throw std::runtime_error("refextract eng: " + err);
+        }
         refaudio::WavData w;
         std::string werr;
         if (!refaudio::read_wav(wav_path, w, werr)) throw std::runtime_error("refextract wav: " + werr);
@@ -78,13 +112,27 @@ class RefExtractor {
         a32.resize(a32.size() + 9600, 0.0f);  // ReferenceAudio appends 0.3 s
         std::vector<float> a16 = refaudio::resample_sinc(a32, 32000, 16000);
 
-        auto proc = g2p_.process(prompt_text);
-        if (proc.ids.empty()) throw std::runtime_error("refextract: prompt text produced no phones");
+        std::vector<int64_t> ref_ids;
+        chng2p::ChineseG2P::Processed proc;
+        if (en) {
+            ref_ids = eng_.phones_to_ids(eng2p::u8_to_w(prompt_text));
+            if (ref_ids.empty()) throw std::runtime_error("refextract: prompt text produced no phones");
+        } else {
+            proc = g2p_.process(prompt_text);
+            if (proc.ids.empty()) throw std::runtime_error("refextract: prompt text produced no phones");
+            ref_ids = proc.ids;
+        }
 
         std::map<std::string, RpkTensor> out;
 
-        // RoBERTa -> ref_bert
-        {
+        // RoBERTa -> ref_bert (English: zeros, as upstream)
+        if (en) {
+            RpkTensor t;
+            t.dtype = 0;
+            t.shape = {(int64_t)ref_ids.size(), 1024};
+            t.data.assign(ref_ids.size() * 1024 * 4, 0);
+            out["ref_bert"] = std::move(t);
+        } else {
             std::vector<int64_t> ids, mask;
             tok_.encode(proc.clean, ids, mask);
             std::vector<int64_t> repeats(proc.word2ph.begin(), proc.word2ph.end());
@@ -124,9 +172,9 @@ class RefExtractor {
         {
             RpkTensor t;
             t.dtype = 1;
-            t.shape = {1, (int64_t)proc.ids.size()};
-            t.data.assign((const uint8_t*)proc.ids.data(),
-                          (const uint8_t*)proc.ids.data() + proc.ids.size() * 8);
+            t.shape = {1, (int64_t)ref_ids.size()};
+            t.data.assign((const uint8_t*)ref_ids.data(),
+                          (const uint8_t*)ref_ids.data() + ref_ids.size() * 8);
             out["ref_seq"] = std::move(t);
         }
         return out;
@@ -212,5 +260,7 @@ class RefExtractor {
     std::shared_ptr<freeeng::Plan> hubert_, roberta_, sv_, pe_;
     wptok::WordPieceTokenizer tok_;
     chng2p::ChineseG2P g2p_;
-    bool ready_ = false;
+    eng2p::EngG2P eng_;
+    std::string dir_;
+    bool ready_ = false, eng_ready_ = false, eng_failed_ = false;
 };

@@ -43,8 +43,8 @@ static std::string shape_str(const RpkTensor& t) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 5) {
-        std::fprintf(stderr, "usage: refextract_check ASSETDIR WAV PROMPT_TEXT RPK\n");
+    if (argc != 5 && argc != 6) {
+        std::fprintf(stderr, "usage: refextract_check ASSETDIR WAV PROMPT_TEXT RPK [LANG]\n");
         return 2;
     }
     RefExtractor ex;
@@ -53,7 +53,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "init failed: %s\n", err.c_str());
         return 1;
     }
-    auto mine = ex.extract(argv[2], argv[3]);
+    auto mine = ex.extract(argv[2], argv[3], argc == 6 ? argv[5] : "zh");
     auto ref = load_rpk(argv[4]);
     int bad = 0;
     // ref_seq: exact integer equality.

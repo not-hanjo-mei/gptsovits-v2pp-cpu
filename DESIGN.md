@@ -1205,3 +1205,33 @@ rippled target). Conclusion: embedding corr is a proxy
 that misleads one level up, exactly as waveform corr did
 in M3-3d(a). The Kaiser resampler stays for both 16k
 consumers; the fitted taps were removed unshipped.
+
+## English prompt extraction (2026-11-28, M4)
+
+Upstream's English path needs no RoBERTa: get_phones_and_bert
+returns the phones with a zero [L,1024] text_bert. The host
+takes "ref_lang": "en" (default "zh") and the extractor then
+fills ref_seq from a port of genie_tts's English G2P and
+ref_bert with zeros; the audio side is unchanged.
+
+The port (eng_g2p.h) covers the whole CleanG2p stack:
+TweetTokenizer, the text normalization cascade (number
+words, ordinals, measurements, currency), the averaged
+perceptron POS tagger, CMU + name dictionaries, wordsegment,
+homographs, and the GRU OOV predictor, with assets exported
+by tools/export_eng_g2p.py (eng.bin + tagger.bin; the tagger
+is flattened because its 5.5 MB weights JSON as a parsed
+tree costs more memory than the model). Two upstream quirks
+are mirrored for oracle equality: REP_MAP's keys were meant
+as character classes but are re.escape'd, so they match
+only the literal bracketed strings; and _ordinal_custom
+glues its suffix onto the number words ("twentythird").
+
+Acceptance: 36/36 exact on every stage against Genie
+oracles (normalize, punctuation correction, tags, phones,
+ids -- the corpus covers both senses of read/lead/complex/
+presents, numbers, dates, times, currency, names, an OOV
+word and domains), and an end-to-end extraction against a
+Genie ReferenceAudio pack: ref_seq exact, ref_bert
+identical zeros, ssl corr 0.999995, ge corr 0.999823,
+ge_advanced corr 0.999903.
