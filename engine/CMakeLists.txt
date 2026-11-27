@@ -108,6 +108,11 @@ add_executable(graph_check src/graph_check.cpp src/free_engine.cpp src/vits_kern
 target_link_libraries(graph_check PRIVATE pthread)
 target_include_directories(graph_check PRIVATE src)
 
+# Reference-audio preparation check (WAV decode + resample vs
+# Genie's ReferenceAudio arrays); header-only, no engine link.
+add_executable(resample_check src/resample_check.cpp)
+target_include_directories(resample_check PRIVATE src)
+
 # Compile-only probe for surveying new graphs (reference
 # extraction models) against the engine's op coverage.
 add_executable(plan_probe src/plan_probe.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
