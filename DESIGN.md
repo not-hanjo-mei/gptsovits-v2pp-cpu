@@ -793,3 +793,17 @@ before any audio exists, so the win is the decoder tail); a
 final WAV: corr 1.0, max diff 1 LSB. Streaming costs extra
 decoder work proportional to the context margins (about +0.6 s
 of vits time on the standard sentence at the defaults).
+
+## Packaging (2026-11-27, M3)
+
+tools/make_release.sh builds the free-only host and packs a
+tarball with the binary, the full source tree (git archive), a
+RELEASE.txt, and SHA256SUMS. Portability is by construction:
+only the AVX2 kernel TU carries -mavx2/-mfma flags (the product
+baseline), AVX-512 is runtime-dispatched, and there is no
+-march=native anywhere. Verified on the EPYC box from a clean
+extract: checksums pass (38 files), the packaged binary runs
+plain and streaming requests against an existing root, and a
+rebuild from the packaged source reproduces the same output
+duration on the standard sentence. No weights are included; a
+runtime root is still produced by the conversion scripts.
