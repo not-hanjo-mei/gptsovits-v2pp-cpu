@@ -988,3 +988,117 @@ Next stages: prompt_encoder (If x2) against ge /
 ge_advanced with the SV embedding from an ORT run, then
 the speaker encoder (SequenceEmpty + Loop, the machinery
 above was built for it), then host integration.
+
+## Runtime reference extraction: prompt_encoder and speaker encoder (2026-11-27, M3)
+
+Both remaining extraction models now run on the free
+engine, so all four stages of runtime reference
+extraction (HuBERT, RoBERTa, prompt_encoder, speaker
+encoder) are proven against their oracles:
+
+- prompt_encoder compiles to 66 steps and matches ORT
+  with an ORT speaker embedding: ge corr 1.000000
+  (maxerr 1.4e-05), ge_advanced corr 1.000000 (maxerr
+  6.9e-05). With the engine's own speaker embedding in
+  place of ORT's, the outputs match the shipped
+  reference pack itself: corr 1.000000, maxerr 4.4e-05
+  / 7.6e-05.
+- speaker_encoder compiles to 785 steps and matches
+  ORT: corr 1.000000, relrms 2e-06, maxerr 1.0e-05.
+  It is slow on the throttled dev box (~9 minutes);
+  extraction runs once per reference, so this is
+  acceptable.
+
+One oracle correction: prompt_encoder's ref_audio
+input is Genie's prepared ReferenceAudio.audio_32k,
+not the raw wav file (for neutral1, 136,000 samples
+prepared from a 126,400-sample file; the shared prefix
+is identical). Fed the true input, ORT reproduces the
+pack's ge / ge_advanced bit-exactly; fed the raw file
+they differ by ~2. Host integration must replicate
+the preparation, not feed the file.
+
+Engine additions for these two graphs:
+
+- General If: both branches compile into the shared
+  step array with owner ranges (the Loop owner
+  mechanism generalized); the taken branch runs and
+  its outputs are copied out, resolving deferred
+  views first. The speaker encoder's Loop body
+  contains an If whose else branch reads the
+  Loop-carried sequence, so branch specialization
+  was not an option.
+- Runtime step kinds: STFT, DFT, Range, runtime
+  Slice, runtime Shape, Tile, BatchNormalization,
+  Clip, Prelu, CastLike, Log, Softplus. STFT's input
+  order is the one ORT reads -- signal, frame_step,
+  window, frame_length -- not the spec's order.
+- Dyn-shape machinery: an eff_dyn predicate usable
+  during lowering, a compile-time dyn propagation
+  pass, per-kind output sizing at exec
+  (dyn_shape_for), self-allocating step kinds, and
+  deferred views at bind for views of dyn step
+  outputs. Shape now honors the start / end attrs.
+
+Bugs worth recording:
+
+- DCE marked used values from step inputs, graph
+  outputs, meta refs and view bases, but not If
+  branch outputs or Loop body outputs. prompt_
+  encoder's Pad step had exactly one reader -- a
+  Squeeze view inside an If branch -- and was
+  erased; the view then resolved against a stale
+  descriptor pointing into an unrelated const
+  buffer.
+- Expand steps come in two shapes: runtime-target
+  steps carry {data, target}; symbolic-target steps
+  carry {data} only. The exec dyn branch read
+  ins[1] unconditionally -- an out-of-bounds read on
+  the runner's shared input vector that ASAN
+  reported as a use-after-free inside the runner
+  itself.
+- Expand's target is a minimum shape, not the
+  output shape: the output is broadcast(data,
+  target). And a runtime-target Expand's output
+  carries placeholder shape symbols nothing can
+  bind, so a downstream symbolic Expand now keeps a
+  constant target on the step and broadcasts the
+  data's true shape at exec.
+- Shape of a dyn value with an empty symbolic shape
+  produced a symbolic value with zero elements,
+  which the const collapse accepted vacuously,
+  minting a fake const that a downstream fold read
+  through a null pointer. It is a runtime SHAPE
+  step now.
+- The dyn Pad sizing used interleaved pad indexing;
+  ONNX pads are [all begins, then all ends]. The
+  4-element under-allocation made the pad copy
+  overlap itself inside the arena.
+- Optional ONNX inputs materialize as -1 entries in
+  a step's input list; every pass that indexes the
+  value table over step inputs must skip them (the
+  uses counters, DCE and liveness each missed it
+  once).
+- eff_dyn, the lowering-time dyn predicate, was a
+  plain recursion over the value DAG with no
+  memoization. On fan-out-heavy graphs it re-walks
+  shared ancestors on every query and blows up
+  exponentially: a GPT stage plan's compile never
+  finished (perf showed 99.9% of cycles inside
+  eff_dyn, self-recursive), which presented as all
+  four gates hanging on both machines while the
+  narrow extraction graphs compiled fine. Memoized
+  on the Impl, stage compiles dropped to tens of
+  milliseconds.
+
+The four gates re-run at their baselines after
+these changes (packed tf 299/361, fp32 tf 361/361,
+vits packed corr 0.959881, vits fp32 corr 1.000000;
+verified on the EPYC box, with the packed tf gate
+independently at 299/361 locally). The ASAN build
+runs prompt_encoder clean.
+
+Remaining M3 work: host integration -- wav decode,
+resampling, a Chinese G2P and a WordPiece tokenizer
+for the prompt side, and the four-plan chain wired
+into the host.

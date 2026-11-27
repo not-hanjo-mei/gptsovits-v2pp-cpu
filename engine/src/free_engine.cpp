@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <complex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -713,7 +714,7 @@ void k_softmax(const RT& X0, RT& Y, int64_t axis, Scratch& sc) {
 
 // Elementwise binary op codes, shared by compiler + kernels.
 enum class BinOp { ADD, SUB, MUL, DIV, POW, MAXIMUM, LESS, GREATER, EQUAL, OR, AND };
-enum class UnOp { NEG, SQRT, SIN, COS, EXP, TANH, SIGMOID, RELU, ABS, LEAKY, ERF, GELU, GELUT };
+enum class UnOp { NEG, SQRT, SIN, COS, EXP, TANH, SIGMOID, RELU, ABS, LEAKY, ERF, GELU, GELUT, SOFTPLUS, LOG };
 
 double binop_apply(BinOp op, double a, double b) {
     switch (op) {
@@ -746,6 +747,13 @@ double unop_apply(UnOp op, double a, double alpha = 0.0) {
         case UnOp::ERF: return std::erf(a);
         case UnOp::GELU: return 0.5 * a * (1.0 + std::erf(a * 0.70710678118654752440));
         case UnOp::GELUT: return 0.5 * a * (1.0 + std::tanh(0.79788456080286535588 * (a + 0.044715 * a * a * a)));
+        case UnOp::SOFTPLUS: {
+            // alpha carries beta (default 1); the 20 threshold
+            // is the stable form ORT and PyTorch both use.
+            double bx = alpha * a;
+            return bx > 20.0 ? a : std::log1p(std::exp(bx)) / alpha;
+        }
+        case UnOp::LOG: return std::log(a);
     }
     return 0;
 }
@@ -880,6 +888,11 @@ float unop_apply_f(UnOp op, float a, double alpha) {
         case UnOp::ERF: return std::erf(a);
         case UnOp::GELU: return 0.5f * a * (1.0f + std::erf(a * 0.70710678118654752440f));
         case UnOp::GELUT: return 0.5f * a * (1.0f + std::tanh(0.79788456080286535588f * (a + 0.044715f * a * a * a)));
+        case UnOp::SOFTPLUS: {
+            double bx = alpha * (double)a;
+            return bx > 20.0 ? a : (float)(std::log1p(std::exp(bx)) / alpha);
+        }
+        case UnOp::LOG: return std::log(a);
     }
     return 0;
 }
@@ -2095,7 +2108,8 @@ enum class SK { MATMUL, GEMM, PACKED, CONV, LN, SOFTMAX, REDUCESUM, ARGMAX, TOPK
                 // Pad, Expand. PCONV also carries PackedConvTranspose
                 // (pc_transpose), PGATHER is PackedGather.
                 PCONV, PGATHER, CONVT, PAD, EXPAND, ATTN, INSTNORM,
-                SEQ_EMPTY, SEQ_SPLIT, SEQ_AT, SEQ_INSERT, SEQ_CONCAT, LOOP };
+                SEQ_EMPTY, SEQ_SPLIT, SEQ_AT, SEQ_INSERT, SEQ_CONCAT, LOOP,
+                IF, SLICE_RT, RANGE, STFT, TILE, PRELU, DFT, BNORM, CLIP, SHAPE };
 struct Step {
     SK k = SK::COPY;
     std::vector<int> in, out;
@@ -2142,6 +2156,13 @@ struct Step {
     int lp_u0 = -1, lp_u1 = -1, lp_b0 = -1, lp_b1 = -1;
     std::vector<int> lp_slots, lp_body_outs;
     int lp_v0 = -1, lp_v1 = -1;
+    // IF: then/else body step ranges by uid (fixed up like LOOP),
+    // branch output value ids, and the value-id range both branch
+    // compilations created.
+    int if_u0 = -1, if_u1 = -1, if_eu0 = -1, if_eu1 = -1;
+    int if_b0 = -1, if_b1 = -1, if_eb0 = -1, if_eb1 = -1;
+    std::vector<int> if_t_outs, if_e_outs;
+    int if_v0 = -1, if_v1 = -1;
 };
 
 struct Value {
@@ -2174,6 +2195,13 @@ struct Impl {
     std::vector<KvPair> kv_pairs;
     std::shared_ptr<KvCache> kv;
     std::vector<Value> vals;
+    // eff_dyn memo, parallel to vals: -1 unknown, 0/1 result,
+    // 2 = computation in progress (cycle guard). A value's
+    // effective dyn-ness is fixed once the value and its
+    // producing step exist, and eff_dyn is only queried on
+    // already-lowered values, so results are stable for the
+    // rest of lowering.
+    std::vector<int8_t> eff_memo;
     std::vector<Step> steps;
     std::map<std::string, int> by_name;
     std::vector<std::string> in_names, out_names;
@@ -2970,6 +2998,91 @@ void lower_node(Compiler& C, const onnxm::Node& n);
 // indices) and the body value range (bind skips its views; the
 // runner resolves them per iteration). Scan outputs (body
 // outputs beyond cond + carried) are not supported.
+void lower_if(Compiler& C, const onnxm::Node& n, const std::vector<int>& ins) {
+    Impl& im = C.im;
+    auto* ta = n.attr("then_branch");
+    auto* ea = n.attr("else_branch");
+    if (!ta || !ta->g || !ea || !ea->g) fail("If (" + n.name + "): missing branch graph");
+    if (ins.size() != 1 || ins[0] < 0) fail("If (" + n.name + "): needs one cond input");
+    auto saved_names = im.by_name;
+    int v_begin = (int)im.vals.size();
+    auto compile_branch = [&](const onnxm::Graph& br, const char* tag,
+                              std::vector<int>& outs, int& u0, int& u1) {
+        Compiler BC(im, br, C.label + tag);
+        for (auto& t : br.initializers) {
+            Value v;
+            v.kind = Value::CONSTV;
+            v.ct = decode_f16_const(t);
+            im.vals.push_back(std::move(v));
+            BC.reg(t.name, (int)im.vals.size() - 1);
+        }
+        u0 = im.next_uid;
+        for (auto& bn : br.nodes) lower_node(BC, bn);
+        u1 = im.next_uid;
+        for (auto& vo : br.outputs) outs.push_back(BC.vid(vo.name));
+        im.by_name = saved_names;
+    };
+    std::vector<int> t_outs, e_outs;
+    int tu0 = 0, tu1 = 0, eu0 = 0, eu1 = 0;
+    compile_branch(*ta->g, ":then", t_outs, tu0, tu1);
+    compile_branch(*ea->g, ":else", e_outs, eu0, eu1);
+    if (t_outs.size() != e_outs.size() || t_outs.size() != n.outputs.size())
+        fail("If (" + n.name + "): branch output count mismatch");
+    int v_end = (int)im.vals.size();
+    auto info_of = [](const Value& v, int& dt, std::vector<EP>& rs) {
+        if (v.kind == Value::CONSTV) {
+            dt = v.ct.data_type;
+            rs.clear();
+            for (auto d : v.ct.dims) rs.push_back(ec(d));
+        } else if (v.kind == Value::SYMVAL) {
+            dt = v.sdt;
+            rs.clear();
+            for (auto d : v.sshape) rs.push_back(ec(d));
+        } else {
+            dt = v.dtype;
+            rs = v.rshape;
+        }
+    };
+    std::vector<int> outs;
+    for (size_t i = 0; i < t_outs.size(); i++) {
+        const Value& tv = im.vals[t_outs[i]];
+        int tdt, edt;
+        std::vector<EP> trs, ers;
+        info_of(tv, tdt, trs);
+        info_of(im.vals[e_outs[i]], edt, ers);
+        Value v;
+        v.kind = Value::RT;
+        v.dtype = tdt;
+        v.is_seq = tv.is_seq;
+        v.eshape = tv.eshape;
+        v.rshape = trs;
+        if (!tv.is_seq) {
+            bool same = trs.size() == ers.size();
+            for (size_t d = 0; same && d < trs.size(); d++)
+                if (!eseq(trs[d], ers[d])) same = false;
+            if (!same) v.dyn = true;
+        }
+        im.vals.push_back(std::move(v));
+        outs.push_back((int)im.vals.size() - 1);
+    }
+    Step st;
+    st.k = SK::IF;
+    st.keep = true;
+    st.in = ins;
+    st.if_u0 = tu0;
+    st.if_u1 = tu1;
+    st.if_eu0 = eu0;
+    st.if_eu1 = eu1;
+    st.if_t_outs = t_outs;
+    st.if_e_outs = e_outs;
+    st.if_v0 = v_begin;
+    st.if_v1 = v_end;
+    C.add_step(st, outs);
+    for (auto& s : im.steps)
+        if ((s.uid >= tu0 && s.uid < tu1) || (s.uid >= eu0 && s.uid < eu1)) s.keep = true;
+    for (size_t i = 0; i < outs.size(); i++) C.reg(n.outputs[i], outs[i]);
+}
+
 void lower_loop(Compiler& C, const onnxm::Node& n, const std::vector<int>& ins) {
     Impl& im = C.im;
     auto* body_attr = n.attr("body");
@@ -3048,6 +3161,55 @@ void lower_loop(Compiler& C, const onnxm::Node& n, const std::vector<int>& ins) 
     for (size_t i = 0; i < outs.size(); i++) C.reg(n.outputs[i], outs[i]);
 }
 
+// Effective dyn-ness, valid during lowering (before the
+// Plan::compile propagation pass runs): a value counts as dyn
+// when it is flagged dyn, when it is a view of an effectively
+// dyn base, or when its producing step reads an effectively
+// dyn input. Producer steps always precede their consumers in
+// the steps array, so the recursion terminates -- but without
+// memoization it re-walks shared ancestors on every query and
+// blows up exponentially on fan-out-heavy graphs (a GPT stage
+// plan's compile spent >99% of its time here, perf-verified).
+// Results are memoized on the Impl; see the eff_memo comment.
+static bool eff_dyn(Impl& im, int vid) {
+    if ((size_t)vid >= im.eff_memo.size()) im.eff_memo.resize(im.vals.size(), -1);
+    int8_t& memo = im.eff_memo[vid];
+    if (memo >= 0) return memo == 1;
+    memo = 2;  // in progress; a re-entrant query sees "not dyn"
+    bool r = false;
+    Value& v = im.vals[vid];
+    if (v.dyn) r = true;
+    else if (v.view_kind != 0 && v.base >= 0) r = eff_dyn(im, v.base);
+    else if (v.kind == Value::RT && v.def_step >= 0) {
+        const Step& s = im.steps[v.def_step];
+        if (s.k == SK::IF) {
+            for (size_t j = 0; j < s.out.size() && !r; j++) {
+                if (s.out[j] != vid) continue;
+                if (j < s.if_t_outs.size() && eff_dyn(im, s.if_t_outs[j])) r = true;
+                if (j < s.if_e_outs.size() && eff_dyn(im, s.if_e_outs[j])) r = true;
+            }
+        } else {
+            if (s.k == SK::LOOP) {
+                for (size_t j = 0; j < s.out.size() && !r; j++)
+                    if (s.out[j] == vid && j + 1 < s.lp_body_outs.size() &&
+                        eff_dyn(im, s.lp_body_outs[j + 1]))
+                        r = true;
+            }
+            if (!r)
+                for (int in : s.in)
+                    if (in >= 0 && im.vals[in].kind == Value::RT && !im.vals[in].is_seq &&
+                        eff_dyn(im, in)) {
+                        r = true;
+                        break;
+                    }
+        }
+    }
+    // im.vals may have grown (and moved) during the recursion;
+    // write through a fresh index, not the cached reference.
+    im.eff_memo[vid] = r ? 1 : 0;
+    return r;
+}
+
 void lower_node(Compiler& C, const onnxm::Node& n) {
     Impl& im = C.im;
     const std::string& op = n.op;
@@ -3090,12 +3252,38 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
         return;
     }
     if (op == "Shape") {
+        // A dyn input whose symbolic rank is unknown (empty
+        // rshape, e.g. a SLICE_RT output) has no compile-time
+        // dim list: emit a runtime SHAPE step that reads the
+        // true dims at execution. Collapsing its empty SYMVAL
+        // to a fake const was the prompt_encoder fold crash.
+        if (im.vals[ins[0]].kind == Value::RT && im.vals[ins[0]].rshape.empty() &&
+            eff_dyn(im, ins[0])) {
+            Step st;
+            st.k = SK::SHAPE;
+            st.in = {ins[0]};
+            int o = C.new_rt(7, {});
+            im.vals[o].dyn = true;
+            C.add_step(st, {o});
+            reg_out(0, o);
+            return;
+        }
+        // Opset 15+: optional start/end attrs select a slice
+        // of the dim list (negatives count from the end).
         Value v;
         v.kind = Value::SYMVAL;
         v.sdt = 7;
         auto sh = shape_exprs(im, im.vals[ins[0]]);
-        v.sshape = {(int64_t)sh.size()};
-        v.selems = sh;
+        int64_t rank = (int64_t)sh.size();
+        int64_t start = n.attr_i("start", 0);
+        int64_t end = n.attr_i("end", rank);
+        if (start < 0) start += rank;
+        if (end < 0) end += rank;
+        start = std::max<int64_t>(0, std::min(start, rank));
+        end = std::max<int64_t>(0, std::min(end, rank));
+        if (end < start) end = start;
+        v.selems.assign(sh.begin() + start, sh.begin() + end);
+        v.sshape = {(int64_t)v.selems.size()};
         im.vals.push_back(std::move(v));
         reg_out(0, maybe_const_collapse(im, (int)im.vals.size() - 1));
         return;
@@ -3238,7 +3426,8 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
     static const std::map<std::string, UnOp> unops = {
         {"Neg", UnOp::NEG}, {"Sqrt", UnOp::SQRT}, {"Sin", UnOp::SIN}, {"Cos", UnOp::COS},
         {"Exp", UnOp::EXP}, {"Tanh", UnOp::TANH}, {"Sigmoid", UnOp::SIGMOID}, {"Relu", UnOp::RELU},
-        {"Abs", UnOp::ABS}, {"LeakyRelu", UnOp::LEAKY}, {"Erf", UnOp::ERF}};
+        {"Abs", UnOp::ABS}, {"LeakyRelu", UnOp::LEAKY}, {"Erf", UnOp::ERF},
+        {"Softplus", UnOp::SOFTPLUS}, {"Log", UnOp::LOG}};
     if (unops.count(op)) {
         if (op == "Neg" && im.vals[ins[0]].kind == Value::SYMVAL) {
             Value v = im.vals[ins[0]];
@@ -3251,6 +3440,7 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
         st.k = SK::UNOP;
         st.uop = unops.at(op);
         if (op == "LeakyRelu") st.alpha = n.attr_f("alpha", 0.01f);
+        if (op == "Softplus") st.alpha = n.attr_f("beta", 1.0f);
         st.in = ins;
         auto os = shape_exprs(im, im.vals[ins[0]]);
         int odt = dtype_of(im, ins[0]);
@@ -3326,6 +3516,26 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
             return;
         }
         int o = C.new_rt((int)to, os);
+        if (eff_dyn(im, ins[0])) im.vals[o].dyn = true;
+        C.add_step(st, {o});
+        reg_out(0, o);
+        return;
+    }
+    if (op == "CastLike") {
+        // Cast to the dtype of the second input (a type witness;
+        // only the data input becomes a step input).
+        int64_t to = dtype_of(im, ins[1]);
+        Step st;
+        st.k = SK::CAST;
+        st.in = {ins[0]};
+        auto os = shape_exprs(im, im.vals[ins[0]]);
+        if (C.all_const({ins[0]})) {
+            auto outs = fold_node(C, n, {ins[0]}, st, {{(int)to, os}}, {});
+            reg_out(0, outs[0]);
+            return;
+        }
+        int o = C.new_rt((int)to, os);
+        if (eff_dyn(im, ins[0])) im.vals[o].dyn = true;
         C.add_step(st, {o});
         reg_out(0, o);
         return;
@@ -3337,29 +3547,36 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
         st.in = ins;
         std::vector<EP> os;
         int odt = dtype_of(im, ins[0]);
+        // A dyn operand's rshape may be rank-deficient; the
+        // output shape then comes from dyn_shape_for at exec.
+        bool dyn_in = eff_dyn(im, ins[0]) || (ins.size() > 1 && ins[1] >= 0 && eff_dyn(im, ins[1]));
         if (op == "MatMul") {
             st.k = SK::MATMUL;
             st.in = {ins[0], ins[1]};
-            os = matmul_shape(shape_exprs(im, im.vals[ins[0]]), shape_exprs(im, im.vals[ins[1]]));
+            if (!dyn_in)
+                os = matmul_shape(shape_exprs(im, im.vals[ins[0]]), shape_exprs(im, im.vals[ins[1]]));
         } else {
             st.k = SK::GEMM;
             st.alpha = n.attr_f("alpha", 1.0f);
             st.beta = n.attr_f("beta", 1.0f);
             st.transA = (int)n.attr_i("transA", 0);
             st.transB = (int)n.attr_i("transB", 0);
-            auto as = shape_exprs(im, im.vals[ins[0]]);
-            auto bs = shape_exprs(im, im.vals[ins[1]]);
-            if (as.size() != 2 || bs.size() != 2) fail_op("Gemm rank != 2");
-            os = {st.transA ? as[1] : as[0], st.transB ? bs[0] : bs[1]};
+            if (!dyn_in) {
+                auto as = shape_exprs(im, im.vals[ins[0]]);
+                auto bs = shape_exprs(im, im.vals[ins[1]]);
+                if (as.size() != 2 || bs.size() != 2) fail_op("Gemm rank != 2");
+                os = {st.transA ? as[1] : as[0], st.transB ? bs[0] : bs[1]};
+            }
             st.in = {ins[0], ins[1]};
             if (ins.size() > 2 && ins[2] >= 0) st.in.push_back(ins[2]);
         }
-        if (C.all_const(st.in)) {
+        if (!dyn_in && C.all_const(st.in)) {
             auto outs = fold_node(C, n, st.in, st, {{odt, os}}, {});
             reg_out(0, outs[0]);
             return;
         }
         int o = C.new_rt(odt, os);
+        if (dyn_in) im.vals[o].dyn = true;
         mark_b_f16(C, st);
         C.add_step(st, {o});
         reg_out(0, o);
@@ -3382,6 +3599,16 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
             st.c_pads.assign(at->ints.begin(), at->ints.begin() + sp);
         }
         st.c_group = n.attr_i("group", 1);
+        if (eff_dyn(im, ins[0])) {
+            // Attr-derived geometry vectors keep the true
+            // spatial count (from the pads/strides attrs);
+            // dyn_shape_for sizes the output at exec.
+            int o = C.new_rt(dtype_of(im, ins[0]), {});
+            im.vals[o].dyn = true;
+            C.add_step(st, {o});
+            reg_out(0, o);
+            return;
+        }
         auto xs = shape_exprs(im, im.vals[ins[0]]);
         auto ws = shape_exprs(im, im.vals[ins[1]]);
         int sp = (int)xs.size() - 2;
@@ -3426,6 +3653,13 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
         }
         at = n.attr("output_padding");
         if (at && !at->ints.empty()) st.ct_out_pad = at->ints[0];
+        if (eff_dyn(im, ins[0])) {
+            int o = C.new_rt(dtype_of(im, ins[0]), {});
+            im.vals[o].dyn = true;
+            C.add_step(st, {o});
+            reg_out(0, o);
+            return;
+        }
         auto xs = shape_exprs(im, im.vals[ins[0]]);
         auto ws = shape_exprs(im, im.vals[ins[1]]);
         int sp = (int)xs.size() - 2;
@@ -3566,22 +3800,32 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
         }
         for (auto& a : axes) a = norm_axis(a, xs.size());
         st.axes = axes;
+        // A dyn input's symbolic shape may be rank-deficient
+        // (its true rank only exists at execution); the axes
+        // stay as lowered and the output becomes dyn instead
+        // of indexing past the shape vector.
+        bool shape_bad = eff_dyn(im, ins[0]);
+        for (auto a : axes)
+            if (a < 0 || a >= (int64_t)xs.size()) shape_bad = true;
         std::vector<EP> os;
-        std::vector<char> red(xs.size(), 0);
-        for (auto a : axes) red[a] = 1;
-        for (size_t i = 0; i < xs.size(); i++) {
-            if (red[i]) {
-                if (st.keepdims) os.push_back(ec(1));
-            } else
-                os.push_back(xs[i]);
+        if (!shape_bad) {
+            std::vector<char> red(xs.size(), 0);
+            for (auto a : axes) red[a] = 1;
+            for (size_t i = 0; i < xs.size(); i++) {
+                if (red[i]) {
+                    if (st.keepdims) os.push_back(ec(1));
+                } else
+                    os.push_back(xs[i]);
+            }
         }
         int odt = dtype_of(im, ins[0]);
-        if (C.all_const(st.in)) {
+        if (!shape_bad && C.all_const(st.in)) {
             auto outs = fold_node(C, n, st.in, st, {{odt, os}}, {});
             reg_out(0, outs[0]);
             return;
         }
         int o = C.new_rt(odt, os);
+        if (shape_bad) im.vals[o].dyn = true;
         C.add_step(st, {o});
         reg_out(0, o);
         return;
@@ -3742,18 +3986,40 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
         st.k = SK::CONCAT;
         st.in = ins;
         st.axis = n.attr_i("axis", 0);
-        auto os = shape_exprs(im, im.vals[ins[0]]);
-        int64_t ax = norm_axis(st.axis, os.size());
-        EP sum = ec(0);
-        for (int v : ins) sum = eadd(sum, shape_exprs(im, im.vals[v])[ax]);
-        os[ax] = sum;
+        // Template shape: the first input with a known rank (a
+        // dyn input, e.g. a ConcatFromSequence result whose
+        // element shape is unknown, may carry an empty shape).
+        // When every input's shape is unknown the output is
+        // dyn with no shape at all; the exec dyn branch derives
+        // it from the true descriptors and normalizes the raw
+        // axis there.
+        std::vector<EP> os;
+        for (int v : ins) {
+            auto s = shape_exprs(im, im.vals[v]);
+            if (!s.empty()) { os = s; break; }
+        }
+        bool any_dyn = os.empty();
+        for (int v : ins)
+            if (eff_dyn(im, v)) any_dyn = true;
+        if (!os.empty()) {
+            int64_t ax = norm_axis(st.axis, (int64_t)os.size());
+            EP sum = ec(0);
+            for (int v : ins) {
+                auto s = shape_exprs(im, im.vals[v]);
+                if ((int64_t)s.size() <= ax) { any_dyn = true; continue; }
+                sum = eadd(sum, s[ax]);
+            }
+            if (!any_dyn) os[ax] = sum;
+            else os.clear();
+        }
         int odt = dtype_of(im, ins[0]);
-        if (C.all_const(st.in)) {
+        if (!any_dyn && C.all_const(st.in)) {
             auto outs = fold_node(C, n, st.in, st, {{odt, os}}, {});
             reg_out(0, outs[0]);
             return;
         }
         int o = C.new_rt(odt, os);
+        if (any_dyn) im.vals[o].dyn = true;
         C.add_step(st, {o});
         reg_out(0, o);
         return;
@@ -3762,15 +4028,27 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
     // ---- ConstantOfShape / RandomNormalLike ----
     if (op == "ConstantOfShape") {
         std::vector<EP> elems;
-        if (!value_sym_elems(im, ins[0], elems)) fail_op("shape input not symbolic/const");
+        bool sym = value_sym_elems(im, ins[0], elems);
         Step st;
         st.k = SK::CONSTSHAPE;
+        st.in = {ins[0]};
         auto* at = n.attr("value");
         if (at && at->t) st.fill = *at->t;
         else {
             st.fill.data_type = 1;
             st.fill.dims = {1};
             st.fill.data.assign(4, 0);
+        }
+        if (!sym) {
+            // Runtime shape spec (a tensor produced at
+            // execution, e.g. by a SHAPE step over a dyn
+            // tensor): output dims exist only at execution;
+            // dyn_shape_for reads them from the input there.
+            int o = C.new_rt(st.fill.data_type, {});
+            im.vals[o].dyn = true;
+            C.add_step(st, {o});
+            reg_out(0, o);
+            return;
         }
         // Constant spec -> constant tensor: fold it (phase 2; the vits
         // attention pads chains route through a ConstantOfShape whose
@@ -3857,6 +4135,21 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
             return;
         }
         auto is = shape_exprs(im, im.vals[ins[0]]);
+        if (eff_dyn(im, ins[0])) {
+            // Keep the perm raw (empty = reverse-all); the
+            // true rank only exists at execution and
+            // resolve_view normalizes against it.
+            Value v;
+            v.kind = Value::RT;
+            v.dtype = dtype_of(im, ins[0]);
+            v.dyn = true;
+            v.view_kind = 1;
+            v.base = ins[0];
+            v.vperm = perm;
+            im.vals.push_back(std::move(v));
+            reg_out(0, (int)im.vals.size() - 1);
+            return;
+        }
         if (perm.empty()) { perm.resize(is.size()); for (size_t i = 0; i < is.size(); i++) perm[i] = (int64_t)is.size() - 1 - i; }
         std::vector<EP> os;
         for (auto p : perm) os.push_back(is[p]);
@@ -3877,7 +4170,41 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
             if (r >= 0) { reg_out(0, r); return; }
         }
         std::vector<EP> target;
-        if (!value_sym_elems(im, ins[1], target)) fail_op("Reshape target not symbolic/const");
+        if (!value_sym_elems(im, ins[1], target)) {
+            // Runtime target tensor (produced by a step, e.g. an
+            // If branch in the SV index loop): a dyn view;
+            // resolve_view recomputes the shape from the
+            // target's values whenever it re-resolves.
+            if (im.vals[ins[1]].kind != Value::RT) fail_op("Reshape target not symbolic/const");
+            Value v;
+            v.kind = Value::RT;
+            v.dtype = dtype_of(im, ins[0]);
+            v.dyn = true;
+            v.view_kind = 2;
+            v.base = ins[0];
+            v.meta0 = ins[1];
+            im.vals.push_back(std::move(v));
+            reg_out(0, (int)im.vals.size() - 1);
+            return;
+        }
+        if (eff_dyn(im, ins[0])) {
+            // Symbolic target but a dyn base: the 0-copy and
+            // -1-infer entries would index a rank-deficient
+            // shape vector. The dyn view path recomputes the
+            // shape from the target's values at exec; the
+            // target value (const or symbolic) is materialized
+            // in res like any meta tensor.
+            Value v;
+            v.kind = Value::RT;
+            v.dtype = dtype_of(im, ins[0]);
+            v.dyn = true;
+            v.view_kind = 2;
+            v.base = ins[0];
+            v.meta0 = ins[1];
+            im.vals.push_back(std::move(v));
+            reg_out(0, (int)im.vals.size() - 1);
+            return;
+        }
         auto is = shape_exprs(im, im.vals[ins[0]]);
         std::vector<EP> os;
         int infer = -1;
@@ -3949,17 +4276,32 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
         auto is = shape_exprs(im, im.vals[ins[0]]);
         std::vector<EP> os;
         std::vector<int64_t> naxes;
+        bool in_dyn = eff_dyn(im, ins[0]);
         if (op == "Unsqueeze") {
             if (!have_axes) fail_op("Unsqueeze axes unknown");
-            int64_t nr = (int64_t)is.size() + (int64_t)axes.size();
-            std::vector<char> at(nr, 0);
-            for (auto a : axes) {
-                int64_t na = norm_axis(a, nr);
-                at[na] = 1;
-                naxes.push_back(na);
+            if (in_dyn) {
+                // The true rank only exists at execution; keep
+                // the axes raw (negatives included) and let
+                // resolve_view normalize them against the
+                // base's true rank. The shape stays unknown.
+                naxes = axes;
+            } else {
+                int64_t nr = (int64_t)is.size() + (int64_t)axes.size();
+                std::vector<char> at(nr, 0);
+                for (auto a : axes) {
+                    int64_t na = norm_axis(a, nr);
+                    at[na] = 1;
+                    naxes.push_back(na);
+                }
+                size_t src = 0;
+                for (int64_t i = 0; i < nr; i++) os.push_back(at[i] ? ec(1) : is[src++]);
             }
-            size_t src = 0;
-            for (int64_t i = 0; i < nr; i++) os.push_back(at[i] ? ec(1) : is[src++]);
+        } else if (in_dyn) {
+            // Squeeze of a dyn tensor: with axes, keep them raw
+            // for exec-time normalization; without axes, the
+            // {-1} sentinel tells resolve_view to drop every
+            // size-1 dim of the true shape.
+            naxes = have_axes ? axes : std::vector<int64_t>{-1};
         } else {
             std::vector<char> drop(is.size(), 0);
             if (have_axes) {
@@ -4012,14 +4354,31 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
         }
         auto is = shape_exprs(im, im.vals[ins[0]]);
         int64_t rank = (int64_t)is.size();
+        std::vector<EP> sev, eev, pev;
+        bool sym_ok = value_sym_elems(im, ins[1], sev) && value_sym_elems(im, ins[2], eev);
+        if (sym_ok && ins.size() > 4 && ins[4] >= 0)
+            sym_ok = value_sym_elems(im, ins[4], pev);
+        if (!sym_ok || eff_dyn(im, ins[0])) {
+            // A dyn input's symbolic shape may be rank-deficient;
+            // SLICE_RT resolves against the true descriptor and
+            // normalizes the raw axes at execution.
+            Value v;
+            v.kind = Value::RT;
+            v.dtype = dtype_of(im, ins[0]);
+            v.dyn = true;
+            im.vals.push_back(std::move(v));
+            int o = (int)im.vals.size() - 1;
+            Step st;
+            st.k = SK::SLICE_RT;
+            st.in = ins;
+            st.axes = axes;
+            C.add_step(st, {o});
+            reg_out(0, o);
+            return;
+        }
         if (axes.empty()) { axes.resize(rank); for (int64_t i = 0; i < rank; i++) axes[i] = i; }
         for (auto& a : axes) a = norm_axis(a, rank);
-        std::vector<EP> sev, eev, pev;
-        if (!value_sym_elems(im, ins[1], sev) || !value_sym_elems(im, ins[2], eev)) fail_op("Slice bounds not symbolic/const");
-        if (ins.size() > 4 && ins[4] >= 0) {
-            if (!value_sym_elems(im, ins[4], pev)) fail_op("Slice steps not symbolic/const");
-        } else
-            pev.assign(axes.size(), ec(1));
+        if (pev.empty()) pev.assign(axes.size(), ec(1));
         std::vector<EP> os = is;
         for (size_t i = 0; i < axes.size(); i++) {
             int64_t ax = axes[i];
@@ -4136,13 +4495,27 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
         std::vector<EP> pads_e;
         if (!value_sym_elems(im, pads_vid, pads_e)) fail_op("Pad pads not symbolic/const");
         auto xs = shape_exprs(im, im.vals[ins[0]]);
+        int odt = dtype_of(im, ins[0]);
+        st.in = {ins[0], pads_vid};
+        if (ins.size() > 2 && ins[2] >= 0) st.in.push_back(ins[2]);
+        if (eff_dyn(im, ins[0])) {
+            // Rank is only known at execution; dyn_shape_for
+            // sizes the output from the true input shape and
+            // the pads descriptor.
+            Value v;
+            v.kind = Value::RT;
+            v.dtype = odt;
+            v.dyn = true;
+            im.vals.push_back(std::move(v));
+            int o = (int)im.vals.size() - 1;
+            C.add_step(st, {o});
+            reg_out(0, o);
+            return;
+        }
         int64_t r = (int64_t)xs.size();
         if ((int64_t)pads_e.size() != 2 * r) fail_op("Pad: pads length != 2*rank");
         std::vector<EP> os = xs;
         for (int64_t d = 0; d < r; d++) os[d] = eadd(eadd(xs[d], pads_e[d]), pads_e[r + d]);
-        st.in = {ins[0], pads_vid};
-        if (ins.size() > 2 && ins[2] >= 0) st.in.push_back(ins[2]);
-        int odt = dtype_of(im, ins[0]);
         if (C.all_const(st.in)) {
             auto outs = fold_node(C, n, st.in, st, {{odt, os}}, {});
             reg_out(0, outs[0]);
@@ -4160,6 +4533,53 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
         if (ins.size() > 1 && ins[1] >= 0) {
             if (!value_const_ints(im, ins[1], sizes)) fail_op("Split sizes not const");
         } else if (auto* at = n.attr("split")) sizes = at->ints;
+        if (eff_dyn(im, ins[0])) {
+            // Dyn base: the views carry their split geometry in
+            // meta fields and resolve_view computes the window
+            // from the base's true shape. meta3 = 1: const
+            // sizes (meta1 = offset, meta2 = length). meta3 =
+            // 2: equal split (meta1 = output index, meta2 =
+            // output count). meta0 keeps the raw axis.
+            int odt = dtype_of(im, ins[0]);
+            int64_t raw_ax = n.attr_i("axis", 0);
+            if (!sizes.empty()) {
+                if (sizes.size() != n.outputs.size()) fail_op("Split: sizes/outputs mismatch");
+                int64_t off = 0;
+                for (size_t i = 0; i < sizes.size(); i++) {
+                    Value v;
+                    v.kind = Value::RT;
+                    v.dtype = odt;
+                    v.dyn = true;
+                    v.view_kind = 7;
+                    v.base = ins[0];
+                    v.meta0 = (int)raw_ax;
+                    v.meta1 = (int)off;
+                    v.meta2 = (int)sizes[i];
+                    v.meta3 = 1;
+                    im.vals.push_back(std::move(v));
+                    reg_out((int)i, (int)im.vals.size() - 1);
+                    off += sizes[i];
+                }
+            } else {
+                int64_t cnt = (int64_t)n.outputs.size();
+                if (cnt == 0) fail_op("Split: no outputs");
+                for (int64_t i = 0; i < cnt; i++) {
+                    Value v;
+                    v.kind = Value::RT;
+                    v.dtype = odt;
+                    v.dyn = true;
+                    v.view_kind = 7;
+                    v.base = ins[0];
+                    v.meta0 = (int)raw_ax;
+                    v.meta1 = (int)i;
+                    v.meta2 = (int)cnt;
+                    v.meta3 = 2;
+                    im.vals.push_back(std::move(v));
+                    reg_out((int)i, (int)im.vals.size() - 1);
+                }
+            }
+            return;
+        }
         auto xs = shape_exprs(im, im.vals[ins[0]]);
         int64_t ax = norm_axis(n.attr_i("axis", 0), xs.size());
         if (sizes.empty()) {
@@ -4253,6 +4673,21 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
         Step st;
         st.k = SK::EXPAND;
         st.in = {ins[0]};
+        // A fully-constant target is also stored on the step:
+        // when the data is dyn-shaped at runtime (its shape
+        // exprs may contain unbindable placeholder symbols
+        // from a runtime-target Expand upstream), the exec
+        // case recomputes the output shape by broadcasting
+        // the data's true shape with these dims.
+        {
+            bool allc = true;
+            for (auto& e : target) {
+                int64_t c;
+                if (!econst(e, c)) { allc = false; break; }
+                st.axes.push_back(c);
+            }
+            if (!allc) st.axes.clear();
+        }
         int odt = dtype_of(im, ins[0]);
         if (C.all_const(st.in)) {
             auto outs = fold_node(C, n, st.in, st, {{odt, os}}, {});
@@ -4389,6 +4824,183 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
         reg_out(0, o);
         return;
     }
+    if (op == "If") {
+        lower_if(C, n, ins);
+        return;
+    }
+    if (op == "Range") {
+        // start / limit / delta are scalars, const or runtime; the
+        // element count is only known at exec time, so the output
+        // is a dyn tensor filled by a RANGE step.
+        Value v;
+        v.kind = Value::RT;
+        v.dtype = dtype_of(im, ins[0]);
+        v.dyn = true;
+        im.vals.push_back(std::move(v));
+        int o = (int)im.vals.size() - 1;
+        Step st;
+        st.k = SK::RANGE;
+        st.in = ins;
+        C.add_step(st, {o});
+        reg_out(0, o);
+        return;
+    }
+    if (op == "STFT") {
+        // ORT's input order, pinned by a bare-graph probe against
+        // numpy: signal, frame_step, window, frame_length. (The
+        // ONNX spec lists frame_length second; ORT reads the
+        // fourth input as frame_length and rejects the graph
+        // when it differs from the window length. Genie's
+        // export follows ORT.)
+        std::vector<int64_t> flv, fsv;
+        if (ins.size() > 3 && ins[3] >= 0) {
+            if (!value_const_ints(im, ins[3], flv) || flv.size() != 1) fail_op("STFT frame_length not const");
+        }
+        if (ins.size() > 1 && ins[1] >= 0) {
+            if (!value_const_ints(im, ins[1], fsv) || fsv.size() != 1) fail_op("STFT frame_step not const");
+        }
+        auto is = shape_exprs(im, im.vals[ins[0]]);
+        if (is.size() < 2) fail_op("STFT signal rank < 2");
+        int64_t fl = flv.empty() ? -1 : flv[0];
+        if (fl < 0 && ins.size() > 2 && ins[2] >= 0) {
+            auto ws = shape_exprs(im, im.vals[ins[2]]);
+            int64_t c;
+            if (ws.size() == 1 && econst(ws[0], c)) fl = c;
+        }
+        if (fl < 0) fail_op("STFT frame_length unknown");
+        int64_t fs = fsv.empty() ? fl : fsv[0];
+        int64_t onesided = n.attr_i("onesided", 1);
+        int64_t bins = onesided ? fl / 2 + 1 : fl;
+        EP frames = eadd(ediv(esub(is[1], ec(fl)), ec(fs)), ec(1));
+        Value v;
+        v.kind = Value::RT;
+        v.dtype = dtype_of(im, ins[0]);
+        v.rshape = {is[0], frames, ec(bins), ec(2)};
+        im.vals.push_back(std::move(v));
+        int o = (int)im.vals.size() - 1;
+        Step st;
+        st.k = SK::STFT;
+        st.in = ins;
+        st.axis = onesided;
+        C.add_step(st, {o});
+        reg_out(0, o);
+        return;
+    }
+    if (op == "Tile") {
+        auto is = shape_exprs(im, im.vals[ins[0]]);
+        std::vector<int64_t> reps;
+        bool reps_const = ins.size() > 1 && ins[1] >= 0 &&
+                          value_const_ints(im, ins[1], reps) && reps.size() == is.size();
+        Value v;
+        v.kind = Value::RT;
+        v.dtype = dtype_of(im, ins[0]);
+        v.rshape = is;
+        if (reps_const) {
+            for (size_t i = 0; i < is.size(); i++) v.rshape[i] = emul(is[i], ec(reps[i]));
+        } else {
+            v.dyn = true;
+        }
+        im.vals.push_back(std::move(v));
+        int o = (int)im.vals.size() - 1;
+        Step st;
+        st.k = SK::TILE;
+        st.in = ins;
+        C.add_step(st, {o});
+        reg_out(0, o);
+        return;
+    }
+    if (op == "PRelu") {
+        Step st;
+        st.k = SK::PRELU;
+        st.in = ins;
+        auto os = shape_exprs(im, im.vals[ins[0]]);
+        int odt = dtype_of(im, ins[0]);
+        if (C.all_const(ins)) {
+            auto outs = fold_node(C, n, ins, st, {{odt, os}}, {});
+            reg_out(0, outs[0]);
+            return;
+        }
+        int o = C.new_rt(odt, os);
+        C.add_step(st, {o});
+        reg_out(0, o);
+        return;
+    }
+    if (op == "DFT") {
+        // axis in st.axis, onesided in st.keepdims, inverse in
+        // st.exclusive. Output's last dim (components) is
+        // always 2; the axis length halves (onesided).
+        auto is = shape_exprs(im, im.vals[ins[0]]);
+        // The exec case normalizes the raw axis against the
+        // true rank; the symbolic shape is only trusted when
+        // the input is not dyn (a dyn input's rshape may be
+        // rank-deficient, and indexing it would go out of
+        // bounds).
+        int64_t ax = n.attr_i("axis", 1);
+        int64_t onesided = n.attr_i("onesided", 0);
+        std::vector<EP> os;
+        if (!eff_dyn(im, ins[0])) {
+            int64_t nax = norm_axis(ax, (int64_t)is.size());
+            os = is;
+            if (onesided) os[nax] = eadd(ediv(is[nax], ec(2)), ec(1));
+            if (!os.empty()) os.back() = ec(2);
+        }
+        Value v;
+        v.kind = Value::RT;
+        v.dtype = dtype_of(im, ins[0]);
+        v.rshape = os;
+        if (eff_dyn(im, ins[0])) v.dyn = true;
+        im.vals.push_back(std::move(v));
+        int o = (int)im.vals.size() - 1;
+        Step st;
+        st.k = SK::DFT;
+        st.in = ins;
+        st.axis = ax;
+        st.keepdims = onesided != 0;
+        st.exclusive = n.attr_i("inverse", 0) != 0;
+        C.add_step(st, {o});
+        reg_out(0, o);
+        return;
+    }
+    if (op == "BatchNormalization") {
+        if (n.attr_i("training_mode", 0) != 0) fail_op("BatchNormalization training mode");
+        if (n.outputs.size() != 1) fail_op("BatchNormalization extra outputs");
+        Step st;
+        st.k = SK::BNORM;
+        st.in = ins;
+        st.eps = n.attr_f("epsilon", 1e-5f);
+        auto os = shape_exprs(im, im.vals[ins[0]]);
+        int odt = dtype_of(im, ins[0]);
+        if (C.all_const(ins)) {
+            auto outs = fold_node(C, n, ins, st, {{odt, os}}, {});
+            reg_out(0, outs[0]);
+            return;
+        }
+        int o = C.new_rt(odt, os);
+        C.add_step(st, {o});
+        reg_out(0, o);
+        return;
+    }
+    if (op == "Clip") {
+        // Bounds from attrs (old opsets) or scalar inputs; input
+        // bounds are re-read at exec, attr bounds ride st.alpha /
+        // st.beta with infinities for "unbounded".
+        Step st;
+        st.k = SK::CLIP;
+        st.in = ins;
+        st.alpha = n.attr_f("min", -std::numeric_limits<float>::infinity());
+        st.beta = n.attr_f("max", std::numeric_limits<float>::infinity());
+        auto os = shape_exprs(im, im.vals[ins[0]]);
+        int odt = dtype_of(im, ins[0]);
+        if (C.all_const(ins)) {
+            auto outs = fold_node(C, n, ins, st, {{odt, os}}, {});
+            reg_out(0, outs[0]);
+            return;
+        }
+        int o = C.new_rt(odt, os);
+        C.add_step(st, {o});
+        reg_out(0, o);
+        return;
+    }
     if (op == "Loop") {
         lower_loop(C, n, ins);
         return;
@@ -4416,6 +5028,222 @@ static void apply_epi_leaky(float* y, int64_t n, float alpha) {
         });
     };
     packed::pool_run(n, body);
+}
+
+// Exact integer elements of a small runtime tensor (slice
+// bounds, range scalars), in logical order, following strides.
+static std::vector<int64_t> rt_ints(const RT& t) {
+    std::vector<int64_t> r;
+    int64_t n = t.numel();
+    r.reserve((size_t)n);
+    int rank = (int)t.shape.size();
+    std::vector<int64_t> str = t.strides.empty() ? rowmajor(t.shape) : t.strides;
+    std::vector<int64_t> coord(rank, 0);
+    int64_t off = 0;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t v = 0;
+        switch (t.dtype) {
+            case 7: memcpy(&v, t.p + off * 8, 8); break;
+            case 6: { int32_t x; memcpy(&x, t.p + off * 4, 4); v = x; break; }
+            case 9: v = t.p[off] != 0 ? 1 : 0; break;
+            default: v = (int64_t)read_d(t, off); break;
+        }
+        r.push_back(v);
+        for (int d = rank - 1; d >= 0; d--) {
+            off += str[d];
+            if (++coord[d] < t.shape[d]) break;
+            coord[d] = 0;
+            off -= str[d] * t.shape[d];
+        }
+    }
+    return r;
+}
+
+// Iterative radix-2 FFT (forward, double precision) for the
+// STFT step. a.size() must be a power of two.
+static void fft_pow2(std::vector<std::complex<double>>& a) {
+    int n = (int)a.size();
+    for (int i = 1, j = 0; i < n; i++) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(a[i], a[j]);
+    }
+    const double PI = 3.14159265358979323846;
+    for (int len = 2; len <= n; len <<= 1) {
+        double ang = -2.0 * PI / len;
+        std::complex<double> wl(std::cos(ang), std::sin(ang));
+        for (int i = 0; i < n; i += len) {
+            std::complex<double> w = 1.0;
+            for (int k = 0; k < len / 2; k++) {
+                std::complex<double> u = a[i + k], v = a[i + k + len / 2] * w;
+                a[i + k] = u + v;
+                a[i + k + len / 2] = u - v;
+                w *= wl;
+            }
+        }
+    }
+}
+
+// Step kinds whose exec case sizes a dyn output itself (from
+// runtime values or by copying a descriptor); all other kinds
+// get their dyn output descriptor from dyn_shape_for.
+static bool step_self_alloc(SK k) {
+    switch (k) {
+        case SK::SEQ_EMPTY: case SK::SEQ_SPLIT: case SK::SEQ_AT: case SK::SEQ_INSERT:
+        case SK::SEQ_CONCAT: case SK::IF: case SK::LOOP: case SK::SLICE_RT:
+        case SK::RANGE: case SK::TILE: case SK::EXPAND: case SK::CAST:
+        case SK::CONCAT: case SK::DFT: case SK::SHAPE:
+            return true;
+        default: return false;
+    }
+}
+
+static std::vector<int64_t> bcast_shape_c(const std::vector<int64_t>& A, const std::vector<int64_t>& B) {
+    size_t r = std::max(A.size(), B.size());
+    std::vector<int64_t> out(r);
+    for (size_t i = 0; i < r; i++) {
+        int64_t da = i < r - A.size() ? 1 : A[i - (r - A.size())];
+        int64_t db = i < r - B.size() ? 1 : B[i - (r - B.size())];
+        out[i] = da == db ? da : (da == 1 ? db : da);
+    }
+    return out;
+}
+
+static std::vector<int64_t> matmul_shape_c(std::vector<int64_t> a, std::vector<int64_t> b) {
+    bool a1 = a.size() == 1, b1 = b.size() == 1;
+    if (a1) a = {1, a[0]};
+    if (b1) b = {b[0], 1};
+    std::vector<int64_t> out = bcast_shape_c(std::vector<int64_t>(a.begin(), a.end() - 2),
+                                             std::vector<int64_t>(b.begin(), b.end() - 2));
+    out.push_back(a[a.size() - 2]);
+    out.push_back(b[b.size() - 1]);
+    if (a1) out.erase(out.begin() + (int)out.size() - 2);
+    if (b1) out.pop_back();
+    return out;
+}
+
+// Concrete output descriptor for a dyn step output, computed
+// from the input descriptors at execution time.
+static RT dyn_shape_for(Impl& im, const Step& st, const std::vector<RT>& sin, int ov) {
+    std::vector<int64_t> sh;
+    auto A = [&](int i) -> const RT& { return sin[(size_t)i]; };
+    switch (st.k) {
+        case SK::BINOP: sh = bcast_shape_c(A(0).shape, A(1).shape); break;
+        case SK::WHERE: sh = bcast_shape_c(bcast_shape_c(A(0).shape, A(1).shape), A(2).shape); break;
+        case SK::UNOP: case SK::PRELU: case SK::CLIP: case SK::BNORM:
+        case SK::SOFTMAX: case SK::LN: case SK::INSTNORM: case SK::CUMSUM:
+        case SK::COPY:
+            sh = A(0).shape;
+            break;
+        case SK::GATHER_EL: sh = A(1).shape; break;
+        case SK::SCATTER_EL: sh = A(0).shape; break;
+        case SK::MATMUL: sh = matmul_shape_c(A(0).shape, A(1).shape); break;
+        case SK::GEMM: {
+            std::vector<int64_t> a = A(0).shape, b = A(1).shape;
+            if (st.transA && a.size() >= 2) std::swap(a[a.size() - 2], a[a.size() - 1]);
+            if (st.transB && b.size() >= 2) std::swap(b[b.size() - 2], b[b.size() - 1]);
+            sh = matmul_shape_c(a, b);
+            break;
+        }
+        case SK::PACKED: {
+            sh = A(0).shape;
+            if (!sh.empty()) sh[sh.size() - 1] = st.pm_cols;
+            break;
+        }
+        case SK::CONV: {
+            const auto& xs = A(0).shape;
+            const auto& ws = A(1).shape;
+            sh = xs;
+            sh[1] = ws[0];
+            // Geometry vectors may be shorter than the true
+            // spatial rank (attr defaults); missing entries
+            // take the ONNX defaults.
+            auto gv = [](const std::vector<int64_t>& v, size_t i, int64_t dflt) {
+                return i < v.size() ? v[i] : dflt;
+            };
+            for (size_t d = 2; d < xs.size(); d++)
+                sh[d] = (xs[d] + 2 * gv(st.c_pads, d - 2, 0) - gv(st.c_dil, d - 2, 1) * (ws[d] - 1) - 1) /
+                            gv(st.c_strides, d - 2, 1) + 1;
+            break;
+        }
+        case SK::CONVT: {
+            const auto& xs = A(0).shape;
+            const auto& ws = A(1).shape;
+            sh = xs;
+            sh[1] = ws[1] * st.c_group;
+            auto gv = [](const std::vector<int64_t>& v, size_t i, int64_t dflt) {
+                return i < v.size() ? v[i] : dflt;
+            };
+            for (size_t d = 2; d < xs.size(); d++)
+                sh[d] = (xs[d] - 1) * gv(st.c_strides, d - 2, 1) - gv(st.c_pads, d - 2, 0) -
+                        gv(st.c_pads_end, d - 2, 0) + gv(st.c_dil, d - 2, 1) * (ws[d] - 1) + st.ct_out_pad + 1;
+            break;
+        }
+        case SK::REDUCESUM: {
+            sh = A(0).shape;
+            std::vector<int64_t> axes = st.axes;
+            for (auto& a : axes) a = norm_axis(a, sh.size());
+            std::sort(axes.begin(), axes.end(), std::greater<int64_t>());
+            for (auto a : axes) {
+                if (a < 0 || a >= (int64_t)sh.size()) continue;
+                if (st.keepdims) sh[(size_t)a] = 1;
+                else sh.erase(sh.begin() + (size_t)a);
+            }
+            break;
+        }
+        case SK::ARGMAX: {
+            sh = A(0).shape;
+            int64_t a = norm_axis(st.axis, sh.size());
+            if (st.keepdims) sh[(size_t)a] = 1;
+            else sh.erase(sh.begin() + (size_t)a);
+            break;
+        }
+        case SK::TOPK: {
+            sh = A(0).shape;
+            int64_t a = norm_axis(st.axis, sh.size());
+            sh[(size_t)a] = st.topk;
+            break;
+        }
+        case SK::GATHER: {
+            int64_t a = norm_axis(st.axis, A(0).shape.size());
+            sh.clear();
+            for (int64_t i = 0; i < a; i++) sh.push_back(A(0).shape[(size_t)i]);
+            for (auto d : A(1).shape) sh.push_back(d);
+            for (size_t i = (size_t)a + 1; i < A(0).shape.size(); i++) sh.push_back(A(0).shape[i]);
+            break;
+        }
+        case SK::PAD: {
+            sh = A(0).shape;
+            std::vector<int64_t> pads = rt_ints(A(1));
+            // ONNX pads layout: all begins, then all ends.
+            for (size_t d = 0; d < sh.size() && d + sh.size() < pads.size(); d++)
+                sh[d] += pads[d] + pads[d + sh.size()];
+            break;
+        }
+        case SK::CONSTSHAPE: sh = rt_ints(A(0)); break;
+        case SK::RANDNORM: sh = A(0).shape; break;
+        case SK::STFT: {
+            // Mirror the exec geometry: [N, F, bins, 2] with
+            // F = (L - fl) / fs + 1, bins from the onesided flag
+            // (carried in st.axis at lowering).
+            int64_t fs = rt_ints(A(1)).at(0);
+            int64_t fl = (st.in.size() > 3 && st.in[3] >= 0) ? rt_ints(A(3)).at(0)
+                         : (st.in.size() > 2 && st.in[2] >= 0 ? A(2).numel() : A(0).shape[1]);
+            int64_t N = A(0).shape[0], L = A(0).shape[1];
+            int64_t bins = st.axis ? fl / 2 + 1 : fl;
+            int64_t F = L >= fl ? (L - fl) / fs + 1 : 0;
+            sh = {N, F, bins, 2};
+            break;
+        }
+        default: fail("dyn output shape not implemented for this step kind");
+    }
+    RT Y;
+    Y.dtype = im.vals[ov].dtype;
+    Y.shape = sh;
+    Y.strides = rowmajor(sh);
+    Y.p = im.dyn_alloc((size_t)Y.numel() * onnxm::elem_size(Y.dtype));
+    return Y;
 }
 
 void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector<RT>& outs, Scratch& sc) {
@@ -4626,8 +5454,349 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
             outs[0] = Y;
             break;
         }
+        case SK::SLICE_RT: {
+            // Runtime bounds: build the strided view descriptor
+            // from the bound tensors' current values; materialize
+            // into the dyn arena when the view is not contiguous
+            // (flat readers downstream assume one or the other).
+            const RT& X = ins[0];
+            std::vector<int64_t> starts = rt_ints(ins[1]);
+            std::vector<int64_t> ends = rt_ints(ins[2]);
+            std::vector<int64_t> stepsv;
+            if (st.in.size() > 4 && st.in[4] >= 0) stepsv = rt_ints(ins[4]);
+            RT Y = X;
+            int64_t off = 0;
+            std::vector<int64_t> axes = st.axes;
+            if (axes.empty()) {
+                axes.resize(X.shape.size());
+                for (size_t a = 0; a < axes.size(); a++) axes[a] = (int64_t)a;
+            }
+            for (size_t i = 0; i < axes.size(); i++) {
+                int64_t ax = norm_axis(axes[i], X.shape.size());
+                int64_t step = stepsv.empty() ? 1 : stepsv[i];
+                if (step == 0) fail("Slice: step 0");
+                int64_t first;
+                Y.shape[ax] = slice_count(X.shape[ax], starts[i], ends[i], step, first);
+                off += first * X.strides[ax];
+                Y.strides[ax] = X.strides[ax] * step;
+            }
+            Y.p = X.p + off * (int64_t)onnxm::elem_size(X.dtype);
+            if (!Y.contig()) {
+                RT M;
+                M.dtype = Y.dtype;
+                M.shape = Y.shape;
+                M.strides = rowmajor(M.shape);
+                M.p = im.dyn_alloc((size_t)M.numel() * onnxm::elem_size(M.dtype));
+                copy_tensor(M, Y);
+                Y = M;
+            }
+            outs[0] = Y;
+            break;
+        }
+        case SK::SHAPE: {
+            // Runtime Shape: the output is the input's true
+            // dim list as an i64 vector (rank known only here).
+            RT Y;
+            Y.dtype = 7;
+            Y.shape = {(int64_t)ins[0].shape.size()};
+            Y.strides = {1};
+            Y.p = im.dyn_alloc((size_t)ins[0].shape.size() * 8);
+            int64_t* d = (int64_t*)Y.p;
+            for (size_t i = 0; i < ins[0].shape.size(); i++) d[i] = ins[0].shape[i];
+            outs[0] = Y;
+            break;
+        }
+        case SK::RANGE: {
+            int odt = im.vals[st.out[0]].dtype;
+            RT Y;
+            Y.dtype = odt;
+            int64_t n = 0;
+            if (odt == 7 || odt == 6) {
+                int64_t s = rt_ints(ins[0]).at(0), l = rt_ints(ins[1]).at(0), d = rt_ints(ins[2]).at(0);
+                if (d == 0) fail("Range: delta 0");
+                if (d > 0 && l > s) n = (l - s + d - 1) / d;
+                if (d < 0 && l < s) n = (s - l - d - 1) / -d;
+                Y.shape = {n};
+                Y.strides = {1};
+                Y.p = im.dyn_alloc((size_t)n * onnxm::elem_size(odt));
+                for (int64_t i = 0; i < n; i++) write_d(Y, i, (double)(s + i * d));
+            } else {
+                double s = read_d(ins[0], 0), l = read_d(ins[1], 0), d = read_d(ins[2], 0);
+                if (d == 0) fail("Range: delta 0");
+                double cnt = (l - s) / d;
+                if (cnt > 0) n = (int64_t)std::ceil(cnt - 1e-9);
+                Y.shape = {n};
+                Y.strides = {1};
+                Y.p = im.dyn_alloc((size_t)n * onnxm::elem_size(odt));
+                for (int64_t i = 0; i < n; i++) write_d(Y, i, s + i * d);
+            }
+            outs[0] = Y;
+            break;
+        }
+        case SK::STFT: {
+            // Input order as ORT reads it: signal, frame_step,
+            // window, frame_length (see the lowering note).
+            const RT& X = ins[0];
+            int64_t fs = rt_ints(ins[1]).at(0);
+            const RT* W = (st.in.size() > 2 && st.in[2] >= 0) ? &ins[2] : nullptr;
+            int64_t fl = (st.in.size() > 3 && st.in[3] >= 0) ? rt_ints(ins[3]).at(0)
+                         : (W ? W->numel() : X.shape[1]);
+            int64_t N = X.shape[0], L = X.shape[1];
+            int64_t bins = st.axis ? fl / 2 + 1 : fl;
+            int64_t F = L >= fl ? (L - fl) / fs + 1 : 0;
+            if (outs[0].shape.size() != 4 || outs[0].shape[1] != F || outs[0].shape[2] != bins)
+                fail("STFT: bind shape disagrees with exec frame count");
+            int64_t s0 = X.strides.empty() ? L : X.strides[0];
+            int64_t s1 = X.strides.size() > 1 ? X.strides[1] : 1;
+            float* outp = (float*)outs[0].p;
+            std::vector<std::complex<double>> buf((size_t)fl);
+            bool pow2 = fl > 0 && (fl & (fl - 1)) == 0;
+            const double PI = 3.14159265358979323846;
+            for (int64_t n = 0; n < N; n++) {
+                for (int64_t f = 0; f < F; f++) {
+                    int64_t base = n * s0 + f * fs * s1;
+                    for (int64_t k = 0; k < fl; k++) {
+                        double w = W ? read_d(*W, k) : 1.0;
+                        buf[(size_t)k] = read_d(X, base + k * s1) * w;
+                    }
+                    float* dst = outp + ((n * F + f) * bins) * 2;
+                    if (pow2) {
+                        fft_pow2(buf);
+                        for (int64_t b = 0; b < bins; b++) {
+                            dst[b * 2] = (float)buf[(size_t)b].real();
+                            dst[b * 2 + 1] = (float)buf[(size_t)b].imag();
+                        }
+                    } else {
+                        for (int64_t b = 0; b < bins; b++) {
+                            std::complex<double> wstep = std::polar(1.0, -2.0 * PI * (double)b / (double)fl);
+                            std::complex<double> wk = 1.0, sum = 0.0;
+                            for (int64_t k = 0; k < fl; k++) { sum += buf[(size_t)k] * wk; wk *= wstep; }
+                            dst[b * 2] = (float)sum.real();
+                            dst[b * 2 + 1] = (float)sum.imag();
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case SK::TILE: {
+            const RT& X = ins[0];
+            std::vector<int64_t> reps = rt_ints(ins[1]);
+            RT Y;
+            Y.dtype = X.dtype;
+            if (!st.out.empty() && im.vals[st.out[0]].dyn) {
+                Y.shape = X.shape;
+                for (size_t i = 0; i < Y.shape.size(); i++) Y.shape[i] *= reps[i];
+                Y.strides = rowmajor(Y.shape);
+                Y.p = im.dyn_alloc((size_t)Y.numel() * onnxm::elem_size(Y.dtype));
+            } else {
+                Y = outs[0];
+            }
+            std::vector<int64_t> xstr = X.strides.empty() ? rowmajor(X.shape) : X.strides;
+            int rank = (int)Y.shape.size();
+            std::vector<int64_t> coord(rank, 0);
+            int64_t esz = (int64_t)onnxm::elem_size(Y.dtype);
+            int64_t n = Y.numel();
+            for (int64_t i = 0; i < n; i++) {
+                int64_t ioff = 0, ooff = 0;
+                for (int d = 0; d < rank; d++) {
+                    ioff += (coord[d] % X.shape[d]) * xstr[d];
+                    ooff += coord[d] * Y.strides[d];
+                }
+                memcpy(Y.p + ooff * esz, X.p + ioff * esz, (size_t)esz);
+                for (int d = rank - 1; d >= 0; d--) {
+                    if (++coord[d] < Y.shape[d]) break;
+                    coord[d] = 0;
+                }
+            }
+            outs[0] = Y;
+            break;
+        }
+        case SK::PRELU: {
+            const RT& X = ins[0];
+            const RT& S = ins[1];
+            RT& Y = outs[0];
+            int rank = (int)X.shape.size();
+            int srank = (int)S.shape.size();
+            std::vector<int64_t> xstr = X.strides.empty() ? rowmajor(X.shape) : X.strides;
+            std::vector<int64_t> sstr = S.strides.empty() ? rowmajor(S.shape) : S.strides;
+            std::vector<int64_t> ystr = Y.strides.empty() ? rowmajor(Y.shape) : Y.strides;
+            std::vector<int64_t> coord(rank, 0);
+            int64_t n = X.numel();
+            for (int64_t i = 0; i < n; i++) {
+                int64_t xo = 0, yo = 0, so = 0;
+                for (int d = 0; d < rank; d++) {
+                    xo += coord[d] * xstr[d];
+                    yo += coord[d] * ystr[d];
+                    int sd = d - (rank - srank);
+                    if (sd >= 0) so += (S.shape[sd] == 1 ? 0 : coord[d]) * sstr[sd];
+                }
+                double x = read_d(X, xo);
+                write_d(Y, yo, x >= 0 ? x : read_d(S, so) * x);
+                for (int d = rank - 1; d >= 0; d--) {
+                    if (++coord[d] < X.shape[d]) break;
+                    coord[d] = 0;
+                }
+            }
+            break;
+        }
+        case SK::DFT: {
+            const RT& X = ins[0];
+            RT Y;
+            if (!st.out.empty() && im.vals[st.out[0]].dyn) {
+                Y.dtype = X.dtype;
+                Y.shape = X.shape;
+                int64_t ax0 = norm_axis(st.axis, (int64_t)Y.shape.size());
+                if (st.keepdims) Y.shape[ax0] = Y.shape[ax0] / 2 + 1;
+                if (!Y.shape.empty()) Y.shape.back() = 2;
+                Y.strides = rowmajor(Y.shape);
+                Y.p = im.dyn_alloc((size_t)Y.numel() * onnxm::elem_size(Y.dtype));
+            } else {
+                Y = outs[0];
+            }
+            int rank = (int)X.shape.size();
+            int64_t ax = norm_axis(st.axis, rank);
+            int64_t L = X.shape[ax];
+            int64_t bins = st.keepdims ? L / 2 + 1 : L;
+            int64_t lcomp = X.shape[rank - 1];
+            std::vector<int64_t> xstr = X.strides.empty() ? rowmajor(X.shape) : X.strides;
+            std::vector<int64_t> ystr = Y.strides.empty() ? rowmajor(Y.shape) : Y.strides;
+            bool pow2 = L > 0 && (L & (L - 1)) == 0;
+            double sgn = st.exclusive ? 1.0 : -1.0;
+            double scale = st.exclusive ? 1.0 / (double)L : 1.0;
+            const double PI = 3.14159265358979323846;
+            std::vector<int64_t> coord(rank, 0);
+            std::vector<std::complex<double>> buf((size_t)L);
+            int64_t outer = 1;
+            for (int d = 0; d < rank; d++)
+                if (d != ax && d != rank - 1) outer *= X.shape[d];
+            for (int64_t o = 0; o < outer; o++) {
+                int64_t xb = 0, yb = 0;
+                for (int d = 0; d < rank; d++) {
+                    if (d == ax || d == rank - 1) continue;
+                    xb += coord[d] * xstr[d];
+                    yb += coord[d] * ystr[d];
+                }
+                for (int64_t k = 0; k < L; k++) {
+                    int64_t off = xb + k * xstr[ax];
+                    double re = read_d(X, off);
+                    double imv = lcomp == 2 ? read_d(X, off + xstr[rank - 1]) : 0.0;
+                    buf[(size_t)k] = {re, imv};
+                }
+                if (pow2) {
+                    if (st.exclusive)
+                        for (auto& c : buf) c = std::conj(c);
+                    fft_pow2(buf);
+                    if (st.exclusive)
+                        for (auto& c : buf) c = std::conj(c) * scale;
+                }
+                for (int64_t b = 0; b < bins; b++) {
+                    std::complex<double> sum;
+                    if (pow2) {
+                        sum = buf[(size_t)b];
+                    } else {
+                        std::complex<double> wstep = std::polar(1.0, sgn * 2.0 * PI * (double)b / (double)L);
+                        std::complex<double> wk = 1.0;
+                        sum = 0.0;
+                        for (int64_t k = 0; k < L; k++) { sum += buf[(size_t)k] * wk; wk *= wstep; }
+                        sum *= scale;
+                    }
+                    int64_t off = yb + b * ystr[ax];
+                    write_d(Y, off, sum.real());
+                    write_d(Y, off + ystr[rank - 1], sum.imag());
+                }
+                for (int d = rank - 1; d >= 0; d--) {
+                    if (d == ax || d == rank - 1) continue;
+                    if (++coord[d] < X.shape[d]) break;
+                    coord[d] = 0;
+                }
+            }
+            outs[0] = Y;
+            break;
+        }
+        case SK::BNORM: {
+            // Inference BN: per-channel affine from the given
+            // mean/var (channel = dim 1, or dim 0 for rank 1).
+            const RT& X = ins[0];
+            RT& Y = outs[0];
+            int rank = (int)X.shape.size();
+            int cd = rank >= 2 ? 1 : 0;
+            int64_t C = X.shape[cd];
+            std::vector<double> inv((size_t)C), shift((size_t)C);
+            for (int64_t c = 0; c < C; c++) {
+                double mean = st.in.size() > 3 && st.in[3] >= 0 ? read_d(ins[3], c) : 0.0;
+                double var = st.in.size() > 4 && st.in[4] >= 0 ? read_d(ins[4], c) : 1.0;
+                double scale = st.in.size() > 1 && st.in[1] >= 0 ? read_d(ins[1], c) : 1.0;
+                double bias = st.in.size() > 2 && st.in[2] >= 0 ? read_d(ins[2], c) : 0.0;
+                inv[(size_t)c] = scale / std::sqrt(var + st.eps);
+                shift[(size_t)c] = bias - mean * inv[(size_t)c];
+            }
+            std::vector<int64_t> xstr = X.strides.empty() ? rowmajor(X.shape) : X.strides;
+            std::vector<int64_t> ystr = Y.strides.empty() ? rowmajor(Y.shape) : Y.strides;
+            std::vector<int64_t> coord(rank, 0);
+            int64_t n = X.numel();
+            for (int64_t i = 0; i < n; i++) {
+                int64_t xo = 0, yo = 0;
+                for (int d = 0; d < rank; d++) {
+                    xo += coord[d] * xstr[d];
+                    yo += coord[d] * ystr[d];
+                }
+                int64_t c = coord[cd];
+                write_d(Y, yo, read_d(X, xo) * inv[(size_t)c] + shift[(size_t)c]);
+                for (int d = rank - 1; d >= 0; d--) {
+                    if (++coord[d] < X.shape[d]) break;
+                    coord[d] = 0;
+                }
+            }
+            break;
+        }
+        case SK::CLIP: {
+            double lo = st.alpha, hi = st.beta;
+            if (st.in.size() > 1 && st.in[1] >= 0) lo = read_d(ins[1], 0);
+            if (st.in.size() > 2 && st.in[2] >= 0) hi = read_d(ins[2], 0);
+            const RT& X = ins[0];
+            RT& Y = outs[0];
+            std::vector<int64_t> xstr = X.strides.empty() ? rowmajor(X.shape) : X.strides;
+            std::vector<int64_t> ystr = Y.strides.empty() ? rowmajor(Y.shape) : Y.strides;
+            int rank = (int)X.shape.size();
+            std::vector<int64_t> coord(rank, 0);
+            int64_t n = X.numel();
+            for (int64_t i = 0; i < n; i++) {
+                int64_t xo = 0, yo = 0;
+                for (int d = 0; d < rank; d++) {
+                    xo += coord[d] * xstr[d];
+                    yo += coord[d] * ystr[d];
+                }
+                double x = read_d(X, xo);
+                write_d(Y, yo, x < lo ? lo : (x > hi ? hi : x));
+                for (int d = rank - 1; d >= 0; d--) {
+                    if (++coord[d] < X.shape[d]) break;
+                    coord[d] = 0;
+                }
+            }
+            break;
+        }
         case SK::EXPAND: {
-            if (im.vals[st.out[0]].dyn) {
+            if (!st.out.empty() && im.vals[st.out[0]].dyn && st.in.size() == 1) {
+                // Symbolic-target step (the target was folded
+                // into the output's shape exprs at lowering, so
+                // the step carries no target input) whose output
+                // was marked dyn by propagation because the data
+                // is dyn. With a constant target (kept in
+                // st.axes), broadcast the data's true shape with
+                // it; otherwise evaluate the shape exprs.
+                // Reading ins[1] here was an out-of-bounds
+                // access on the input vector.
+                std::vector<int64_t> os;
+                if (!st.axes.empty()) os = bcast_shape_c(ins[0].shape, st.axes);
+                else
+                    for (auto& e : im.vals[st.out[0]].rshape) os.push_back(eeval(e, im.bsv));
+                outs[0].shape = os;
+                outs[0].strides = rowmajor(os);
+                outs[0].dtype = ins[0].dtype;
+                outs[0].p = im.dyn_alloc((size_t)outs[0].numel() * onnxm::elem_size(outs[0].dtype));
+            }
+            if (!st.out.empty() && im.vals[st.out[0]].dyn && st.in.size() > 1) {
                 // Dyn output (loop body): the target shape is a
                 // runtime tensor; size a fresh buffer from it on
                 // every execution (the descriptor written back by
@@ -4649,6 +5818,14 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
                         os[i] = sd >= 0 ? X.shape[sd] : 1;
                     }
                 }
+                // ONNX Expand semantics: the target is a
+                // minimum shape; the output is the broadcast
+                // of the data shape with the target (a target
+                // dim of 1 takes the data dim). Treating the
+                // target as the literal output shape broke
+                // prompt_encoder's mask expand ([1,1,212] to
+                // target [1,212,1] must give [1,212,212]).
+                os = bcast_shape_c(X.shape, os);
                 outs[0].shape = os;
                 outs[0].strides = rowmajor(os);
                 outs[0].dtype = X.dtype;
@@ -4662,8 +5839,14 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
         case SK::SOFTMAX: k_softmax(ins[0], outs[0], st.axis, sc); break;
         case SK::ATTN: k_attn(ins[0], ins[1], ins[2], outs[0], sc, st.out_scale); break;
         case SK::REDUCESUM: {
-            if (st.l2) { k_reducel2(ins[0], outs[0], st.axes, st.keepdims); break; }
-            k_reducesum(ins[0], outs[0], st.axes, st.keepdims);
+            // Axes were normalized at lowering against the
+            // symbolic shape; for a dyn input that shape may be
+            // rank-deficient, so re-normalize against the true
+            // rank here (kernels index red[axis] unchecked).
+            std::vector<int64_t> axes = st.axes;
+            for (auto& a : axes) a = norm_axis(a, ins[0].shape.size());
+            if (st.l2) { k_reducel2(ins[0], outs[0], axes, st.keepdims); break; }
+            k_reducesum(ins[0], outs[0], axes, st.keepdims);
             if (st.mean) {
                 double f = (double)outs[0].numel() / (double)ins[0].numel();
                 RT& Y = outs[0];
@@ -4688,6 +5871,33 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
         case SK::GATHER_EL: k_gather_elements(ins[0], ins[1], outs[0], st.axis); break;
         case SK::SCATTER_EL: k_scatter_elements(ins[0], ins[1], ins[2], outs[0], st.axis, st.reduction); break;
         case SK::CONCAT: {
+            if (!st.out.empty() && im.vals[st.out[0]].dyn) {
+                // An input's true length is data-dependent:
+                // derive the output shape from the input
+                // descriptors and allocate in the dyn arena.
+                const RT* tmpl = &ins[0];
+                for (auto& e : ins)
+                    if (!e.shape.empty()) { tmpl = &e; break; }
+                int64_t ax = norm_axis(st.axis, (int64_t)tmpl->shape.size());
+                RT Y;
+                Y.dtype = ins[0].dtype;
+                Y.shape = tmpl->shape;
+                int64_t total = 0;
+                for (auto& e : ins) total += e.shape[ax];
+                Y.shape[ax] = total;
+                Y.strides = rowmajor(Y.shape);
+                Y.p = im.dyn_alloc((size_t)Y.numel() * onnxm::elem_size(Y.dtype));
+                int64_t cum = 0;
+                for (auto& e : ins) {
+                    RT sub = Y;
+                    sub.shape = e.shape;
+                    sub.p = Y.p + cum * Y.strides[ax] * (int64_t)onnxm::elem_size(Y.dtype);
+                    copy_tensor(sub, e);
+                    cum += e.shape[ax];
+                }
+                outs[0] = Y;
+                break;
+            }
             if (st.kv_slot >= 0 && im.kv) {
                 // Stateful KV append: outs[0] views the cache
                 // buffer; copy only the new slice at the slot's
@@ -4725,7 +5935,20 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
         }
         case SK::BINOP: k_binop(st.bop, ins[0], ins[1], outs[0]); if (st.epi_act == 1) apply_epi_leaky((float*)outs[0].p, outs[0].numel(), st.epi_alpha); break;
         case SK::UNOP: k_unop(st.uop, ins[0], outs[0], st.alpha); break;
-        case SK::CAST: k_cast(ins[0], outs[0]); break;
+        case SK::CAST: {
+            if (!st.out.empty() && im.vals[st.out[0]].dyn) {
+                RT Y;
+                Y.dtype = im.vals[st.out[0]].dtype;
+                Y.shape = ins[0].shape;
+                Y.strides = rowmajor(Y.shape);
+                Y.p = im.dyn_alloc((size_t)Y.numel() * onnxm::elem_size(Y.dtype));
+                k_cast(ins[0], Y);
+                outs[0] = Y;
+                break;
+            }
+            k_cast(ins[0], outs[0]);
+            break;
+        }
         case SK::WHERE: k_where(ins[0], ins[1], ins[2], outs[0]); break;
         case SK::COPY:
             if (st.flat_copy) flatten_copy(outs[0], ins[0]);
@@ -4755,7 +5978,7 @@ static bool fold_one_scalar_mul(Impl& im) {
     auto& steps = im.steps;
     std::vector<int> uses(vals.size(), 0), view_kids(vals.size(), 0);
     for (auto& s : steps)
-        for (int v : s.in) uses[v]++;
+        for (int v : s.in) if (v >= 0) uses[v]++;
     for (size_t i = 0; i < vals.size(); i++) {
         const Value& v = vals[i];
         if (v.kind == Value::RT && v.view_kind != 0 && v.base >= 0) {
@@ -5040,7 +6263,7 @@ static bool fuse_one_leaky(Impl& im) {
     auto& vals = im.vals;
     std::vector<int> uses(vals.size(), 0), view_kids(vals.size(), 0);
     for (auto& s : steps)
-        for (int v : s.in) uses[v]++;
+        for (int v : s.in) if (v >= 0) uses[v]++;
     for (auto& v : vals) {
         if (v.kind == Value::RT && v.view_kind != 0 && v.base >= 0) view_kids[v.base]++;
         for (int m : {v.meta0, v.meta1, v.meta2, v.meta3})
@@ -5107,8 +6330,22 @@ static void dce_pure_steps(Impl& im) {
         changed = false;
         std::vector<char> used(vals.size(), 0);
         for (auto& s : steps)
-            for (int v : s.in) used[v] = 1;
+            for (int v : s.in) if (v >= 0) used[v] = 1;
         for (int v : im.out_vals) used[v] = 1;
+        // Branch/body outputs are consumed by their owning
+        // IF/LOOP step's copy-out, not by a step input: mark
+        // them used, or a pure producer whose only reader is
+        // a branch-internal view (Pad -> Squeeze in
+        // prompt_encoder) is erased and the view resolves
+        // against a stale bind descriptor.
+        for (auto& s : steps) {
+            if (s.k == SK::IF) {
+                for (int v : s.if_t_outs) if (v >= 0) used[v] = 1;
+                for (int v : s.if_e_outs) if (v >= 0) used[v] = 1;
+            }
+            if (s.k == SK::LOOP)
+                for (int v : s.lp_body_outs) if (v >= 0) used[v] = 1;
+        }
         for (auto& v : vals)
             for (int m : {v.meta0, v.meta1, v.meta2, v.meta3})
                 if (m >= 0) used[m] = 1;
@@ -5217,6 +6454,33 @@ std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bo
         im->out_names.push_back(vo.name);
         im->out_vals.push_back(id);
     }
+    // Dyn propagation through steps: a step reading a tensor
+    // whose shape is only known at execution produces outputs
+    // whose shapes are only known at execution; the runner
+    // sizes them from the input descriptors (dyn_shape_for).
+    // Steps are in lowering order (bodies precede their
+    // Loop / If step), so one forward pass settles it.
+    for (auto& s : im->steps) {
+        if (s.k == SK::LOOP) {
+            for (size_t j = 0; j < s.out.size() && j + 1 < s.lp_body_outs.size(); j++)
+                if (im->vals[s.lp_body_outs[j + 1]].dyn) im->vals[s.out[j]].dyn = true;
+            continue;
+        }
+        if (s.k == SK::IF) {
+            for (size_t j = 0; j < s.out.size(); j++)
+                if ((j < s.if_t_outs.size() && im->vals[s.if_t_outs[j]].dyn) ||
+                    (j < s.if_e_outs.size() && im->vals[s.if_e_outs[j]].dyn))
+                    im->vals[s.out[j]].dyn = true;
+            continue;
+        }
+        bool in_dyn = false;
+        for (int v : s.in)
+            if (v >= 0 && im->vals[v].kind == Value::RT && !im->vals[v].is_seq && im->vals[v].dyn) in_dyn = true;
+        if (!in_dyn) continue;
+        for (int v : s.out)
+            if (im->vals[v].kind == Value::RT && !im->vals[v].is_seq && im->vals[v].view_kind == 0)
+                im->vals[v].dyn = true;
+    }
     while (fold_one_scalar_mul(*im)) {
     }
     while (fold_one_scalar_mul_pre(*im)) {
@@ -5238,17 +6502,24 @@ std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bo
     {
         std::map<int, int> by_uid;
         for (int i = 0; i < (int)im->steps.size(); i++) by_uid[im->steps[i].uid] = i;
-        for (auto& s : im->steps) {
-            if (s.k != SK::LOOP) continue;
-            if (s.lp_u0 == s.lp_u1) {
-                auto it = by_uid.find(s.uid);
-                s.lp_b0 = s.lp_b1 = it == by_uid.end() ? 0 : it->second;
-                continue;
+        auto resolve_range = [&](int u0, int u1, int self_uid, int& b0, int& b1, const char* what) {
+            if (u0 == u1) {
+                auto it = by_uid.find(self_uid);
+                b0 = b1 = it == by_uid.end() ? 0 : it->second;
+                return;
             }
-            auto a = by_uid.find(s.lp_u0), b = by_uid.find(s.lp_u1 - 1);
-            if (a == by_uid.end() || b == by_uid.end()) fail("loop body steps lost in passes");
-            s.lp_b0 = a->second;
-            s.lp_b1 = b->second + 1;
+            auto a = by_uid.find(u0), b = by_uid.find(u1 - 1);
+            if (a == by_uid.end() || b == by_uid.end()) fail(what);
+            b0 = a->second;
+            b1 = b->second + 1;
+        };
+        for (auto& s : im->steps) {
+            if (s.k == SK::LOOP)
+                resolve_range(s.lp_u0, s.lp_u1, s.uid, s.lp_b0, s.lp_b1, "loop body steps lost in passes");
+            if (s.k == SK::IF) {
+                resolve_range(s.if_u0, s.if_u1, s.uid, s.if_b0, s.if_b1, "if then-branch steps lost in passes");
+                resolve_range(s.if_eu0, s.if_eu1, s.uid, s.if_eb0, s.if_eb1, "if else-branch steps lost in passes");
+            }
         }
     }
     detect_kv_pairs(*im);
@@ -5257,22 +6528,30 @@ std::shared_ptr<Plan> Plan::compile(const onnxm::Graph& g, std::string label, bo
     // a view's last use must extend its base's).
     int nsteps = (int)im->steps.size();
     for (int s = 0; s < nsteps; s++)
-        for (int v : im->steps[s].in) im->vals[v].last_use = std::max(im->vals[v].last_use, s);
+        for (int v : im->steps[s].in)
+            if (v >= 0) im->vals[v].last_use = std::max(im->vals[v].last_use, s);
     for (auto& v : im->vals)
         if (v.is_output) v.last_use = nsteps + 1;
+    // Loop slots and body outputs, and If branch outputs, are
+    // read/written by the runner itself, outside the step list:
+    // keep their arena blocks live until the LOOP / IF step. This
+    // runs before the view propagation below so that a body or
+    // branch output which is a view extends its base's life too.
+    for (int si = 0; si < nsteps; si++) {
+        const Step& s = im->steps[si];
+        if (s.k == SK::LOOP) {
+            for (int v : s.lp_slots) im->vals[v].last_use = std::max(im->vals[v].last_use, si);
+            for (int v : s.lp_body_outs) im->vals[v].last_use = std::max(im->vals[v].last_use, si);
+        }
+        if (s.k == SK::IF) {
+            for (int v : s.if_t_outs) im->vals[v].last_use = std::max(im->vals[v].last_use, si);
+            for (int v : s.if_e_outs) im->vals[v].last_use = std::max(im->vals[v].last_use, si);
+        }
+    }
     for (int i = (int)im->vals.size() - 1; i >= 0; i--) {
         Value& v = im->vals[i];
         if (v.kind == Value::RT && v.view_kind != 0 && v.base >= 0)
             im->vals[v.base].last_use = std::max(im->vals[v.base].last_use, v.last_use);
-    }
-    // Loop slots and body outputs are read/written by the runner
-    // itself, outside the step list: keep their arena blocks live
-    // until the LOOP step.
-    for (int si = 0; si < nsteps; si++) {
-        const Step& s = im->steps[si];
-        if (s.k != SK::LOOP) continue;
-        for (int v : s.lp_slots) im->vals[v].last_use = std::max(im->vals[v].last_use, si);
-        for (int v : s.lp_body_outs) im->vals[v].last_use = std::max(im->vals[v].last_use, si);
     }
     plan->in_names_ = im->in_names;
     plan->out_names_ = im->out_names;
@@ -5304,15 +6583,17 @@ std::vector<int64_t> read_meta_ints(const RT& t) {
 // FE_PROFILE accumulators (see Plan::run). Kind order matches enum SK.
 // Totals are kept per plan label so a decode step (stage plans) can be
 // read separately from prefill (first) and the encoder.
-struct ProfAcc { double us[34] = {}; long n[34] = {}; };
+struct ProfAcc { double us[44] = {}; long n[44] = {}; };
 static std::map<std::string, ProfAcc> g_prof;
-static const char* g_prof_names[34] = {"MATMUL", "GEMM", "PACKED", "CONV", "LN", "SOFTMAX",
+static const char* g_prof_names[44] = {"MATMUL", "GEMM", "PACKED", "CONV", "LN", "SOFTMAX",
                                        "REDUCESUM", "ARGMAX", "TOPK", "CUMSUM", "GATHER",
                                        "GATHER_EL", "SCATTER_EL", "CONCAT", "CONSTSHAPE",
                                        "RANDNORM", "BINOP", "UNOP", "CAST", "WHERE", "COPY",
                                        "PCONV", "PGATHER", "CONVT", "PAD", "EXPAND", "ATTN",
                                        "INSTNORM", "SEQ_EMPTY", "SEQ_SPLIT", "SEQ_AT",
-                                       "SEQ_INSERT", "SEQ_CONCAT", "LOOP"};
+                                       "SEQ_INSERT", "SEQ_CONCAT", "LOOP", "IF",
+                                       "SLICE_RT", "RANGE", "STFT", "TILE", "PRELU", "DFT",
+                                       "BNORM", "CLIP", "SHAPE"};
 static std::map<std::string, double> g_prof_bind, g_prof_exec;
 static std::map<std::string, long> g_prof_runs;
 static void prof_print() {
@@ -5335,7 +6616,7 @@ static void prof_print() {
 static void prof_add(const std::string& label, int kind, double us) {
     static bool reg = (std::atexit(prof_print), true);
     (void)reg;
-    if (kind >= 0 && kind < 27) { ProfAcc& a = g_prof[label]; a.us[kind] += us; a.n[kind]++; }
+    if (kind >= 0 && kind < 44) { ProfAcc& a = g_prof[label]; a.us[kind] += us; a.n[kind]++; }
 }
 
 void Plan::release_arena() {
@@ -5356,7 +6637,7 @@ static bool fuse_one_attn(Impl& im) {
     auto& vals = im.vals;
     std::vector<int> uses(vals.size(), 0), view_kids(vals.size(), 0);
     for (auto& s : steps)
-        for (int v : s.in) uses[v]++;
+        for (int v : s.in) if (v >= 0) uses[v]++;
     for (auto& v : vals) {
         if (v.kind == Value::RT && v.view_kind != 0 && v.base >= 0) view_kids[v.base]++;
         for (int m : {v.meta0, v.meta1, v.meta2, v.meta3})
@@ -5730,9 +7011,15 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
         r.dtype = v.dtype;
         if (v.view_kind == 1) {  // transpose
             r.p = B.p;
-            for (auto p : v.vperm) {
-                r.shape.push_back(B.shape[p]);
-                r.strides.push_back(B.strides[p]);
+            std::vector<int64_t> perm = v.vperm;
+            if (perm.empty()) {
+                perm.resize(B.shape.size());
+                for (size_t i = 0; i < perm.size(); i++) perm[i] = (int64_t)perm.size() - 1 - (int64_t)i;
+            }
+            for (auto p : perm) {
+                int64_t pa = norm_axis(p, B.shape.size());
+                r.shape.push_back(B.shape[pa]);
+                r.strides.push_back(B.strides[pa]);
             }
         } else if (v.view_kind == 2) {  // reshape
             RT src = B;
@@ -5764,7 +7051,7 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
         } else if (v.view_kind == 3) {  // unsqueeze
             r.p = B.p;
             std::vector<char> at(B.shape.size() + v.vaxes.size(), 0);
-            for (auto a : v.vaxes) at[a] = 1;
+            for (auto a : v.vaxes) at[(size_t)norm_axis(a, at.size())] = 1;
             size_t src = 0;
             for (size_t d = 0; d < at.size(); d++) {
                 if (at[d]) {
@@ -5780,12 +7067,16 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
         } else if (v.view_kind == 4) {  // squeeze
             r.p = B.p;
             std::vector<char> drop(B.shape.size(), 0);
-            for (auto a : v.vaxes) drop[a] = 1;
-            for (size_t d = 0; d < B.shape.size(); d++)
-                if (!drop[d]) {
+            bool drop_all = v.vaxes.size() == 1 && v.vaxes[0] == -1;
+            if (!drop_all)
+                for (auto a : v.vaxes) drop[(size_t)norm_axis(a, B.shape.size())] = 1;
+            for (size_t d = 0; d < B.shape.size(); d++) {
+                bool dropped = drop_all ? B.shape[d] == 1 : drop[d] != 0;
+                if (!dropped) {
                     r.shape.push_back(B.shape[d]);
                     r.strides.push_back(B.strides[d]);
                 }
+            }
         } else if (v.view_kind == 5) {  // slice
             std::vector<int64_t> starts = read_meta_ints(res[v.meta0]);
             std::vector<int64_t> ends = read_meta_ints(res[v.meta1]);
@@ -5810,18 +7101,55 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
         } else if (v.view_kind == 7) {  // split: contiguous-axis window of the base
             int64_t ax = norm_axis(v.meta0, B.shape.size());
             r = B;
-            r.shape[ax] = cshape[i][ax];
-            r.p = B.p + (int64_t)v.meta1 * B.strides[ax] * (int64_t)onnxm::elem_size(B.dtype);
+            if (v.meta3 == 2) {
+                // Equal split of a dyn base: the window length
+                // is the true axis length over the output count.
+                int64_t len = B.shape[ax] / v.meta2;
+                r.shape[ax] = len;
+                r.p = B.p + (int64_t)v.meta1 * len * B.strides[ax] * (int64_t)onnxm::elem_size(B.dtype);
+            } else if (v.meta3 == 1) {
+                // Const sizes over a dyn base.
+                r.shape[ax] = v.meta2;
+                r.p = B.p + (int64_t)v.meta1 * B.strides[ax] * (int64_t)onnxm::elem_size(B.dtype);
+            } else {
+                r.shape[ax] = cshape[i][ax];
+                r.p = B.p + (int64_t)v.meta1 * B.strides[ax] * (int64_t)onnxm::elem_size(B.dtype);
+            }
         }
         // Validate compile-time shape exprs against the resolved view.
         if (!v.dyn && r.shape != cshape[i]) fail("view shape mismatch at bind (slice/reshape exprs)");
         res[i] = r;
         done[i] = 1;
     };
+    // A view is bind-resolvable only when everything it reads
+    // (its base chain, and the meta tensors for reshape/slice
+    // views) already has a real descriptor: consts, symbolic
+    // values, inputs and non-dyn step outputs (arena) qualify;
+    // a dyn step output does not — its descriptor only exists
+    // after its step runs. Deferred views start stale and the
+    // runner resolves them on first use.
+    std::function<bool(int)> bind_ready = [&](int vid) -> bool {
+        const Value& v = im.vals[vid];
+        if (v.kind != Value::RT) return true;
+        if (v.view_kind != 0) {
+            if (v.base >= 0 && !bind_ready(v.base)) return false;
+            if (v.view_kind == 2 && v.meta0 >= 0 && !bind_ready(v.meta0)) return false;
+            if (v.view_kind == 5)
+                for (int m : {v.meta0, v.meta1, v.meta2, v.meta3})
+                    if (m >= 0 && !bind_ready(m)) return false;
+            return true;
+        }
+        return !(v.dyn && v.def_step >= 0);
+    };
+    std::vector<int> deferred_views;
     for (int i = 0; i < nv; i++) {
         Value& v = im.vals[i];
         if (v.kind != Value::RT || v.view_kind == 0 || done[i]) continue;
         if (in_body[i]) continue;  // resolved per iteration by the runner
+        if (!bind_ready(i)) {
+            deferred_views.push_back(i);
+            continue;
+        }
         resolve_view(i);
     }
     // Execute steps. FE_PROFILE=1 accumulates wall time per step kind
@@ -5846,6 +7174,7 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
     std::vector<char> view_stale(nv, 0);
     for (int i = 0; i < nv; i++)
         if (in_body[i] && im.vals[i].view_kind != 0) view_stale[i] = 1;
+    for (int i : deferred_views) view_stale[i] = 1;
     std::function<void(int)> resolve_stale = [&](int i) {
         if (!view_stale[i]) return;
         int b = im.vals[i].base;
@@ -5863,20 +7192,50 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
     // level. (Body steps sit inline in the steps array, between
     // the steps of the nodes lowered before and after the Loop.)
     int nsteps = (int)im.steps.size();
-    std::vector<int> step_owner(nsteps, -1);
+    std::vector<int> step_owner(nsteps, -1), owner_span(nsteps, 0x7fffffff);
+    auto claim_range = [&](int li, int b0, int b1) {
+        if (b0 < 0 || b1 <= b0) return;
+        for (int i = b0; i < b1 && i < nsteps; i++)
+            if (b1 - b0 < owner_span[i]) { owner_span[i] = b1 - b0; step_owner[i] = li; }
+    };
     for (int li = 0; li < nsteps; li++) {
         const Step& ls = im.steps[li];
-        if (ls.k != SK::LOOP || ls.lp_b0 < 0) continue;
-        for (int i = ls.lp_b0; i < ls.lp_b1 && i < nsteps; i++) {
-            int cur = step_owner[i];
-            if (cur < 0 || (ls.lp_b1 - ls.lp_b0) < (im.steps[cur].lp_b1 - im.steps[cur].lp_b0))
-                step_owner[i] = li;
+        if (ls.k == SK::LOOP) claim_range(li, ls.lp_b0, ls.lp_b1);
+        if (ls.k == SK::IF) {
+            claim_range(li, ls.if_b0, ls.if_b1);
+            claim_range(li, ls.if_eb0, ls.if_eb1);
         }
     }
     std::function<void(int, int, int)> run_steps = [&](int b0, int b1, int owner) {
         for (int si = b0; si < b1; si++) {
             if (step_owner[si] != owner) continue;
             const Step& st = im.steps[si];
+            if (st.k == SK::IF) {
+                auto if0 = std::chrono::steady_clock::now();
+                // ---- If execution: run the taken branch, then
+                // copy its outputs onto the If's out values ----
+                bool cond = read_d(res[st.in[0]], 0) != 0;
+                if (cond) run_steps(st.if_b0, st.if_b1, si);
+                else run_steps(st.if_eb0, st.if_eb1, si);
+                const std::vector<int>& bouts = cond ? st.if_t_outs : st.if_e_outs;
+                for (size_t j = 0; j < st.out.size(); j++) {
+                    int bo = bouts[j], ov = st.out[j];
+                    // A branch output may be a deferred view
+                    // (e.g. Squeeze of a dyn tensor) that no
+                    // regular step ever consumed: resolve it
+                    // before copying its descriptor, like the
+                    // step-input path below does.
+                    if (im.vals[bo].view_kind != 0 && view_stale[bo]) resolve_stale(bo);
+                    if (im.vals[ov].is_seq) im.bseqs[ov] = im.bseqs[bo];
+                    else if (im.vals[bo].kind == Value::CONSTV) res[ov] = tensor_of_const(im.vals[bo].ct);
+                    else res[ov] = res[bo];
+                    mark_kids_stale(ov);
+                }
+                if (profile)
+                    prof_add(im.label, (int)SK::IF,
+                             std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - if0).count());
+                continue;
+            }
             if (st.k == SK::LOOP) {
                 auto lp0 = std::chrono::steady_clock::now();
                 // ---- Loop execution ----
@@ -5929,6 +7288,12 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
             sin.resize(st.in.size());
             sout.resize(st.out.size());
             for (size_t j = 0; j < st.in.size(); j++) sin[j] = st.in[j] >= 0 ? res[st.in[j]] : RT{};
+            if (!step_self_alloc(st.k))
+                for (size_t j = 0; j < st.out.size(); j++) {
+                    int ov = st.out[j];
+                    if (ov >= 0 && im.vals[ov].dyn && !im.vals[ov].is_seq && im.vals[ov].view_kind == 0)
+                        res[ov] = dyn_shape_for(im, st, sin, ov);
+                }
             for (size_t j = 0; j < st.out.size(); j++) sout[j] = res[st.out[j]];
             Scratch::Mark mk = sc.mark();
             if (profile) {
@@ -5950,6 +7315,11 @@ std::vector<Tensor> Plan::run_vec(const std::vector<Tensor>& inputs) {
     if (profile)
         g_prof_exec[im.label] +=
             std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - exec_t0).count();
+    // An output that is itself a deferred view may never have
+    // been consumed by a step; resolve it now that its base is
+    // final.
+    for (int v : im.out_vals)
+        if (im.vals[v].view_kind != 0 && view_stale[v]) resolve_stale(v);
     // Outputs, in out_names order.
     std::vector<Tensor> out(im.out_vals.size());
     for (size_t i = 0; i < im.out_vals.size(); i++) {
