@@ -117,6 +117,10 @@ target_include_directories(resample_check PRIVATE src)
 add_executable(tokenizer_check src/tokenizer_check.cpp)
 target_include_directories(tokenizer_check PRIVATE src)
 
+# g2pM port check vs the original g2pM oracle.
+add_executable(g2pm_check src/g2pm_check.cpp)
+target_include_directories(g2pm_check PRIVATE src)
+
 # Compile-only probe for surveying new graphs (reference
 # extraction models) against the engine's op coverage.
 add_executable(plan_probe src/plan_probe.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
