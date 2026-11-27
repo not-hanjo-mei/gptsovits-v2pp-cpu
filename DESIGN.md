@@ -1185,3 +1185,23 @@ index.json. Tag lookup consults index.json first, then the
 sidecar. Verified on neutral1: the saved pack loaded by tag
 in a fresh process reproduced the runtime request's audio
 bit-exactly (corr 1.0, maxdiff 0, tokens 25/25).
+
+## SV resampler fit attempt (2026-11-28, M4 -- rejected)
+
+Hypothesis: the runtime path's one soft tensor, ge (corr
+0.999510 vs the pack), traces to the speaker embedding's
+sensitivity to the 32k->16k transition band, so a FIR
+fitted to soxr HQ's measured magnitude response (firwin2,
+1023 taps, sparse probe points) should close it. In
+isolation it did: SV embedding corr 0.998910 -> 0.999318,
+relrms 0.0464 -> 0.0366. End to end it did not: with the
+fitted filter feeding only the speaker encoder, ge fell
+to corr 0.998960 (maxerr 1.74) from 0.999510 (1.23) --
+the prompt encoder amplifies the fitted filter's residual
+direction more than the Kaiser's. A denser 2047-tap fit
+against an impulse-response measurement was far worse
+everywhere (SV 0.930, ssl 0.974; truncated measurement,
+rippled target). Conclusion: embedding corr is a proxy
+that misleads one level up, exactly as waveform corr did
+in M3-3d(a). The Kaiser resampler stays for both 16k
+consumers; the fitted taps were removed unshipped.
