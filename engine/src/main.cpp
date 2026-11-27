@@ -910,6 +910,29 @@ int main(int argc, char** argv) {
                 for (auto tk : gen) { if (tk >= EOS_ID) break; pred.push_back(tk); }
                 if (pred.empty()) throw std::runtime_error("empty semantic sequence");
 
+                // Streaming (free engine): "stream": true splits the
+                // semantic sequence into chunks synthesized one by
+                // one, each appended to reqNNN.pcm (s16le raw vits
+                // output, pre output-chain) as it lands, with one
+                // JSON line per chunk on stdout. A slice of n tokens
+                // yields exactly 1280*n samples (measured), and each
+                // chunk runs with chunk_ctx tokens of context on both
+                // sides whose audio is trimmed off, so the chunks
+                // concatenate seamlessly. The final WAV still goes
+                // through the normal output chain, built from the
+                // concatenated chunk audio.
+                const Json* stj = r.find("stream");
+                bool want_stream = stj && stj->type == Json::Bool && stj->b;
+                const Json* ctj = r.find("chunk_tokens");
+                int64_t chunk_tokens = ctj ? (int64_t)ctj->as_num(25) : 25;
+                const Json* ccj = r.find("chunk_ctx");
+                int64_t chunk_ctx = ccj ? (int64_t)ccj->as_num(5) : 5;
+                if (chunk_tokens < 1) chunk_tokens = 25;
+                if (chunk_ctx < 0) chunk_ctx = 0;
+                bool streamed = false;
+                double first_audio_ms = -1;
+                int n_chunks = 0;
+
                 // ---- vits ----
                 t0 = Clock::now();
 #ifndef POTATO_FREE_ONLY
@@ -925,40 +948,58 @@ int main(int argc, char** argv) {
                 const float* audio = nullptr;
                 size_t n_audio = 0;
                 if (engine_free) {
-                    // TEMP probe: raw audio length of token slices.
-                    static const bool vits_probe = std::getenv("POTATO_VITS_PROBE") != nullptr;
-                    if (vits_probe) {
-                        auto run_slice = [&](int64_t a, int64_t b) -> size_t {
-                            std::map<std::string, freeeng::Tensor> pv;
-                            freeeng::Tensor pt; pt.dtype = 7; pt.data = (const uint8_t*)text_ids.data(); pt.shape = {1, L};
-                            pv.emplace("text_seq", pt);
-                            freeeng::Tensor pp; pp.dtype = 7; pp.data = (const uint8_t*)(pred.data() + a); pp.shape = {1, 1, b - a};
-                            pv.emplace("pred_semantic", pp);
-                            pv.emplace("ge", ft_from_rpk(ref.at("ge")));
-                            pv.emplace("ge_advanced", ft_from_rpk(ref.at("ge_advanced")));
-                            auto po = fh.vits->run(pv);
-                            size_t n = ft_to_vec(po.at("audio")).size();
-                            fh.vits->release_arena();
-                            return n;
-                        };
-                        int64_t T = (int64_t)pred.size();
-                        std::cerr << "[probe] T=" << T << " full=" << run_slice(0, T)
-                                  << " [0,10)=" << run_slice(0, std::min<int64_t>(10, T))
-                                  << " [10,20)=" << run_slice(10, std::min<int64_t>(20, T))
-                                  << " [0,20)=" << run_slice(0, std::min<int64_t>(20, T)) << "\n";
+                    auto run_vits_range = [&](int64_t a, int64_t b) {
+                        std::map<std::string, freeeng::Tensor> vin;
+                        freeeng::Tensor vt; vt.dtype = 7; vt.data = (const uint8_t*)text_ids.data(); vt.shape = {1, L};
+                        vin.emplace("text_seq", vt);
+                        freeeng::Tensor vp; vp.dtype = 7; vp.data = (const uint8_t*)(pred.data() + a); vp.shape = {1, 1, b - a};
+                        vin.emplace("pred_semantic", vp);
+                        vin.emplace("ge", ft_from_rpk(ref.at("ge")));
+                        vin.emplace("ge_advanced", ft_from_rpk(ref.at("ge_advanced")));
+                        auto vout_f = fh.vits->run(vin);
+                        std::vector<float> out = ft_to_vec(vout_f.at("audio"));
+                        fh.vits->release_arena();  // audio is copied out; drop the vits peak
+                        return out;
+                    };
+                    const int64_t T = (int64_t)pred.size();
+                    if (want_stream && T > chunk_tokens) {
+                        char pcmname[64];
+                        snprintf(pcmname, 64, "req%03ld.pcm", req_no);
+                        std::string pcmpath = outdir + "/" + pcmname;
+                        std::ofstream pcm(pcmpath, std::ios::binary);
+                        if (!pcm) throw std::runtime_error("cannot open stream file " + pcmpath);
+                        audio_free.reserve((size_t)T * 1280);
+                        std::vector<int16_t> s16;
+                        for (int64_t s = 0; s < T; s += chunk_tokens) {
+                            int64_t e = std::min(T, s + chunk_tokens);
+                            int64_t cs = std::max<int64_t>(0, s - chunk_ctx);
+                            int64_t ce = std::min(T, e + chunk_ctx);
+                            std::vector<float> raw = run_vits_range(cs, ce);
+                            size_t off = (size_t)(s - cs) * 1280;
+                            size_t len = (size_t)(e - s) * 1280;
+                            if (off + len > raw.size()) throw std::runtime_error("vits chunk shorter than 1280/token mapping");
+                            s16.resize(len);
+                            for (size_t i = 0; i < len; i++) {
+                                double v = raw[off + i];
+                                if (v > 1.0) v = 1.0; else if (v < -1.0) v = -1.0;
+                                s16[i] = (int16_t)std::lrint(v * 32767.0);
+                            }
+                            pcm.write((const char*)s16.data(), (std::streamsize)(len * 2));
+                            pcm.flush();
+                            audio_free.insert(audio_free.end(), raw.begin() + off, raw.begin() + off + len);
+                            n_chunks++;
+                            if (first_audio_ms < 0) first_audio_ms = ms_since(t_req);
+                            std::cout << "{\"chunk\": " << (n_chunks - 1) << ", \"file\": \"" << pcmpath
+                                      << "\", \"samples_total\": " << audio_free.size()
+                                      << ", \"elapsed_ms\": " << (long long)ms_since(t_req) << "}" << std::endl;
+                        }
+                        streamed = true;
+                    } else {
+                        if (want_stream) notes.push_back("stream not used: sequence fits one chunk or engine is not free");
+                        audio_free = run_vits_range(0, T);
                     }
-                    std::map<std::string, freeeng::Tensor> vin;
-                    freeeng::Tensor vt; vt.dtype = 7; vt.data = (const uint8_t*)text_ids.data(); vt.shape = {1, L};
-                    vin.emplace("text_seq", vt);
-                    freeeng::Tensor vp; vp.dtype = 7; vp.data = (const uint8_t*)pred.data(); vp.shape = {1, 1, (int64_t)pred.size()};
-                    vin.emplace("pred_semantic", vp);
-                    vin.emplace("ge", ft_from_rpk(ref.at("ge")));
-                    vin.emplace("ge_advanced", ft_from_rpk(ref.at("ge_advanced")));
-                    auto vout_f = fh.vits->run(vin);
-                    audio_free = ft_to_vec(vout_f.at("audio"));
                     audio = audio_free.data();
                     n_audio = audio_free.size();
-                    fh.vits->release_arena();  // audio is copied out; drop the vits peak
                 }
 #ifndef POTATO_FREE_ONLY
                 else if (vits_packed) {
@@ -1032,6 +1073,9 @@ int main(int argc, char** argv) {
                    << ", \"decode_per_step\": " << (steps ? t_dec / steps : 0) << ", \"vits\": " << t_vits
                    << ", \"deess\": " << t_deess
                    << ", \"total\": " << ms_since(t_req) << "}, \"deess_applied\": " << (use_deess ? "true" : "false")
+                   << ", \"streamed\": " << (streamed ? "true" : "false")
+                   << ", \"first_audio_ms\": " << (long long)first_audio_ms
+                   << ", \"chunks\": " << n_chunks
                    << ", \"softclip_applied\": " << (use_softclip ? "true" : "false")
                    << ", \"levels\": {\"peak_in\": " << lv.peak_in << ", \"peak_out\": " << lv.peak_out
                    << ", \"rms_in_db\": " << rms_db(lv.rms_in) << ", \"rms_out_db\": " << rms_db(lv.rms_out)
