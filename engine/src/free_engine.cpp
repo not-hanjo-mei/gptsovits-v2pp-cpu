@@ -577,6 +577,41 @@ void k_layernorm(const RT& X0, const RT* W, const RT* B, RT& Y, int64_t axis, fl
     else packed::kernel_pool().run(body);
 }
 
+// InstanceNormalization: per (n, c) mean/var over every remaining
+// dim; scale/bias are [C]. On a contiguous tensor each (n, c)
+// slice is one contiguous block of S elements.
+void k_instancenorm(const RT& X0, const RT* W, const RT* B, RT& Y, float eps, Scratch& sc) {
+    RT X = sc.contig_of(X0);
+    int64_t N = X.shape.size() > 0 ? X.shape[0] : 1;
+    int64_t C = X.shape.size() > 1 ? X.shape[1] : 1;
+    int64_t S = X.numel() / (N * C);
+    const float* x = (const float*)X.p;
+    float* y = (float*)Y.p;
+    const float* w = W ? (const float*)W->p : nullptr;
+    const float* b = B ? (const float*)B->p : nullptr;
+    RT wc, bc;
+    if (W && !W->contig()) wc = sc.contig_of(*W), w = (const float*)wc.p;
+    if (B && !B->contig()) bc = sc.contig_of(*B), b = (const float*)bc.p;
+    for (int64_t i = 0; i < N * C; i++) {
+        const float* xr = x + i * S;
+        float* yr = y + i * S;
+        double mean = 0;
+        for (int64_t j = 0; j < S; j++) mean += xr[j];
+        mean /= S;
+        double var = 0;
+        for (int64_t j = 0; j < S; j++) { double d = xr[j] - mean; var += d * d; }
+        var /= S;
+        double inv = 1.0 / std::sqrt(var + eps);
+        int64_t c = i % C;
+        for (int64_t j = 0; j < S; j++) {
+            float v = (float)((xr[j] - mean) * inv);
+            if (w) v *= w[c];
+            if (b) v += b[c];
+            yr[j] = v;
+        }
+    }
+}
+
 // Fused attention (fuse_one_attn): Q [B,H,M,32], K as the transposed
 // view [B,H,32,L] (position stride = strides[3]), V [B,H,L,32].
 // Scores use the same float dot as k_matmul's wide path (the
@@ -678,7 +713,7 @@ void k_softmax(const RT& X0, RT& Y, int64_t axis, Scratch& sc) {
 
 // Elementwise binary op codes, shared by compiler + kernels.
 enum class BinOp { ADD, SUB, MUL, DIV, POW, MAXIMUM, LESS, GREATER, EQUAL, OR, AND };
-enum class UnOp { NEG, SQRT, SIN, COS, EXP, TANH, SIGMOID, RELU, ABS, LEAKY };
+enum class UnOp { NEG, SQRT, SIN, COS, EXP, TANH, SIGMOID, RELU, ABS, LEAKY, ERF };
 
 double binop_apply(BinOp op, double a, double b) {
     switch (op) {
@@ -708,6 +743,7 @@ double unop_apply(UnOp op, double a, double alpha = 0.0) {
         case UnOp::RELU: return a > 0 ? a : 0;
         case UnOp::ABS: return std::fabs(a);
         case UnOp::LEAKY: return a > 0 ? a : alpha * a;
+        case UnOp::ERF: return std::erf(a);
     }
     return 0;
 }
@@ -839,6 +875,7 @@ float unop_apply_f(UnOp op, float a, double alpha) {
         case UnOp::RELU: return a > 0 ? a : 0.0f;
         case UnOp::ABS: return std::fabs(a);
         case UnOp::LEAKY: return a > 0 ? a : (float)(alpha * a);
+        case UnOp::ERF: return std::erf(a);
     }
     return 0;
 }
@@ -1481,9 +1518,8 @@ void k_concat(const std::vector<const RT*>& ins, RT& Y, int64_t axis, Scratch& s
     }
 }
 
-void k_conv(const RT& X0, const RT& W0, const RT* B, RT& Y, const std::vector<int64_t>& strides_a,
-            const std::vector<int64_t>& pads, const std::vector<int64_t>& dil, int64_t group, Scratch& sc) {
-    if (group != 1) fail("Conv: group != 1 not implemented");
+void k_conv_g1(const RT& X0, const RT& W0, const RT* B, RT& Y, const std::vector<int64_t>& strides_a,
+            const std::vector<int64_t>& pads, const std::vector<int64_t>& dil, Scratch& sc) {
     RT X = sc.contig_of(X0), W = sc.contig_of(W0);
     RT Bc;
     const float* bias = nullptr;
@@ -1602,6 +1638,45 @@ void k_conv(const RT& X0, const RT& W0, const RT* B, RT& Y, const std::vector<in
             }
         });
     });
+}
+
+// Grouped Conv: split into per-group group-1 convs. X and Y
+// channel slices are strided views over the contiguous bases
+// (contig_of inside k_conv_g1 materializes the X slice; the Y
+// slice is written through a scratch output plus a strided
+// copy). W slices are contiguous blocks by construction (the
+// weight's dim 1 is already C/group).
+void k_conv(const RT& X0, const RT& W0, const RT* B, RT& Y, const std::vector<int64_t>& strides_a,
+            const std::vector<int64_t>& pads, const std::vector<int64_t>& dil, int64_t group, Scratch& sc) {
+    if (group == 1) { k_conv_g1(X0, W0, B, Y, strides_a, pads, dil, sc); return; }
+    RT X = sc.contig_of(X0), W = sc.contig_of(W0);
+    int64_t N = X.shape[0], C = X.shape[1], O = W.shape[0];
+    if (C % group != 0 || O % group != 0) fail("Conv: channels not divisible by group");
+    int64_t Cg = C / group, Og = O / group;
+    int64_t Sin = X.numel() / (N * C), Sout = Y.numel() / (N * O);
+    int es = (int)onnxm::elem_size(X.dtype);
+    int64_t Ksp = 1;
+    for (size_t i = 1; i < W.shape.size(); i++) Ksp *= W.shape[i];
+    Ksp /= Cg;
+    for (int64_t g = 0; g < group; g++) {
+        auto mark = sc.mark();
+        RT xg; xg.dtype = X.dtype; xg.shape = X.shape; xg.shape[1] = Cg; xg.strides = X.strides;
+        xg.p = X.p + g * Cg * Sin * es;
+        RT wg; wg.dtype = W.dtype; wg.shape = W.shape; wg.shape[0] = Og; wg.strides = W.strides;
+        wg.p = W.p + g * Og * Cg * Ksp * es;
+        RT bg; const RT* bgp = nullptr;
+        if (B) { bg.dtype = B->dtype; bg.shape = {Og}; bg.strides = {1}; bg.p = B->p + g * Og * es; bgp = &bg; }
+        RT yg; yg.dtype = Y.dtype; yg.shape = Y.shape; yg.shape[1] = Og;
+        yg.p = sc.alloc((size_t)N * Og * Sout * es);
+        // Contiguous strides for the temp output [N, Og, spatial...].
+        yg.strides.assign(Y.shape.size(), 1);
+        for (int i = (int)Y.shape.size() - 2; i >= 0; i--) yg.strides[i] = yg.strides[i + 1] * yg.shape[i + 1];
+        k_conv_g1(xg, wg, bgp, yg, strides_a, pads, dil, sc);
+        RT yv; yv.dtype = Y.dtype; yv.shape = Y.shape; yv.shape[1] = Og; yv.strides = Y.strides;
+        yv.p = Y.p + g * Og * Sout * es;
+        copy_tensor(yv, yg);
+        sc.reset(mark);
+    }
 }
 
 // fp32 ConvTranspose (phase 2; the baked vits graph's 5 nodes are all
@@ -1992,7 +2067,7 @@ enum class SK { MATMUL, GEMM, PACKED, CONV, LN, SOFTMAX, REDUCESUM, ARGMAX, TOPK
                 // Phase 2 (vits): packed conv family, fp32 ConvTranspose,
                 // Pad, Expand. PCONV also carries PackedConvTranspose
                 // (pc_transpose), PGATHER is PackedGather.
-                PCONV, PGATHER, CONVT, PAD, EXPAND, ATTN };
+                PCONV, PGATHER, CONVT, PAD, EXPAND, ATTN, INSTNORM };
 struct Step {
     SK k = SK::COPY;
     std::vector<int> in, out;
@@ -2864,7 +2939,7 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
     static const std::map<std::string, UnOp> unops = {
         {"Neg", UnOp::NEG}, {"Sqrt", UnOp::SQRT}, {"Sin", UnOp::SIN}, {"Cos", UnOp::COS},
         {"Exp", UnOp::EXP}, {"Tanh", UnOp::TANH}, {"Sigmoid", UnOp::SIGMOID}, {"Relu", UnOp::RELU},
-        {"Abs", UnOp::ABS}, {"LeakyRelu", UnOp::LEAKY}};
+        {"Abs", UnOp::ABS}, {"LeakyRelu", UnOp::LEAKY}, {"Erf", UnOp::ERF}};
     if (unops.count(op)) {
         if (op == "Neg" && im.vals[ins[0]].kind == Value::SYMVAL) {
             Value v = im.vals[ins[0]];
@@ -3088,6 +3163,23 @@ void lower_node(Compiler& C, const onnxm::Node& n) {
             reg_out((int)i, C.new_rt(odt, ds));
             im.vals.back().def_step = -2;  // mark: no producer (never materialized unless used)
         }
+        return;
+    }
+    if (op == "InstanceNormalization") {
+        Step st;
+        st.k = SK::INSTNORM;
+        st.in = ins;
+        st.eps = n.attr_f("epsilon", 1e-5f);
+        auto os = shape_exprs(im, im.vals[ins[0]]);
+        int odt = dtype_of(im, ins[0]);
+        if (C.all_const(st.in)) {
+            auto outs = fold_node(C, n, st.in, st, {{odt, os}}, {});
+            reg_out(0, outs[0]);
+            return;
+        }
+        int o = C.new_rt(odt, os);
+        C.add_step(st, {o});
+        reg_out(0, o);
         return;
     }
     if (op == "Softmax") {
@@ -3967,6 +4059,7 @@ void exec_step(Impl& im, const Step& st, const std::vector<RT>& ins, std::vector
         }
         case SK::EXPAND: k_expand(ins[0], outs[0]); break;
         case SK::LN: k_layernorm(ins[0], ins.size() > 1 ? &ins[1] : nullptr, ins.size() > 2 ? &ins[2] : nullptr, outs[0], st.axis, st.eps, sc); break;
+        case SK::INSTNORM: k_instancenorm(ins[0], ins.size() > 1 ? &ins[1] : nullptr, ins.size() > 2 ? &ins[2] : nullptr, outs[0], st.eps, sc); break;
         case SK::SOFTMAX: k_softmax(ins[0], outs[0], st.axis, sc); break;
         case SK::ATTN: k_attn(ins[0], ins[1], ins[2], outs[0], sc, st.out_scale); break;
         case SK::REDUCESUM: {
@@ -4573,13 +4666,14 @@ std::vector<int64_t> read_meta_ints(const RT& t) {
 // FE_PROFILE accumulators (see Plan::run). Kind order matches enum SK.
 // Totals are kept per plan label so a decode step (stage plans) can be
 // read separately from prefill (first) and the encoder.
-struct ProfAcc { double us[27] = {}; long n[27] = {}; };
+struct ProfAcc { double us[28] = {}; long n[28] = {}; };
 static std::map<std::string, ProfAcc> g_prof;
-static const char* g_prof_names[27] = {"MATMUL", "GEMM", "PACKED", "CONV", "LN", "SOFTMAX",
+static const char* g_prof_names[28] = {"MATMUL", "GEMM", "PACKED", "CONV", "LN", "SOFTMAX",
                                        "REDUCESUM", "ARGMAX", "TOPK", "CUMSUM", "GATHER",
                                        "GATHER_EL", "SCATTER_EL", "CONCAT", "CONSTSHAPE",
                                        "RANDNORM", "BINOP", "UNOP", "CAST", "WHERE", "COPY",
-                                       "PCONV", "PGATHER", "CONVT", "PAD", "EXPAND", "ATTN"};
+                                       "PCONV", "PGATHER", "CONVT", "PAD", "EXPAND", "ATTN",
+                                       "INSTNORM"};
 static std::map<std::string, double> g_prof_bind, g_prof_exec;
 static std::map<std::string, long> g_prof_runs;
 static void prof_print() {
@@ -4661,6 +4755,18 @@ static bool fuse_one_attn(Impl& im) {
         if (s2.out_scale != 1.0f) continue;
         int vctx = s2.out[0];
         int vq = s0.in[0], vk = s0.in[1], vv = s2.in[1];
+        // k_attn is specialized to head dim 32 (the GPT graphs).
+        // Fuse only when all three operand shapes are compile-time
+        // constants with that layout; anything else (HuBERT's 64,
+        // symbolic dims) keeps the plain matmul/softmax steps.
+        auto const_dim = [&](int vid, size_t d, int64_t& out) {
+            const auto& rs = vals[vid].rshape;
+            return rs.size() > d && econst(rs[d], out);
+        };
+        int64_t dq, dk, dv;
+        if (!const_dim(vq, 3, dq) || dq != 32) continue;
+        if (!const_dim(vk, 2, dk) || dk != 32) continue;
+        if (!const_dim(vv, 3, dv) || dv != 32) continue;
         s0.k = SK::ATTN;
         s0.in = {vq, vk, vv};
         s0.out = {vctx};
