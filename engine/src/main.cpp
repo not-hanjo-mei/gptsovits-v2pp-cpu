@@ -925,6 +925,28 @@ int main(int argc, char** argv) {
                 const float* audio = nullptr;
                 size_t n_audio = 0;
                 if (engine_free) {
+                    // TEMP probe: raw audio length of token slices.
+                    static const bool vits_probe = std::getenv("POTATO_VITS_PROBE") != nullptr;
+                    if (vits_probe) {
+                        auto run_slice = [&](int64_t a, int64_t b) -> size_t {
+                            std::map<std::string, freeeng::Tensor> pv;
+                            freeeng::Tensor pt; pt.dtype = 7; pt.data = (const uint8_t*)text_ids.data(); pt.shape = {1, L};
+                            pv.emplace("text_seq", pt);
+                            freeeng::Tensor pp; pp.dtype = 7; pp.data = (const uint8_t*)(pred.data() + a); pp.shape = {1, 1, b - a};
+                            pv.emplace("pred_semantic", pp);
+                            pv.emplace("ge", ft_from_rpk(ref.at("ge")));
+                            pv.emplace("ge_advanced", ft_from_rpk(ref.at("ge_advanced")));
+                            auto po = fh.vits->run(pv);
+                            size_t n = ft_to_vec(po.at("audio")).size();
+                            fh.vits->release_arena();
+                            return n;
+                        };
+                        int64_t T = (int64_t)pred.size();
+                        std::cerr << "[probe] T=" << T << " full=" << run_slice(0, T)
+                                  << " [0,10)=" << run_slice(0, std::min<int64_t>(10, T))
+                                  << " [10,20)=" << run_slice(10, std::min<int64_t>(20, T))
+                                  << " [0,20)=" << run_slice(0, std::min<int64_t>(20, T)) << "\n";
+                    }
                     std::map<std::string, freeeng::Tensor> vin;
                     freeeng::Tensor vt; vt.dtype = 7; vt.data = (const uint8_t*)text_ids.data(); vt.shape = {1, L};
                     vin.emplace("text_seq", vt);
