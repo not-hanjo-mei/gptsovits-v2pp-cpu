@@ -125,6 +125,14 @@ target_include_directories(g2pm_check PRIVATE src)
 add_executable(jieba_check src/jieba_check.cpp)
 target_include_directories(jieba_check PRIVATE src)
 
+# pypinyin subset check vs pypinyin oracles.
+add_executable(pypinyin_check src/pypinyin_check.cpp)
+target_include_directories(pypinyin_check PRIVATE src)
+
+# Assembled Chinese G2P check vs the Genie g2p oracle.
+add_executable(chn_g2p_check src/chn_g2p_check.cpp)
+target_include_directories(chn_g2p_check PRIVATE src)
+
 # Compile-only probe for surveying new graphs (reference
 # extraction models) against the engine's op coverage.
 add_executable(plan_probe src/plan_probe.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
