@@ -37,7 +37,7 @@ No model weights are included. See src/README.md for what a
 runtime root directory must contain.
 EOF
 cd "$BUILD/$NAME"
-find . -type f -exec sha256sum {} + | sort -k2 > SHA256SUMS
+find . -type f ! -name SHA256SUMS -exec sha256sum {} + | sort -k2 > SHA256SUMS
 cd "$BUILD"
 mkdir -p "$OUT"
 tar -czf "$OUT/$NAME.tar.gz" "$NAME"
