@@ -132,6 +132,8 @@ target_include_directories(pypinyin_check PRIVATE src)
 # Assembled Chinese G2P check vs the Genie g2p oracle.
 add_executable(chn_g2p_check src/chn_g2p_check.cpp)
 target_include_directories(chn_g2p_check PRIVATE src)
+add_executable(eng_g2p_check src/eng_g2p_check.cpp)
+target_include_directories(eng_g2p_check PRIVATE src)
 
 # Runtime reference extraction check vs an offline pack.
 add_executable(refextract_check src/refextract_check.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})

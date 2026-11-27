@@ -105,8 +105,10 @@ the process. Add `"ref_save": true` and the tensors are also
 written to `host/refpacks/<hash>.rpk` and registered in the
 sidecar `host/refpacks/rt_index.json`; later processes can then
 use them as `{"tag": "rt:<hash>"}` like any offline pack.
-Extraction assets live under `host/refextract/` in the root
-(see `tools/REFEXTRACT_ASSETS.md` for how to build them).
+`"ref_lang": "en"` switches the prompt side to the ported
+English G2P with a zero ref_bert, as upstream does. Extraction
+assets live under `host/refextract/` in the root (see
+`tools/REFEXTRACT_ASSETS.md` for how to build them).
 
 Streaming: add `"stream": true` to a request (packed path) and the
 host runs the vits front once, then emits the vocoder decoder's
