@@ -863,3 +863,45 @@ validated through prompt_encoder's outputs. Extraction runs
 once per new reference, so per-stage speed is secondary to
 agreement; the packs' corr baselines (0.96 class for quantized
 paths, ~1.0 for fp32) are the acceptance shape.
+
+## Runtime reference extraction: HuBERT stage (2026-11-27, M3)
+
+The HuBERT graph now runs on the free engine end to end.
+hubert_check feeds the exact 16 kHz waveform Genie's
+ReferenceAudio produced for the neutral1 clip and compares
+last_hidden_state against both the ORT run and the shipped
+refpack tensor: corr 1.000000 against both, maxerr 2.7e-05
+(ORT) and 2.6e-05 (pack). The two oracles agree with each
+other to one fp16 ulp (maxerr 1.7e-06), so the pack values
+are a valid target for the remaining stages too.
+
+Engine additions, all general:
+- InstanceNormalization (per-(n, c) statistics over the
+  remaining dims), used once by the feature extractor.
+- Erf as a unary op (the exact-GELU form).
+- Grouped Conv: the wrapper splits a group>1 conv into
+  per-group group-1 convs over strided X/Y views with a
+  scratch output per group, reusing the existing tiles
+  unchanged. Validated by the encoder's pos-conv (group 16)
+  at the encoder-input checkpoint.
+- The fused-attention matcher now requires compile-time
+  constant head dim 32 on Q/K/V before fusing. It previously
+  matched HuBERT's 64-dim attention by pattern alone and
+  failed at bind; the GPT plans still fuse (FE_PROFILE:
+  4,344 ATTN calls on the packed gate run, as before).
+
+Genie's weight distribution for this model is a flat fp16
+bin whose byte layout only matches the graph after an
+in-memory fp32 conversion in their loader (the graph declares
+fp32 external tensors at fp32 offsets). tools/
+convert_fp16_external.py materializes the same conversion
+on disk; the graph then loads unmodified.
+
+Two tooling lessons from the bisect: plan outputs can be
+strided views (a graph ending in Transpose returns one), and
+hubert_check now flattens outputs in logical order before
+comparing -- the first full-graph comparison read the view
+as flat memory and reported corr 0 for a correct engine.
+Checkpoints inside the graph (feature extractor, encoder
+input, encoder layer 0) all agreed with ORT at corr 1.0
+before the full run did.

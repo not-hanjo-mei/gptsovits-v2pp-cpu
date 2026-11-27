@@ -93,6 +93,13 @@ add_executable(vits_check_free src/vits_check_free.cpp src/free_engine.cpp src/v
 target_link_libraries(vits_check_free PRIVATE pthread)
 target_include_directories(vits_check_free PRIVATE src)
 
+# HuBERT gate for runtime reference extraction: engine output vs
+# the ORT run and the shipped refpack tensor (see
+# src/hubert_check.cpp).
+add_executable(hubert_check src/hubert_check.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
+target_link_libraries(hubert_check PRIVATE pthread)
+target_include_directories(hubert_check PRIVATE src)
+
 # Compile-only probe for surveying new graphs (reference
 # extraction models) against the engine's op coverage.
 add_executable(plan_probe src/plan_probe.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
