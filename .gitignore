@@ -35,3 +35,6 @@ cmake-build-*/
 __pycache__/
 venv/
 .venv/
+
+# release artifacts are built locally, not tracked
+dist/
