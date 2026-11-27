@@ -1173,3 +1173,15 @@ before a near-tie flip; the conditioning is functionally
 equivalent, the divergence is autoregressive chaos on
 fp-level deltas, not an extraction defect. Four gates
 unchanged (299/361, 361/361, 0.959881, 1.000000).
+
+## Saved runtime references (2026-11-28, M4)
+
+A `ref_wav` request with `"ref_save": true` now persists its
+extracted tensors: `write_rpk` (rpk.h, the mirror of the
+loader) writes `host/refpacks/<hash>.rpk`, and a sidecar
+`host/refpacks/rt_index.json` maps the `rt:<hash>` tag to
+{file, audio, text} so the host never rewrites the user's
+index.json. Tag lookup consults index.json first, then the
+sidecar. Verified on neutral1: the saved pack loaded by tag
+in a fresh process reproduced the runtime request's audio
+bit-exactly (corr 1.0, maxdiff 0, tokens 25/25).

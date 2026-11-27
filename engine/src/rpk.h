@@ -21,6 +21,41 @@ struct RpkTensor {
     }
 };
 
+// Writer matching load_rpk / precompute_refs.py's format.
+inline void write_rpk(const std::string& path, const std::map<std::string, RpkTensor>& tensors) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) throw std::runtime_error("cannot write rpk: " + path);
+    auto w = [&](const void* p, size_t n) {
+        if (n && fwrite(p, 1, n, f) != n) {
+            fclose(f);
+            throw std::runtime_error("short write: " + path);
+        }
+    };
+    auto u8 = [&](uint8_t v) { w(&v, 1); };
+    auto u16 = [&](uint16_t v) { uint8_t b[2] = {(uint8_t)v, (uint8_t)(v >> 8)}; w(b, 2); };
+    auto u32 = [&](uint32_t v) {
+        uint8_t b[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24)};
+        w(b, 4);
+    };
+    auto u64 = [&](uint64_t v) {
+        u32((uint32_t)v);
+        u32((uint32_t)(v >> 32));
+    };
+    w("RPK1", 4);
+    u32((uint32_t)tensors.size());
+    for (auto& kv : tensors) {
+        const RpkTensor& t = kv.second;
+        u16((uint16_t)kv.first.size());
+        w(kv.first.data(), kv.first.size());
+        u8((uint8_t)t.dtype);
+        u8((uint8_t)t.shape.size());
+        for (auto d : t.shape) u32((uint32_t)d);
+        u64((uint64_t)t.data.size());
+        w(t.data.data(), t.data.size());
+    }
+    fclose(f);
+}
+
 inline std::map<std::string, RpkTensor> load_rpk(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) throw std::runtime_error("cannot open rpk: " + path);

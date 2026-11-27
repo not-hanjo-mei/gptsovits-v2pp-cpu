@@ -5,7 +5,11 @@
 // from offline .rpk packs. A request may instead carry
 // "ref_wav" + "ref_text": the five tensors are then extracted
 // at runtime (refextract.h, free engine only) and cached by
-// content hash for the life of the process.
+// content hash for the life of the process. With
+// "ref_save": true the tensors are also written to
+// host/refpacks/<hash>.rpk and registered in the sidecar
+// rt_index.json, so later processes can use them as
+// {"tag": "rt:<hash>"} like any offline pack.
 // Interface: resident process, stdin one JSON request per line, one wav file
 // per request into --outdir, one JSON result line on stdout per request.
 #ifndef POTATO_FREE_ONLY
@@ -19,6 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <set>
 #include <sstream>
 
 #include "cpu.h"
@@ -633,7 +638,57 @@ int main(int argc, char** argv) {
         G2P g2p;
         g2p.load(root + "/host/data");
         Json index_doc = JsonParser(read_text(root + "/host/refpacks/index.json")).parse();
-        std::cerr << "[load] g2p + refpack index ready; boot " << (int)ms_since(t_boot) << " ms; rss " << rss_kb() / 1024 << " MB\n";
+        // Sidecar index for runtime-extracted packs saved with
+        // "ref_save": tag -> {file, audio, text}. Kept apart
+        // from index.json so the host never rewrites it.
+        struct RtIndexEntry { std::string file, audio, text; };
+        std::map<std::string, RtIndexEntry> rt_index;
+        {
+            std::ifstream f(root + "/host/refpacks/rt_index.json");
+            if (f) {
+                Json doc = JsonParser(std::string((std::istreambuf_iterator<char>(f)),
+                                                  std::istreambuf_iterator<char>())).parse();
+                if (doc.type == Json::Obj)
+                    for (auto& kv : doc.obj) {
+                        const Json* file = kv.second.find("file");
+                        if (!file) continue;
+                        RtIndexEntry e;
+                        e.file = file->as_str();
+                        if (const Json* a = kv.second.find("audio")) e.audio = a->as_str();
+                        if (const Json* t = kv.second.find("text")) e.text = t->as_str();
+                        rt_index[kv.first] = e;
+                    }
+            }
+        }
+        auto find_tag_file = [&](const std::string& tag) -> std::string {
+            if (const Json* node = index_doc.find(tag)) return node->find("file")->as_str();
+            auto it = rt_index.find(tag);
+            return it == rt_index.end() ? "" : it->second.file;
+        };
+        auto persist_rt_index = [&]() {
+            auto esc = [](const std::string& s) {
+                std::string o;
+                for (char c : s) {
+                    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+                    else if ((uint8_t)c < 0x20) { char b[8]; snprintf(b, 8, "\\u%04x", c); o += b; }
+                    else o += c;
+                }
+                return o;
+            };
+            std::string out = "{\n";
+            bool first = true;
+            for (auto& kv : rt_index) {
+                if (!first) out += ",\n";
+                first = false;
+                out += " \"" + esc(kv.first) + "\": {\"file\": \"" + esc(kv.second.file) +
+                       "\", \"audio\": \"" + esc(kv.second.audio) + "\", \"text\": \"" +
+                       esc(kv.second.text) + "\"}";
+            }
+            out += "\n}\n";
+            write_file(root + "/host/refpacks/rt_index.json", (const uint8_t*)out.data(), out.size());
+        };
+        std::cerr << "[load] g2p + refpack index ready (" << rt_index.size()
+                  << " saved runtime refs); boot " << (int)ms_since(t_boot) << " ms; rss " << rss_kb() / 1024 << " MB\n";
 
 #ifndef POTATO_FREE_ONLY
         Ort::AllocatorWithDefaultOptions alloc;
@@ -642,9 +697,9 @@ int main(int argc, char** argv) {
         auto get_ref = [&](const std::string& tag) -> const std::map<std::string, RpkTensor>& {
             auto it = refcache.find(tag);
             if (it != refcache.end()) return it->second;
-            const Json* node = index_doc.find(tag);
-            if (!node) throw std::runtime_error("tag not in index: " + tag);
-            auto rp = load_rpk(root + "/host/refpacks/" + node->find("file")->as_str());
+            std::string file = find_tag_file(tag);
+            if (file.empty()) throw std::runtime_error("tag not in index: " + tag);
+            auto rp = load_rpk(root + "/host/refpacks/" + file);
             refcache[tag] = std::move(rp);
             return refcache[tag];
         };
@@ -654,7 +709,8 @@ int main(int argc, char** argv) {
         // share the pack cache under an "rt:<hash>" key.
         RefExtractor rt_ext;
         bool rt_ext_ready = false, rt_ext_failed = false;
-        auto get_ref_rt = [&](const std::string& wav, const std::string& ptext)
+        std::set<std::string> rt_saved;
+        auto get_ref_rt = [&](const std::string& wav, const std::string& ptext, bool save)
             -> const std::map<std::string, RpkTensor>& {
             auto wb = read_file(wav);
             uint64_t h = 1469598103934665603ULL;
@@ -666,23 +722,37 @@ int main(int argc, char** argv) {
             char key[40];
             snprintf(key, sizeof key, "rt:%016llx", (unsigned long long)h);
             auto it = refcache.find(key);
-            if (it != refcache.end()) return it->second;
-            if (!engine_free) throw std::runtime_error("ref_wav requires --engine free");
-            if (!rt_ext_ready) {
-                if (rt_ext_failed) throw std::runtime_error("runtime reference extraction unavailable");
-                std::string err;
-                if (!rt_ext.init(root + "/host/refextract", err)) {
-                    rt_ext_failed = true;
-                    throw std::runtime_error("refextract init: " + err);
+            if (it == refcache.end()) {
+                if (!engine_free) throw std::runtime_error("ref_wav requires --engine free");
+                if (!rt_ext_ready) {
+                    if (rt_ext_failed) throw std::runtime_error("runtime reference extraction unavailable");
+                    std::string err;
+                    if (!rt_ext.init(root + "/host/refextract", err)) {
+                        rt_ext_failed = true;
+                        throw std::runtime_error("refextract init: " + err);
+                    }
+                    rt_ext_ready = true;
                 }
-                rt_ext_ready = true;
+                auto t0 = Clock::now();
+                auto tensors = rt_ext.extract(wav, ptext);
+                std::cerr << "[ref] runtime reference " << key << " extracted in " << (int)ms_since(t0)
+                          << " ms; rss " << rss_kb() / 1024 << " MB\n";
+                refcache[key] = std::move(tensors);
+                it = refcache.find(key);
             }
-            auto t0 = Clock::now();
-            auto tensors = rt_ext.extract(wav, ptext);
-            std::cerr << "[ref] runtime reference " << key << " extracted in " << (int)ms_since(t0)
-                      << " ms; rss " << rss_kb() / 1024 << " MB\n";
-            refcache[key] = std::move(tensors);
-            return refcache[key];
+            if (save && !rt_saved.count(key)) {
+                std::string file = std::string(key + 3) + ".rpk";  // strip "rt:"
+                write_rpk(root + "/host/refpacks/" + file, it->second);
+                RtIndexEntry e;
+                e.file = file;
+                e.audio = wav.substr(wav.find_last_of('/') + 1);
+                e.text = ptext;
+                rt_index[key] = e;
+                persist_rt_index();
+                rt_saved.insert(key);
+                std::cerr << "[ref] saved runtime reference as pack " << file << " (tag " << key << ")\n";
+            }
+            return it->second;
         };
 
         const int SR = 32000, EOS_ID = 1024, VOCAB = 1025, MAX_STEPS = 500;
@@ -710,14 +780,17 @@ int main(int argc, char** argv) {
                 bool greedy = gj && gj->type == Json::Bool && gj->b;
                 std::vector<std::string> notes;
                 if (r.find("speed")) notes.push_back("speed accepted but not applied: no graph input carries it");
+                const Json* rsj = r.find("ref_save");
+                bool ref_save = rsj && rsj->type == Json::Bool && rsj->b;
                 const std::map<std::string, RpkTensor>* refp = nullptr;
                 std::string tag_used = tag;
                 if (!ref_wav.empty()) {
-                    refp = &get_ref_rt(ref_wav, ref_text);
+                    refp = &get_ref_rt(ref_wav, ref_text, ref_save);
                     tag_used = "(runtime)";
-                    notes.push_back("runtime-extracted reference from " + ref_wav);
+                    notes.push_back("runtime-extracted reference from " + ref_wav +
+                                    (ref_save ? ", saved as a pack" : ""));
                 } else {
-                    if (!index_doc.find(tag)) { tag_used = "neutral1"; notes.push_back("tag '" + tag + "' missing, fell back to neutral1"); }
+                    if (find_tag_file(tag).empty()) { tag_used = "neutral1"; notes.push_back("tag '" + tag + "' missing, fell back to neutral1"); }
                     refp = &get_ref(tag_used);
                 }
                 const auto& ref = *refp;

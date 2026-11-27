@@ -101,8 +101,12 @@ host then extracts the five reference tensors at runtime — wav
 decode + resample, Chinese G2P, WordPiece tokenization, and the
 HuBERT / RoBERTa / speaker-encoder / prompt-encoder plans, all on
 the free engine — and caches them by content hash for the life of
-the process. Extraction assets live under `host/refextract/` in
-the root (see DESIGN.md, "Host integration").
+the process. Add `"ref_save": true` and the tensors are also
+written to `host/refpacks/<hash>.rpk` and registered in the
+sidecar `host/refpacks/rt_index.json`; later processes can then
+use them as `{"tag": "rt:<hash>"}` like any offline pack.
+Extraction assets live under `host/refextract/` in the root
+(see `tools/REFEXTRACT_ASSETS.md` for how to build them).
 
 Streaming: add `"stream": true` to a request (packed path) and the
 host runs the vits front once, then emits the vocoder decoder's
