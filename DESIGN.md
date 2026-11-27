@@ -807,3 +807,59 @@ plain and streaming requests against an existing root, and a
 rebuild from the packaged source reproduces the same output
 duration on the standard sentence. No weights are included; a
 runtime root is still produced by the conversion scripts.
+
+## Runtime reference extraction: design and first probe (2026-11-27, M3)
+
+Goal: build a refpack from a raw wav + prompt text at runtime,
+in the host, on the free engine -- the second half of the
+dual-mode design (packs remain the supported mode). The offline
+producer (host/precompute_refs.py in the asset root) defines the
+target exactly. A pack holds five tensors:
+
+  ref_seq      i64[1, L]     prompt phones (the host's own g2p)
+  ref_bert     f32[L, 1024]  RoBERTa over the prompt text
+  ssl_content  f32[1, 768, T]  HuBERT over the wav at 16 kHz
+  ge           f32[1, 1024, 1] prompt_encoder (below)
+  ge_advanced  f32[1, 512, 1]  prompt_encoder (below)
+
+prompt_encoder_fp32.onnx takes the raw 32 kHz waveform plus an
+SV embedding and produces both ge tensors (mel inside the
+graph). The SV embedding comes from the ERes2NetV2 speaker
+encoder over the 16 kHz waveform. Host-side DSP still needed:
+wav decode and resampling to 16/32 kHz; a WordPiece tokenizer
+for RoBERTa (vocab ships in the asset root).
+
+Compile probe (plan_probe, compile-only) against the graphs in
+the asset root, 2026-11-27:
+
+  HuBERT (chinese-hubert-base.onnx, 238 KB + external weights)
+    Blocked at load: the graph references
+    chinese-hubert-base_weights.bin; the asset ships the fp16
+    weights as chinese-hubert-base_weights_fp16.bin. A rename at
+    pack time fixes the path; the fp16 external initializers
+    then need loader support (convert at load, or an fp16 plan
+    path like the GPT one).
+  RoBERTa (RoBERTa.onnx, 1,707 nodes; inputs input_ids,
+    attention_mask, repeats; output phone_features)
+    One blocker: a Slice whose end is symbolic ("const slice
+    symbolic end"). The engine's symbolic shape system has the
+    values; the Slice lowering must learn to defer its bounds
+    to bind time.
+  Speaker encoder (speaker_encoder.onnx, 806 nodes)
+    SequenceEmpty is unsupported; the graph batches frames with
+    sequence ops. Either grow the sequence op family or rewrite
+    the graph's batching away offline.
+  prompt_encoder (prompt_encoder_fp32.onnx, 281 nodes)
+    If is unsupported. At runtime the branch is fixed (an SV
+    embedding is always supplied), so an offline specialization
+    to the taken branch is legitimate; general If support is
+    the alternative.
+
+Order of attack, each stage with its oracle from an existing
+pack: HuBERT vs ssl_content; RoBERTa vs ref_bert;
+prompt_encoder vs ge/ge_advanced (SV embedding from an ORT run
+until the speaker encoder lands); speaker encoder last,
+validated through prompt_encoder's outputs. Extraction runs
+once per new reference, so per-stage speed is secondary to
+agreement; the packs' corr baselines (0.96 class for quantized
+paths, ~1.0 for fp32) are the acceptance shape.

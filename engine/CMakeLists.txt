@@ -93,6 +93,12 @@ add_executable(vits_check_free src/vits_check_free.cpp src/free_engine.cpp src/v
 target_link_libraries(vits_check_free PRIVATE pthread)
 target_include_directories(vits_check_free PRIVATE src)
 
+# Compile-only probe for surveying new graphs (reference
+# extraction models) against the engine's op coverage.
+add_executable(plan_probe src/plan_probe.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
+target_link_libraries(plan_probe PRIVATE pthread)
+target_include_directories(plan_probe PRIVATE src)
+
 # Streaming validation: chunked VITS slicing vs one-shot on the
 # noiseless fp32 graph (see src/vits_slice_check.cpp).
 add_executable(vits_slice_check src/vits_slice_check.cpp src/free_engine.cpp src/vits_kernels.cpp src/avx2_kernels.cpp ${POTATO_ASM_SRC})
