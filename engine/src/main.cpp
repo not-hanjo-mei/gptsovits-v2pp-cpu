@@ -2,7 +2,10 @@
 // decode loop. Loads weight-only packs (W4 or W8 GPT, W8 vits), dequantizes
 // them in-process and injects the fp32 tensors into the fp32 graph templates
 // from Stage 1. Reference conditioning (incl. prompt-encoder outputs) comes
-// from offline .rpk packs; prompt_encoder never runs at runtime.
+// from offline .rpk packs. A request may instead carry
+// "ref_wav" + "ref_text": the five tensors are then extracted
+// at runtime (refextract.h, free engine only) and cached by
+// content hash for the life of the process.
 // Interface: resident process, stdin one JSON request per line, one wav file
 // per request into --outdir, one JSON result line on stdout per request.
 #ifndef POTATO_FREE_ONLY
@@ -35,6 +38,7 @@
 #include "vits_packed.h"
 #endif
 #include "patch.h"
+#include "refextract.h"
 #include "rpk.h"
 
 using Clock = std::chrono::steady_clock;
@@ -645,6 +649,42 @@ int main(int argc, char** argv) {
             return refcache[tag];
         };
 
+        // Runtime-extracted references (M3-3d): lazily
+        // initialized on the first ref_wav request; results
+        // share the pack cache under an "rt:<hash>" key.
+        RefExtractor rt_ext;
+        bool rt_ext_ready = false, rt_ext_failed = false;
+        auto get_ref_rt = [&](const std::string& wav, const std::string& ptext)
+            -> const std::map<std::string, RpkTensor>& {
+            auto wb = read_file(wav);
+            uint64_t h = 1469598103934665603ULL;
+            auto mix = [&](const uint8_t* p, size_t n) {
+                for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+            };
+            mix(wb.data(), wb.size());
+            mix((const uint8_t*)ptext.data(), ptext.size());
+            char key[40];
+            snprintf(key, sizeof key, "rt:%016llx", (unsigned long long)h);
+            auto it = refcache.find(key);
+            if (it != refcache.end()) return it->second;
+            if (!engine_free) throw std::runtime_error("ref_wav requires --engine free");
+            if (!rt_ext_ready) {
+                if (rt_ext_failed) throw std::runtime_error("runtime reference extraction unavailable");
+                std::string err;
+                if (!rt_ext.init(root + "/host/refextract", err)) {
+                    rt_ext_failed = true;
+                    throw std::runtime_error("refextract init: " + err);
+                }
+                rt_ext_ready = true;
+            }
+            auto t0 = Clock::now();
+            auto tensors = rt_ext.extract(wav, ptext);
+            std::cerr << "[ref] runtime reference " << key << " extracted in " << (int)ms_since(t0)
+                      << " ms; rss " << rss_kb() / 1024 << " MB\n";
+            refcache[key] = std::move(tensors);
+            return refcache[key];
+        };
+
         const int SR = 32000, EOS_ID = 1024, VOCAB = 1025, MAX_STEPS = 500;
         std::string line;
         long req_no = 0;
@@ -658,6 +698,8 @@ int main(int argc, char** argv) {
                 auto getnum = [&](const char* k, double d) { const Json* j = r.find(k); return j ? j->as_num(d) : d; };
                 std::string text = getstr("text", "");
                 std::string tag = getstr("tag", "neutral1");
+                std::string ref_wav = getstr("ref_wav", "");
+                std::string ref_text = getstr("ref_text", "");
                 double speed = getnum("speed", 1.0);
                 (void)speed;
                 int top_k = (int)getnum("top_k", 20);
@@ -668,9 +710,17 @@ int main(int argc, char** argv) {
                 bool greedy = gj && gj->type == Json::Bool && gj->b;
                 std::vector<std::string> notes;
                 if (r.find("speed")) notes.push_back("speed accepted but not applied: no graph input carries it");
+                const std::map<std::string, RpkTensor>* refp = nullptr;
                 std::string tag_used = tag;
-                if (!index_doc.find(tag)) { tag_used = "neutral1"; notes.push_back("tag '" + tag + "' missing, fell back to neutral1"); }
-                const auto& ref = get_ref(tag_used);
+                if (!ref_wav.empty()) {
+                    refp = &get_ref_rt(ref_wav, ref_text);
+                    tag_used = "(runtime)";
+                    notes.push_back("runtime-extracted reference from " + ref_wav);
+                } else {
+                    if (!index_doc.find(tag)) { tag_used = "neutral1"; notes.push_back("tag '" + tag + "' missing, fell back to neutral1"); }
+                    refp = &get_ref(tag_used);
+                }
+                const auto& ref = *refp;
 
                 // ---- G2P (shell behavior: prepend ".") ----
                 auto t0 = Clock::now();

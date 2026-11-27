@@ -94,10 +94,15 @@ cmake --build build -j 4        # produces build/tts_host
 `tts_host` reads a root directory holding the converted graph packs
 and speaks JSON lines on stdin/stdout: one request line
 (`{"text": ..., "tag": ..., "seed": ...}`), one result line with the
-output wav path and timings. Reference audio runs from precomputed
-reference packs today; runtime extraction (wav in, features computed
-on the spot, optionally written back as a pack) is the settled
-dual-mode design in DESIGN.md and is not implemented yet.
+output wav path and timings. Reference audio normally runs from
+precomputed reference packs. A request may instead carry
+`"ref_wav"` (a wav path) and `"ref_text"` (its transcript): the
+host then extracts the five reference tensors at runtime — wav
+decode + resample, Chinese G2P, WordPiece tokenization, and the
+HuBERT / RoBERTa / speaker-encoder / prompt-encoder plans, all on
+the free engine — and caches them by content hash for the life of
+the process. Extraction assets live under `host/refextract/` in
+the root (see DESIGN.md, "Host integration").
 
 Streaming: add `"stream": true` to a request (packed path) and the
 host runs the vits front once, then emits the vocoder decoder's

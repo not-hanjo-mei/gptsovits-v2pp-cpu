@@ -1098,7 +1098,78 @@ verified on the EPYC box, with the packed tf gate
 independently at 299/361 locally). The ASAN build
 runs prompt_encoder clean.
 
-Remaining M3 work: host integration -- wav decode,
-resampling, a Chinese G2P and a WordPiece tokenizer
-for the prompt side, and the four-plan chain wired
-into the host.
+Remaining M3 work at this point: host integration --
+wav decode, resampling, a Chinese G2P and a WordPiece
+tokenizer for the prompt side, and the four-plan chain
+wired into the host (next entry).
+
+## Host integration (2026-11-27, M3-3d)
+
+The runtime reference path is wired end to end. Four pieces,
+each verified against the offline Python pipeline (Genie /
+genie_tts in the tts-engine venv) on the 69 reference texts
+plus synthetic edge cases:
+
+(a) Wav decode + resample (`resample.h`, `wavread.h`,
+`resample_check`). RIFF reader (PCM 16/24/32, float,
+extensible) with channel averaging; Kaiser-windowed sinc
+resampler standing in for soxr 'hq'. For the neutral1
+reference (32 kHz native): audio_32k bit-exact; audio_16k
+corr 0.999918, with the error confined to soxr's gradual
+7.3-8 kHz transition band (steeper/longer fits measured
+worse). Downstream through HuBERT: ssl corr 0.999993 vs
+the pack. Accepted on that basis.
+
+(b) Chinese G2P (`chn_g2p.h`, `g2pm.h`, `jieba.h`,
+`pypinyin_mini.h`, `textnorm.h`). A full port of Genie's
+chinese_to_phones + TextNormalizer: g2pM BiLSTM over its
+exported weights (76/76 texts exact), jieba_fast dict DAG +
+posseg viterbi + finalseg (psg 93/93, cut_for_search
+712/712), the pypinyin subset used by the pipeline
+(to_initials / to_finals_tone3 / lazy finals: 1366/1366,
+712/712), tone sandhi + erhua + polyphonic correction +
+opencpop mapping, and the normalizer cascade (t2s,
+fullwidth, date/time/range/temperature/measure/ASMD/
+power/fraction/percent/phone/version/quantifier/number)
+on std::wregex. Assembled: normalize 103/103, g2p 98/98,
+full process (clean, phones, ids, word2ph) 98/98 exact.
+Model/dict data ships as exported binary assets (export
+scripts run the Python packages once, offline). Two
+upstream behaviors are mirrored deliberately: the
+normalizer's temperature unit reads the wrong regex group
+(the emitted unit is always the plain degree word), and
+the time-range half-hour test reads the first minute.
+Five corpus texts crash Genie itself (an empty lazy final
+in the three-tone merge, on interjection characters); the
+port produces output there instead. Consistent with the
+shipped packs holding 65 packs for 69 clips.
+
+(c) WordPiece tokenizer (`wordpiece.h`, `tokenizer_check`):
+the RoBERTa tokenizer.json stack (BertNormalizer,
+BertPreTokenizer, WordPiece over vocab.txt). 87/87 exact.
+
+(d) Host wiring (`refextract.h`, `refextract_check`,
+main.cpp). A request with "ref_wav" + "ref_text" extracts
+the five tensors in memory (HuBERT -> ssl_content,
+speaker encoder -> prompt encoder -> ge / ge_advanced,
+g2p + tokenizer + RoBERTa -> ref_seq / ref_bert), stores
+them in the pack cache under an FNV-1a content key, and
+synthesizes through the unchanged pack path. Extraction
+plans and assets load lazily from `host/refextract/` on
+the first such request (free engine only).
+
+Acceptance on neutral1 vs the offline pack: ref_seq
+exact; ref_bert corr 1.000000 (maxerr 0.0184, the free
+engine's own RoBERTa delta from 3b); ssl_content corr
+0.999993; ge corr 0.999510, ge_advanced corr 0.999835.
+The ge delta is traced, not shrugged: the engine's
+speaker embedding is exact on identical audio (3c), but
+the embedding is sensitive to the resampler's transition
+band -- engine SV on the port's audio_16k vs ORT SV on
+soxr's gives corr 0.998910, relrms 0.046. Synthesis A/B
+(pack vs runtime, same seed): token sequences share a
+21-token prefix under sampling and 52 tokens under greedy
+before a near-tie flip; the conditioning is functionally
+equivalent, the divergence is autoregressive chaos on
+fp-level deltas, not an extraction defect. Four gates
+unchanged (299/361, 361/361, 0.959881, 1.000000).
