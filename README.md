@@ -128,4 +128,5 @@ AVX/AVX2 machines.
 
 ## License
 
-Not yet chosen.
+MIT (see `LICENSE`). Model weights are not covered: none are
+distributed here, and any weights you bring keep their own terms.
