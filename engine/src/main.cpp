@@ -343,6 +343,28 @@ static std::pair<size_t, size_t> trim_range(const float* a, size_t n, double max
     return {lead, n - trail};
 }
 
+// The full English G2P chain (eng_g2p.h: tokenizer,
+// normalization, POS tagger, CMU/name dicts, wordsegment,
+// GRU OOV) for the target-text frontend, loaded from the
+// same refextract assets the prompt side uses. Returns
+// false when the assets are absent; the caller then keeps
+// the legacy G2P (g2p.h) as a fallback.
+static bool load_eng_g2p(const std::string& root, eng2p::EngG2P& eng) {
+    std::vector<std::string> symbols;
+    {
+        std::ifstream f(root + "/host/refextract/g2p/symbols_v2.txt");
+        if (!f) return false;
+        std::string line;
+        while (std::getline(f, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            symbols.push_back(line);
+        }
+        while (!symbols.empty() && symbols.back().empty()) symbols.pop_back();
+    }
+    std::string err;
+    return eng.load(root + "/host/refextract/eng", symbols, err);
+}
+
 int main(int argc, char** argv) {
     std::string root;  // --root is required (no baked-in default)
     std::string outdir, emit_dir;
@@ -410,11 +432,14 @@ int main(int argc, char** argv) {
         // Validation helper: one input line of text -> one JSON array of phone ids.
         G2P g2p;
         g2p.load(root + "/host/data");
+        eng2p::EngG2P eng_g2p;
+        bool eng_ready = load_eng_g2p(root, eng_g2p);
         std::string l;
         while (std::getline(std::cin, l)) {
             if (l.empty()) continue;
             int fb = 0;
-            auto ids = g2p.text_to_ids("." + l, fb);
+            auto ids = eng_ready ? eng_g2p.phones_to_ids(eng2p::u8_to_w(l))
+                                 : g2p.text_to_ids("." + l, fb);
             std::cout << "{\"ids\": [";
             for (size_t i = 0; i < ids.size(); i++) { if (i) std::cout << ","; std::cout << ids[i]; }
             std::cout << "], \"fallback\": " << fb << "}" << std::endl;
@@ -639,6 +664,11 @@ int main(int argc, char** argv) {
 
         G2P g2p;
         g2p.load(root + "/host/data");
+        eng2p::EngG2P eng_g2p;
+        bool eng_ready = load_eng_g2p(root, eng_g2p);
+        if (!eng_ready)
+            std::cerr << "[load] english assets not found under host/refextract/eng; "
+                         "target text uses the legacy g2p\n";
         Json index_doc = JsonParser(read_text(root + "/host/refpacks/index.json")).parse();
         // Sidecar index for runtime-extracted packs saved with
         // "ref_save": tag -> {file, audio, text}. Kept apart
@@ -804,10 +834,14 @@ int main(int argc, char** argv) {
                 }
                 const auto& ref = *refp;
 
-                // ---- G2P (shell behavior: prepend ".") ----
+                // ---- G2P: the full English chain when its
+                // assets are present (raw text, upstream
+                // pipeline); the legacy frontend otherwise
+                // (shell behavior: prepend ".") ----
                 auto t0 = Clock::now();
                 int fb = 0;
-                auto text_ids = g2p.text_to_ids("." + text, fb);
+                auto text_ids = eng_ready ? eng_g2p.phones_to_ids(eng2p::u8_to_w(text))
+                                          : g2p.text_to_ids("." + text, fb);
                 double t_g2p = ms_since(t0);
                 int64_t L = text_ids.size();
                 std::vector<float> text_bert((size_t)L * 1024, 0.0f);
