@@ -42,7 +42,11 @@ the resampler's transition band. (Fitting the resampler to
 soxr's response improves the embedding in isolation and makes
 ge worse end to end, so the plain Kaiser resampler stays.)
 English prompts take a zero ref_bert, as upstream does, so
-the English path needs no RoBERTa.
+the English path needs no RoBERTa. The same ported chain
+also serves English target text in the host frontend when
+the assets are present; without them the frontend falls
+back to a simpler legacy G2P whose out-of-dictionary words
+degrade to letter spelling.
 
 ## Where the speed comes from
 
