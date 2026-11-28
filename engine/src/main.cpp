@@ -365,6 +365,27 @@ static bool load_eng_g2p(const std::string& root, eng2p::EngG2P& eng) {
     return eng.load(root + "/host/refextract/eng", symbols, err);
 }
 
+// True when the UTF-8 text holds at least one CJK ideograph.
+static bool contains_cjk(const std::string& s) {
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = (unsigned char)s[i];
+        uint32_t cp;
+        size_t len;
+        if (c < 0x80) { i++; continue; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+        else { i++; continue; }
+        if (i + len > s.size()) break;
+        for (size_t k = 1; k < len; k++) cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3F);
+        if ((cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0x4E00 && cp <= 0x9FFF) ||
+            (cp >= 0xF900 && cp <= 0xFAFF))
+            return true;
+        i += len;
+    }
+    return false;
+}
+
 int main(int argc, char** argv) {
     std::string root;  // --root is required (no baked-in default)
     std::string outdir, emit_dir;
@@ -434,12 +455,24 @@ int main(int argc, char** argv) {
         g2p.load(root + "/host/data");
         eng2p::EngG2P eng_g2p;
         bool eng_ready = load_eng_g2p(root, eng_g2p);
+        RefExtractor zh_ext;
+        bool zh_ready = false;
+        {
+            std::string err;
+            zh_ready = zh_ext.init_text(root + "/host/refextract", err);
+        }
         std::string l;
         while (std::getline(std::cin, l)) {
             if (l.empty()) continue;
             int fb = 0;
-            auto ids = eng_ready ? eng_g2p.phones_to_ids(eng2p::u8_to_w(l))
-                                 : g2p.text_to_ids("." + l, fb);
+            std::vector<int64_t> ids;
+            if (zh_ready && contains_cjk(l)) {
+                std::vector<float> bert;
+                zh_ext.frontend_zh(l, ids, bert);
+            } else {
+                ids = eng_ready ? eng_g2p.phones_to_ids(eng2p::u8_to_w(l))
+                                : g2p.text_to_ids("." + l, fb);
+            }
             std::cout << "{\"ids\": [";
             for (size_t i = 0; i < ids.size(); i++) { if (i) std::cout << ","; std::cout << ids[i]; }
             std::cout << "], \"fallback\": " << fb << "}" << std::endl;
@@ -741,6 +774,11 @@ int main(int argc, char** argv) {
         // share the pack cache under an "rt:<hash>" key.
         RefExtractor rt_ext;
         bool rt_ext_ready = false, rt_ext_failed = false;
+        // Chinese target text: a text-side extractor (Chinese
+        // G2P + RoBERTa), lazily initialized on the first
+        // request whose text contains CJK.
+        RefExtractor zh_ext;
+        bool zh_ext_tried = false, zh_ext_ready = false;
         std::set<std::string> rt_saved;
         auto get_ref_rt = [&](const std::string& wav, const std::string& ptext, bool save,
                               const std::string& lang)
@@ -834,17 +872,34 @@ int main(int argc, char** argv) {
                 }
                 const auto& ref = *refp;
 
-                // ---- G2P: the full English chain when its
-                // assets are present (raw text, upstream
-                // pipeline); the legacy frontend otherwise
-                // (shell behavior: prepend ".") ----
+                // ---- Target text frontend: Chinese text
+                // takes the Chinese chain (phones + RoBERTa
+                // features); English takes the full English
+                // chain when its assets are present, else the
+                // legacy frontend (shell behavior: prepend
+                // "."). BERT features are zeros outside the
+                // Chinese chain; upstream has none there. ----
                 auto t0 = Clock::now();
                 int fb = 0;
-                auto text_ids = eng_ready ? eng_g2p.phones_to_ids(eng2p::u8_to_w(text))
-                                          : g2p.text_to_ids("." + text, fb);
+                std::vector<int64_t> text_ids;
+                std::vector<float> text_bert;
+                bool want_zh = contains_cjk(text);
+                if (want_zh && !zh_ext_tried) {
+                    zh_ext_tried = true;
+                    std::string err;
+                    zh_ext_ready = zh_ext.init_text(root + "/host/refextract", err);
+                    if (!zh_ext_ready)
+                        notes.push_back("chinese frontend unavailable (" + err + "); legacy g2p used");
+                }
+                if (want_zh && zh_ext_ready) {
+                    zh_ext.frontend_zh(text, text_ids, text_bert);
+                } else {
+                    text_ids = eng_ready ? eng_g2p.phones_to_ids(eng2p::u8_to_w(text))
+                                         : g2p.text_to_ids("." + text, fb);
+                    text_bert.assign(text_ids.size() * 1024, 0.0f);
+                }
                 double t_g2p = ms_since(t0);
                 int64_t L = text_ids.size();
-                std::vector<float> text_bert((size_t)L * 1024, 0.0f);
                 const auto& ref_seq = ref.at("ref_seq");
                 const auto& ref_bert = ref.at("ref_bert");
                 const auto& ssl = ref.at("ssl_content");

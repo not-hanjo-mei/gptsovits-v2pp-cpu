@@ -25,7 +25,7 @@
 //   g2p/{g2pm.bin, dict.txt, jieba_posseg.bin, finalseg.bin,
 //        pypinyin.bin, sandhi.bin, polyphonic.bin,
 //        opencpop-strict.txt, symbols_v2.txt, t2s.bin}
-//   eng/{eng.bin, taggers/..., wordsegment/...} (English only,
+//   eng/{eng.bin, tagger.bin, wordsegment/...} (English only,
 //        loaded lazily on the first English request)
 #pragma once
 
@@ -49,13 +49,13 @@
 
 class RefExtractor {
    public:
-    bool init(const std::string& dir, std::string& err) {
+    // Text side only: vocab, Chinese G2P assets, the RoBERTa
+    // plan. Enough for frontend_zh; the host's target-text
+    // frontend uses this without paying for the audio plans.
+    bool init_text(const std::string& dir, std::string& err) {
+        if (text_ready_) return true;
         dir_ = dir;
         try {
-            hubert_ = compile(dir + "/hubert/chinese-hubert-base.onnx", "ref_hubert");
-            roberta_ = compile(dir + "/RoBERTa.onnx", "ref_roberta");
-            sv_ = compile(dir + "/speaker_encoder.onnx", "ref_sv");
-            pe_ = compile(dir + "/prompt_encoder_fp32.onnx", "ref_prompt_encoder");
             if (!tok_.load_vocab(dir + "/vocab.txt")) {
                 err = "cannot load vocab.txt";
                 return false;
@@ -67,6 +67,22 @@ class RefExtractor {
                 err = "cannot load g2p assets";
                 return false;
             }
+            roberta_ = compile(dir + "/RoBERTa.onnx", "ref_roberta");
+        } catch (const std::exception& e) {
+            err = e.what();
+            return false;
+        }
+        text_ready_ = true;
+        return true;
+    }
+    bool text_ready() const { return text_ready_; }
+
+    bool init(const std::string& dir, std::string& err) {
+        if (!init_text(dir, err)) return false;
+        try {
+            hubert_ = compile(dir + "/hubert/chinese-hubert-base.onnx", "ref_hubert");
+            sv_ = compile(dir + "/speaker_encoder.onnx", "ref_sv");
+            pe_ = compile(dir + "/prompt_encoder_fp32.onnx", "ref_prompt_encoder");
         } catch (const std::exception& e) {
             err = e.what();
             return false;
@@ -75,6 +91,28 @@ class RefExtractor {
         return true;
     }
     bool ready() const { return ready_; }
+
+    // Chinese text -> phone ids + phone-level BERT features,
+    // the text half of extract(). Used for prompt references
+    // and for Chinese target text in the host frontend.
+    void frontend_zh(const std::string& text, std::vector<int64_t>& ids_out,
+                     std::vector<float>& bert_out) {
+        if (!text_ready_) throw std::runtime_error("refextract: text side not initialized");
+        chng2p::ChineseG2P::Processed proc = g2p_.process(text);
+        if (proc.ids.empty()) throw std::runtime_error("refextract: text produced no phones");
+        ids_out = proc.ids;
+        std::vector<int64_t> ids, mask;
+        tok_.encode(proc.clean, ids, mask);
+        std::vector<int64_t> repeats(proc.word2ph.begin(), proc.word2ph.end());
+        std::map<std::string, freeeng::Tensor> in;
+        in.emplace("input_ids", mk_i64(ids, {1, (int64_t)ids.size()}));
+        in.emplace("attention_mask", mk_i64(mask, {1, (int64_t)mask.size()}));
+        in.emplace("repeats", mk_i64(repeats, {(int64_t)repeats.size()}));
+        auto outs = roberta_->run(in);
+        std::vector<int64_t> shape;
+        bert_out = copy_f32(outs.at("phone_features"), shape);
+        roberta_->release_arena();
+    }
 
     bool ensure_eng(std::string& err) {
         if (eng_ready_) return true;
@@ -113,14 +151,12 @@ class RefExtractor {
         std::vector<float> a16 = refaudio::resample_sinc(a32, 32000, 16000);
 
         std::vector<int64_t> ref_ids;
-        chng2p::ChineseG2P::Processed proc;
+        std::vector<float> bert_f;
         if (en) {
             ref_ids = eng_.phones_to_ids(eng2p::u8_to_w(prompt_text));
             if (ref_ids.empty()) throw std::runtime_error("refextract: prompt text produced no phones");
         } else {
-            proc = g2p_.process(prompt_text);
-            if (proc.ids.empty()) throw std::runtime_error("refextract: prompt text produced no phones");
-            ref_ids = proc.ids;
+            frontend_zh(prompt_text, ref_ids, bert_f);
         }
 
         std::map<std::string, RpkTensor> out;
@@ -133,16 +169,12 @@ class RefExtractor {
             t.data.assign(ref_ids.size() * 1024 * 4, 0);
             out["ref_bert"] = std::move(t);
         } else {
-            std::vector<int64_t> ids, mask;
-            tok_.encode(proc.clean, ids, mask);
-            std::vector<int64_t> repeats(proc.word2ph.begin(), proc.word2ph.end());
-            std::map<std::string, freeeng::Tensor> in;
-            in.emplace("input_ids", mk_i64(ids, {1, (int64_t)ids.size()}));
-            in.emplace("attention_mask", mk_i64(mask, {1, (int64_t)mask.size()}));
-            in.emplace("repeats", mk_i64(repeats, {(int64_t)repeats.size()}));
-            auto outs = roberta_->run(in);
-            out["ref_bert"] = copy_f32_rpk(outs.at("phone_features"));
-            roberta_->release_arena();
+            RpkTensor t;
+            t.dtype = 0;
+            t.shape = {(int64_t)ref_ids.size(), 1024};
+            t.data.assign((const uint8_t*)bert_f.data(),
+                          (const uint8_t*)bert_f.data() + bert_f.size() * 4);
+            out["ref_bert"] = std::move(t);
         }
         // HuBERT -> ssl_content
         {
@@ -262,5 +294,5 @@ class RefExtractor {
     chng2p::ChineseG2P g2p_;
     eng2p::EngG2P eng_;
     std::string dir_;
-    bool ready_ = false, eng_ready_ = false, eng_failed_ = false;
+    bool ready_ = false, text_ready_ = false, eng_ready_ = false, eng_failed_ = false;
 };
